@@ -1,3 +1,7 @@
+use dioxus::prelude::*;
+
+mod ui;
+
 fn main() {
-    println!("Hello, world!");
+    dioxus::launch(ui::ui_component::app);
 }
