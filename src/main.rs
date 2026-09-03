@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 mod ui;
-
+mod sound;
 fn main() {
-    dioxus::launch(ui::ui_component::app);
+    dioxus::launch(ui::ui_main::app);
 }
