@@ -1,9 +1,8 @@
-use std::ptr::null_mut;
-
 use crate::sound::devices::{self, SoundDevice};
 use dioxus::prelude::*;
+
 #[component]
-pub fn ui_soundDeviceDropdown() -> Element {
+pub fn SoundDeviceDropdown() -> Element {
     // Fetch devices
     let devices_result = devices::fetch_output_devices();
 
@@ -35,7 +34,7 @@ pub fn ui_soundDeviceDropdown() -> Element {
     rsx! {
         section { class: "device-selector",
             label {
-                for: "device-select",
+                r#for: "device-select",
                 "Audio Device: "
             }
             select {
@@ -67,14 +66,13 @@ pub fn ui_soundDeviceDropdown() -> Element {
             }
             div {
                 class: "device-selector",
-                {ui_sound_device_details(selected_device)}
+                {sound_device_details(selected_device)}
             }
         }
     }
 }
 
-
-pub fn ui_sound_device_details(device: Option<&SoundDevice>) -> Element{
+pub fn sound_device_details(device: Option<&SoundDevice>) -> Element {
     let Some(device) = device else {
         return rsx! {
             section {
@@ -85,32 +83,32 @@ pub fn ui_sound_device_details(device: Option<&SoundDevice>) -> Element{
     };
 
     rsx! {
-            section {
-                class: "device-full",
+        section {
+            class: "device-full",
 
-                p { "Name: {device.name}" }
-                p { "ID: {device.id}" }
-                p { "Direction: {device.get_device_direction()}" }
-                p { "Default: {device.get_default_status()}" }
+            p { "Name: {device.name}" }
+            p { "ID: {device.id}" }
+            p { "Direction: {device.get_device_direction()}" }
+            p { "Default: {device.get_default_status()}" }
 
-                h4 { "Supported configurations" }
+            h4 { "Supported configurations" }
 
-                if device.configs.is_empty() {
-                    p { "No supported configurations found." }
-                } else {
-                    article {
-                        ul {
-                            for (index, config) in device.configs.iter().enumerate() {
-                                li { key: "{index}",
-                                    "Channels: {config.channels}, \
-                                    sample rate: {config.min_sample_rate}–{config.max_sample_rate} Hz, \
-                                    format: {config.sample_format:?}, \
-                                    buffer size: {config.buffer_size:?}"
-                                }
+            if device.configs.is_empty() {
+                p { "No supported configurations found." }
+            } else {
+                article {
+                    ul {
+                        for (index, config) in device.configs.iter().enumerate() {
+                            li { key: "{index}",
+                                "Channels: {config.channels}, \
+                                sample rate: {config.min_sample_rate}–{config.max_sample_rate} Hz, \
+                                format: {config.sample_format:?}, \
+                                buffer size: {config.buffer_size:?}"
                             }
                         }
                     }
                 }
             }
         }
+    }
 }

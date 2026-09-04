@@ -1,7 +1,7 @@
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait};
-use dioxus::prelude::*;
 
+#[derive(Debug, Clone)]
 pub struct SoundDevice {
     pub id: usize,
     pub name: String,
@@ -10,6 +10,7 @@ pub struct SoundDevice {
     pub configs: Vec<DeviceConfig>,
 }
 
+#[derive(Debug, Clone)]
 pub struct DeviceConfig {
     pub channels: u16,
     pub min_sample_rate: u32,
@@ -21,16 +22,17 @@ pub struct DeviceConfig {
 impl SoundDevice {
     pub fn get_device_direction(&self) -> &'static str {
         if self.is_input {
-            return "Input";
+            "Input"
         } else {
-            return "Output";
+            "Output"
         }
     }
+
     pub fn get_default_status(&self) -> &'static str {
         if self.is_default {
-            return "Yes";
+            "Yes"
         } else {
-            return "No";
+            "No"
         }
     }
 }
@@ -59,7 +61,7 @@ pub fn fetch_output_devices() -> Result<Vec<SoundDevice>> {
                         min_sample_rate: config.min_sample_rate().0,
                         max_sample_rate: config.max_sample_rate().0,
                         sample_format: config.sample_format(),
-                        buffer_size: config.buffer_size().clone(),
+                        buffer_size: *config.buffer_size(),
                     });
                 }
             }
@@ -67,8 +69,7 @@ pub fn fetch_output_devices() -> Result<Vec<SoundDevice>> {
             Err(error) => {
                 eprintln!(
                     "Could not read supported output configurations for \
-                     '{}': {error}",
-                    device_name
+                     '{device_name}': {error}"
                 );
             }
         }
@@ -83,4 +84,31 @@ pub fn fetch_output_devices() -> Result<Vec<SoundDevice>> {
     }
 
     Ok(devices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_device_direction() {
+        let device_in = SoundDevice {
+            id: 0,
+            name: "Mic".into(),
+            is_input: true,
+            is_default: false,
+            configs: vec![],
+        };
+        assert_eq!(device_in.get_device_direction(), "Input");
+
+        let device_out = SoundDevice {
+            id: 1,
+            name: "Speakers".into(),
+            is_input: false,
+            is_default: true,
+            configs: vec![],
+        };
+        assert_eq!(device_out.get_device_direction(), "Output");
+        assert_eq!(device_out.get_default_status(), "Yes");
+    }
 }

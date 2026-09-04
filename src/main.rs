@@ -1,7 +1,6 @@
-use dioxus::prelude::*;
-
-mod ui;
 mod sound;
+mod ui;
+
 fn main() {
-    dioxus::launch(ui::ui_main::app);
+    dioxus::launch(ui::App);
 }

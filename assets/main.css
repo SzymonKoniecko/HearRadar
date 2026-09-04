@@ -1,6 +1,8 @@
 :root {
     --color-bg: #050508;
     --color-surface: #0f1219;
+    --color-surface-sections: #141822;
+    --color-surface-contrast: #1c2232;
     --color-grid: #2d3446;
     --color-pastel-green: #00ff9d;
     --color-pastel-darkgreen: #005c3e;
@@ -63,7 +65,6 @@ body {
     overflow-x: hidden;
     transition: background-color 0.3s ease;
 }
-
 
 #header {
     display: block;
