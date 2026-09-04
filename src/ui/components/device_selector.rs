@@ -41,7 +41,11 @@ pub fn SoundDeviceDropdown() -> Element {
         selected_name.set(devices[0].name.clone());
     }
 
+    let mut active_stream = use_signal(|| None::<cpal::Stream>);
+    let is_streaming = active_stream.read().is_some();
+
     let selected_device = devices.iter().find(|device| device.name == selected_name());
+
 
     rsx! {
         div { class: "device-container",
@@ -83,7 +87,27 @@ pub fn SoundDeviceDropdown() -> Element {
                     onclick: move |_| {
                         devices_state.set(devices::fetch_output_devices().map_err(|e| e.to_string()));
                     },
-                    "↻ Refresh"
+                    "Refresh"
+                }
+                button {
+                    class: if is_streaming { "stop-button" } else { "start-button" },
+                    title: if is_streaming { "Stop audio capture" } else { "Fetch audio" },
+                    onclick: move |_| {
+                        if active_stream.read().is_some() {
+                            active_stream.set(None);
+                        } else {
+                            let name = selected_name();
+                            match devices::fetch_audio_from_device(&name) {
+                                Ok(stream) => {
+                                    active_stream.set(Some(stream));
+                                }
+                                Err(e) => {
+                                    eprintln!("Błąd uruchamiania strumienia: {e}");
+                                }
+                            }
+                        }
+                    },
+                    if is_streaming { "Stop audio" } else { "Fetch audio" }
                 }
             }
             {sound_device_details(selected_device)}

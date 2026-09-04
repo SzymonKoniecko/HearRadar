@@ -189,6 +189,31 @@ button:active {
     box-shadow: 0 4px 12px rgba(59, 130, 246, 0.45);
 }
 
+.start-button {
+    background-color: var(--color-pastel-darkgreen);
+    color: var(--color-pastel-green);
+    border: 1px solid var(--color-pastel-green);
+    box-shadow: 0 2px 8px rgba(0, 255, 157, 0.2);
+}
+
+.start-button:hover {
+    background-color: #007a52;
+    box-shadow: 0 4px 12px rgba(0, 255, 157, 0.35);
+}
+
+.stop-button {
+    background-color: var(--color-error-bg);
+    color: var(--color-error-text);
+    border: 1px solid var(--color-error-border);
+    box-shadow: 0 2px 8px rgba(229, 115, 115, 0.2);
+}
+
+.stop-button:hover {
+    background-color: #5c0e0e;
+    box-shadow: 0 4px 12px rgba(229, 115, 115, 0.35);
+}
+
+
 /* Device details card */
 .device-full {
     display: flex;
