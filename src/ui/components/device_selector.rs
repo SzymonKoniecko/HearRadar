@@ -1,8 +1,12 @@
-use crate::sound::devices::{self, SoundDevice};
+use crate::sound::devices::{self, SharedAudioAnalysis, SoundDevice};
 use dioxus::prelude::*;
 
 #[component]
-pub fn SoundDeviceDropdown() -> Element {
+pub fn SoundDeviceDropdown(
+    analysis: SharedAudioAnalysis,
+    on_launch_overlay: EventHandler<()>,
+) -> Element {
+
     // Cache devices in a signal so it only fetches once on mount, NOT on every re-render
     let mut devices_state = use_signal(|| {
         devices::fetch_output_devices().map_err(|err| err.to_string())
@@ -97,7 +101,7 @@ pub fn SoundDeviceDropdown() -> Element {
                             active_stream.set(None);
                         } else {
                             let name = selected_name();
-                            match devices::fetch_audio_from_device(&name) {
+                            match devices::fetch_audio_from_device(&name, analysis.clone()) {
                                 Ok(stream) => {
                                     active_stream.set(Some(stream));
                                 }
@@ -108,6 +112,14 @@ pub fn SoundDeviceDropdown() -> Element {
                         }
                     },
                     if is_streaming { "Stop audio" } else { "Fetch audio" }
+                }
+                button {
+                    class: "launch-overlay-button",
+                    title: "Przełącz na przezroczysty radar nad grą",
+                    onclick: move |_| {
+                        on_launch_overlay.call(());
+                    },
+                    "🎯 Uruchom Radar (Overlay)"
                 }
             }
             {sound_device_details(selected_device)}
