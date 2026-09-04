@@ -3,18 +3,24 @@ use dioxus::prelude::*;
 
 #[component]
 pub fn SoundDeviceDropdown() -> Element {
-    // Fetch devices
-    let devices_result = devices::fetch_output_devices();
+    // Cache devices in a signal so it only fetches once on mount, NOT on every re-render
+    let mut devices_state = use_signal(|| {
+        devices::fetch_output_devices().map_err(|err| err.to_string())
+    });
 
     // Handle error state
-    let devices = match devices_result {
-        Ok(devs) => devs,
-        Err(error) => {
+    let devices_read = devices_state.read();
+    let devices = match &*devices_read {
+        Ok(devs) => devs.clone(),
+        Err(err) => {
+            let err_msg = err.clone();
             return rsx! {
                 div { class: "error-container",
-                    p { class: "error-text", "Could not load output devices: {error}" }
+                    p { class: "error-text", "Could not load output devices: {err_msg}" }
                     button {
-                        onclick: move |_| { /* Add retry logic here */ },
+                        onclick: move |_| {
+                            devices_state.set(devices::fetch_output_devices().map_err(|e| e.to_string()));
+                        },
                         "Retry"
                     }
                 }
@@ -29,45 +35,58 @@ pub fn SoundDeviceDropdown() -> Element {
             .map(|device| device.name.clone())
             .unwrap_or_default()
     });
+
+    // If selected_name is empty but devices became available, default to first device
+    if selected_name().is_empty() && !devices.is_empty() {
+        selected_name.set(devices[0].name.clone());
+    }
+
     let selected_device = devices.iter().find(|device| device.name == selected_name());
 
     rsx! {
-        section { class: "device-selector",
-            label {
-                r#for: "device-select",
-                "Audio Device: "
-            }
-            select {
-                id: "device-select",
-                value: "{selected_name}",
-                aria_label: "Select audio output device",
-
-                oninput: move |event| {
-                    selected_name.set(event.value());
-
-                    // TODO: Add logic to actually switch the audio device here
-                    // e.g., crate::sound::switch_device(&event.value());
-                },
-
-                option {
-                    value: "",
-                    disabled: true,
-                    selected: "{selected_name.is_empty()}",
-                    "Choose a device...",
+        div { class: "device-container",
+            div { class: "device-selector",
+                label {
+                    r#for: "device-select",
+                    "Audio Device: "
                 }
+                select {
+                    id: "device-select",
+                    value: "{selected_name}",
+                    aria_label: "Select audio output device",
 
-                for device in &devices {
+                    oninput: move |event| {
+                        selected_name.set(event.value());
+
+                        // TODO: Add logic to actually switch the audio device here
+                        // e.g., crate::sound::switch_device(&event.value());
+                    },
+
                     option {
-                        key: "{device.id}",
-                        value: "{device.name}",
-                        "{device.name}"
+                        value: "",
+                        disabled: true,
+                        selected: "{selected_name.is_empty()}",
+                        "Choose a device...",
+                    }
+
+                    for device in &devices {
+                        option {
+                            key: "{device.id}",
+                            value: "{device.name}",
+                            "{device.name}"
+                        }
                     }
                 }
+                button {
+                    class: "refresh-button",
+                    title: "Scan for newly connected audio devices",
+                    onclick: move |_| {
+                        devices_state.set(devices::fetch_output_devices().map_err(|e| e.to_string()));
+                    },
+                    "↻ Refresh"
+                }
             }
-            div {
-                class: "device-selector",
-                {sound_device_details(selected_device)}
-            }
+            {sound_device_details(selected_device)}
         }
     }
 }
