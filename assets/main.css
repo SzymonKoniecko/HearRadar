@@ -474,3 +474,246 @@ body:has(#app.overlay-mode) {
 .radar-test-btn--active:hover {
     background-color: #007a52;
 }
+
+/* ── Panel konfiguracji radaru ───────────────────────────────────────────── */
+
+.radar-config-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6vh;
+    background-color: var(--color-surface-sections);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 1.25vh 1.25vw;
+    margin-top: 1.5vh;
+}
+
+.radar-config-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.5vh;
+}
+
+.radar-config-header h4 {
+    color: var(--color-pastel-green);
+    font-size: 0.9em;
+    margin: 0;
+}
+
+.radar-config-reset {
+    background-color: transparent;
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-border);
+    border-radius: 5px;
+    padding: 0.2vh 0.5vw;
+    font-size: 0.78em;
+    font-weight: 500;
+    cursor: pointer;
+    box-shadow: none;
+    transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.radar-config-reset:hover {
+    color: var(--color-pastel-green);
+    border-color: var(--color-pastel-green);
+    background-color: transparent;
+    box-shadow: none;
+    transform: none;
+}
+
+.radar-config-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75vw;
+}
+
+.radar-config-label {
+    flex: 0 0 72px;
+    font-size: 0.8em;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+}
+
+.radar-config-control {
+    display: flex;
+    align-items: center;
+    flex: 1;
+    gap: 0.5vw;
+}
+
+.radar-config-val {
+    flex: 0 0 44px;
+    font-size: 0.78em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    color: var(--color-pastel-green);
+    text-align: right;
+}
+
+/* Slider styling */
+.radar-slider {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--color-surface-contrast);
+    outline: none;
+    cursor: pointer;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+}
+
+.radar-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--color-pastel-green);
+    cursor: pointer;
+    box-shadow: 0 0 6px rgba(0, 255, 157, 0.4);
+    transition: box-shadow 0.15s ease, transform 0.1s ease;
+}
+
+.radar-slider::-webkit-slider-thumb:hover {
+    box-shadow: 0 0 10px rgba(0, 255, 157, 0.7);
+    transform: scale(1.15);
+}
+
+.radar-slider::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--color-grid);
+}
+
+/* ── Mono Router Panel ───────────────────────────────────────────────────── */
+
+.mono-router-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6vh;
+    background-color: var(--color-surface-sections);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 1.25vh 1.25vw;
+    margin-top: 1.5vh;
+}
+
+.mono-router-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75vw;
+    margin-bottom: 0.2vh;
+}
+
+.mono-router-title {
+    font-size: 0.9em;
+    font-weight: 700;
+    color: var(--color-pastel-green);
+}
+
+.mono-router-badge {
+    font-size: 0.72em;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--color-text-secondary);
+    padding: 0.15vh 0.4vw;
+    border: 1px solid var(--color-border);
+    border-radius: 4px;
+    background: transparent;
+}
+
+.mono-router-badge--active {
+    color: var(--color-pastel-green);
+    border-color: var(--color-pastel-green);
+    background: rgba(0, 255, 157, 0.06);
+    box-shadow: 0 0 6px rgba(0, 255, 157, 0.2);
+}
+
+.mono-router-hint {
+    font-size: 0.8em;
+    color: var(--color-text-secondary);
+    margin: 0 0 0.4vh 0;
+    line-height: 1.4;
+}
+
+.mono-router-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75vw;
+}
+
+.mono-router-label {
+    flex: 0 0 60px;
+    font-size: 0.8em;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+}
+
+.mono-router-select {
+    flex: 1;
+    min-width: 0;
+    padding: 0.4vh 0.6vw;
+    background-color: var(--color-surface-contrast);
+    border: 1px solid var(--color-border);
+    color: var(--color-text-main);
+    border-radius: 6px;
+    font-size: 0.82em;
+    outline: none;
+    cursor: pointer;
+    transition: border-color 0.2s ease;
+}
+
+.mono-router-select:focus {
+    border-color: var(--color-pastel-green);
+}
+
+/* Przyciski wyboru ucha */
+.mono-ear-group {
+    display: flex;
+    gap: 0.4vw;
+    flex-wrap: wrap;
+}
+
+.mono-ear-btn {
+    background-color: var(--color-surface-contrast);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    padding: 0.35vh 0.55vw;
+    font-size: 0.8em;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+    box-shadow: none;
+    transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.mono-ear-btn:hover {
+    background-color: var(--color-pastel-darkgreen);
+    border-color: var(--color-pastel-green);
+    color: var(--color-pastel-green);
+    transform: none;
+    box-shadow: none;
+}
+
+.mono-ear-btn--active {
+    background-color: var(--color-pastel-darkgreen);
+    border-color: var(--color-pastel-green);
+    color: var(--color-pastel-green);
+    font-weight: 700;
+    box-shadow: 0 0 8px rgba(0, 255, 157, 0.25);
+}
+
+.mono-ear-btn--active:hover {
+    background-color: #007a52;
+}
+
+/* Przycisk toggle routera — pełna szerokość */
+.mono-router-toggle {
+    width: 100%;
+    justify-content: center;
+    font-size: 0.88em;
+}

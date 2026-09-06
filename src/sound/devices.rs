@@ -8,6 +8,59 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sound::direction::{self, analyze_channels};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RadarConfig {
+    /// Pozycja X środka radaru jako ułamek szerokości okna (0.0 = lewo, 1.0 = prawo).
+    pub anchor_x: f32,
+    /// Pozycja Y środka radaru jako ułamek wysokości okna (0.0 = góra, 1.0 = dół).
+    pub anchor_y: f32,
+    /// Promień radaru w pikselach (50 .. 300).
+    pub radius: f32,
+    /// Przezroczystość tła radaru (0.0 = pełna przezroczystość, 1.0 = pełne krycie).
+    pub bg_alpha: f32,
+    /// Ogólny mnożnik przezroczystości linii i kropek (0.0 .. 1.0).
+    pub fg_alpha: f32,
+}
+
+impl Default for RadarConfig {
+    fn default() -> Self {
+        Self {
+            anchor_x: 1.0,
+            anchor_y: 1.0,
+            radius:   125.0,
+            bg_alpha: 0.82,
+            fg_alpha: 1.0,
+        }
+    }
+}
+
+/// Wybór ucha do odtwarzania mono.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MonoEar {
+    /// Mono routing wyłączony — brak strumienia wyjściowego.
+    #[default]
+    Off,
+    /// Mono sygnał odtwarzany tylko na lewym kanale.
+    Left,
+    /// Mono sygnał odtwarzany tylko na prawym kanale.
+    Right,
+    /// Mono sygnał odtwarzany na obu kanałach.
+    Both,
+}
+
+impl MonoEar {
+    pub const ALL: &'static [Self] = &[Self::Off, Self::Left, Self::Right, Self::Both];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off   => "Off",
+            Self::Left  => "← Lewe ucho",
+            Self::Right => "→ Prawe ucho",
+            Self::Both  => "↔ Oba",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AudioAnalysis {
     pub angle: f32,          // -180° .. 0° (przód) .. +180°
@@ -17,6 +70,10 @@ pub struct AudioAnalysis {
     /// Indeks scenariusza testowego: 0 = live audio, 1..N = kolejne testy.
     /// Ustawiany przez UI Dioxus, odczytywany przez egui.
     pub test_scenario: u8,
+    /// Konfiguracja wyglądu i pozycji radaru egui.
+    pub radar_config: RadarConfig,
+    /// Wybór ucha do mono routingu. Ustawiany przez UI, czytany przez mono_router.
+    pub mono_ear: MonoEar,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +204,41 @@ pub fn fetch_output_devices() -> Result<Vec<SoundDevice>> {
         }
         return Ok(devices);
     }
+}
+
+/// Zwraca fizyczne urządzenia wyjściowe (słuchawki, głośniki) na wszystkich platformach.
+/// Używane do wyboru urządzenia docelowego dla mono routera.
+pub fn fetch_physical_output_devices() -> Result<Vec<SoundDevice>> {
+    let host = cpal::default_host();
+    let default_name = host.default_output_device().and_then(|d| d.name().ok());
+
+    let mut devices = Vec::new();
+    for (index, device) in host.output_devices()?.enumerate() {
+        let Ok(name) = device.name() else { continue };
+        let is_default = default_name.as_deref() == Some(&name);
+
+        let mut configs = Vec::new();
+        if let Ok(supported) = device.supported_output_configs() {
+            for c in supported {
+                configs.push(DeviceConfig {
+                    channels: c.channels(),
+                    min_sample_rate: c.min_sample_rate().0,
+                    max_sample_rate: c.max_sample_rate().0,
+                    sample_format: c.sample_format(),
+                    buffer_size: *c.buffer_size(),
+                });
+            }
+        }
+
+        devices.push(SoundDevice {
+            id: index,
+            name,
+            is_input: false,
+            is_default,
+            configs,
+        });
+    }
+    Ok(devices)
 }
 
 pub fn fetch_audio_from_device(
