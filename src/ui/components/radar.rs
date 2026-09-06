@@ -13,32 +13,26 @@ pub fn RadarDisplay(
     let center = 120.0f32;
     let radius = 100.0f32;
 
-    // Kąt: -90° (lewo), 0° (przód/góra), +90° (prawo)
+    // Kąt: 0° = przód (góra), +90° = prawo, -90° = lewo
     let rad = (angle - 90.0).to_radians();
-    let distance = (intensity * radius).clamp(15.0, radius);
+    let distance = (intensity * radius).clamp(10.0, radius);
     let blip_x = center + distance * rad.cos();
     let blip_y = center + distance * rad.sin();
 
-    // Kropki kierunkowe rozmieszczone co 30° na obwodzie okręgu (12 pozycji, jak na tarczy zegara)
-    let direction_dots: Vec<(f32, f32)> = (0..12)
-        .map(|i| {
-            let a = (i as f32 * 30.0 - 90.0).to_radians();
-            (center + radius * a.cos(), center + radius * a.sin())
-        })
-        .collect();
-
     rsx! {
         div {
+            style: "position: relative; display: inline-block;",
             onmousedown: move |_| {
                 if is_overlay {
                     desktop.drag();
                 }
             },
 
+            // Przycisk powrotu (tylko overlay)
             if is_overlay {
                 button {
+                    class: "radar-dock-btn",
                     title: "Otwórz panel ustawień",
-                    style: "position: absolute; top: 4px; right: 4px; z-index: 10;",
                     onclick: move |e| {
                         e.stop_propagation();
                         on_toggle_overlay.call(());
@@ -52,41 +46,44 @@ pub fn RadarDisplay(
                 width: "240",
                 height: "240",
 
-                // Surowy okrąg zasięgu radaru
+                // Pierścień zewnętrzny (100%)
                 circle {
-                    cx: "{center}",
-                    cy: "{center}",
-                    r: "{radius}",
+                    cx: "{center}", cy: "{center}", r: "{radius}",
                     fill: "none",
-                    stroke: "white",
+                    stroke: "rgba(0,255,157,0.5)",
                     stroke_width: "1.5",
                 }
 
-                // Środek radaru
+                // Pierścień środkowy (66%)
                 circle {
-                    cx: "{center}",
-                    cy: "{center}",
-                    r: "2",
-                    fill: "white",
+                    cx: "{center}", cy: "{center}", r: "{radius * 0.66}",
+                    fill: "none",
+                    stroke: "rgba(0,255,157,0.25)",
+                    stroke_width: "1",
                 }
 
-                // Kropki oznaczające kierunki na obwodzie
-                for (dx , dy) in direction_dots.iter() {
-                    circle {
-                        cx: "{dx}",
-                        cy: "{dy}",
-                        r: "2.5",
-                        fill: "gray",
-                    }
+                // Pierścień wewnętrzny (33%)
+                circle {
+                    cx: "{center}", cy: "{center}", r: "{radius * 0.33}",
+                    fill: "none",
+                    stroke: "rgba(0,255,157,0.25)",
+                    stroke_width: "1",
                 }
 
-                // Wykryty punkt dźwięku - kropka w kierunku i odległości zależnej od intensywności
+                // Środek
+                circle {
+                    cx: "{center}", cy: "{center}", r: "2.5",
+                    fill: "rgba(0,255,157,0.8)",
+                }
+
+                // Blip dźwiękowy
                 if intensity > 0.02 {
                     circle {
-                        cx: "{blip_x}",
-                        cy: "{blip_y}",
-                        r: "{5.0 + intensity * 5.0}",
-                        fill: "red",
+                        cx: "{blip_x}", cy: "{blip_y}",
+                        r: "6",
+                        fill: "#ff0055",
+                        stroke: "rgba(255,255,255,0.6)",
+                        stroke_width: "1.5",
                     }
                 }
             }
