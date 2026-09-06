@@ -1,4 +1,4 @@
-use crate::sound::devices::{RadarConfig, SharedAudioAnalysis};
+use crate::sound::devices::RadarConfig;
 use egui::{Color32, Painter, Pos2, Stroke, Vec2};
 use std::f32::consts::TAU;
 
@@ -55,7 +55,7 @@ impl TestScenario {
         }
     }
 
-    fn generate(self, n: usize, phase: f32) -> Vec<f32> {
+    pub fn generate(self, n: usize, phase: f32) -> Vec<f32> {
         (0..n)
             .map(|i| {
                 let t = i as f32 / n as f32;
@@ -157,102 +157,4 @@ impl SampleBuffer {
     pub fn decay(&mut self, factor: f32) {
         for s in &mut self.samples { *s *= factor; }
     }
-}
-
-// ── Aplikacja eframe ─────────────────────────────────────────────────────────
-
-pub struct RadarEguiApp {
-    analysis: SharedAudioAnalysis,
-    buffer:   SampleBuffer,
-    sim_phase:  f32,
-    test_phase: f32,
-}
-
-impl RadarEguiApp {
-    pub fn new(analysis: SharedAudioAnalysis) -> Self {
-        Self {
-            analysis,
-            buffer: SampleBuffer::new(256),
-            sim_phase:  0.0,
-            test_phase: 0.0,
-        }
-    }
-
-    fn read_scenario(&self) -> TestScenario {
-        self.analysis.lock()
-            .map(|g| TestScenario::from_u8(g.test_scenario))
-            .unwrap_or(TestScenario::Off)
-    }
-
-    fn read_config(&self) -> RadarConfig {
-        self.analysis.lock()
-            .map(|g| g.radar_config)
-            .unwrap_or_default()
-    }
-}
-
-impl eframe::App for RadarEguiApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let scenario = self.read_scenario();
-
-        if scenario != TestScenario::Off {
-            self.test_phase += 0.04;
-            self.buffer.samples = scenario.generate(256, self.test_phase);
-        } else {
-            let (angle, intensity) = self.analysis.lock()
-                .map(|g| (g.angle, g.intensity))
-                .unwrap_or((0.0, 0.0));
-
-            if intensity > 0.01 {
-                let ar = angle.to_radians();
-                let new: Vec<f32> = (0..16)
-                    .map(|i| (ar + i as f32 / 16.0 * std::f32::consts::FRAC_PI_4).sin() * intensity)
-                    .collect();
-                self.buffer.push_samples(&new);
-            } else {
-                self.sim_phase += 0.08;
-                let new: Vec<f32> = (0..16)
-                    .map(|i| (self.sim_phase + i as f32 / 16.0 * TAU).sin() * 0.3)
-                    .collect();
-                self.buffer.push_samples(&new);
-            }
-
-            self.buffer.decay(0.97);
-        }
-
-        ctx.request_repaint();
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let cfg  = self.read_config();
-        let rect = ui.max_rect();
-
-        // Pozycja: anchor_x/anchor_y jako ułamek rozmiarów okna
-        let margin = cfg.radius + 4.0;
-        let cx = rect.left() + cfg.anchor_x * (rect.width()  - 2.0 * margin) + margin;
-        let cy = rect.top()  + cfg.anchor_y * (rect.height() - 2.0 * margin) + margin;
-        let center = Pos2::new(cx, cy);
-
-        draw_radar(ui.painter(), center, &cfg, &self.buffer.samples);
-    }
-}
-
-// ── Uruchomienie okna eframe ─────────────────────────────────────────────────
-
-pub fn launch_radar_window(analysis: SharedAudioAnalysis) {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("HearRadar — Audio Radar")
-            .with_inner_size([860.0, 700.0])
-            .with_transparent(true)
-            .with_decorations(true),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "HearRadar",
-        options,
-        Box::new(|_cc| Ok(Box::new(RadarEguiApp::new(analysis)))),
-    )
-    .expect("eframe failed to start");
 }
