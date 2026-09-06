@@ -225,6 +225,8 @@ fn update_analysis(samples: &[f32], channels: usize, analysis: &SharedAudioAnaly
     let stats = analyze_channels(samples, channels);
     let (angle, intensity) = direction::compute_direction(&stats.rms);
 
+    println!("{}", direction::format_channel_levels(&stats.rms));
+
     if let Ok(mut lock) = analysis.lock() {
         lock.angle = angle;
         lock.intensity = intensity;

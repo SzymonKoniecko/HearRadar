@@ -161,6 +161,52 @@ pub fn compute_direction(channel_rms: &[f32]) -> (f32, f32) {
     (angle, intensity)
 }
 
+/// Zwraca poglądową nazwę układu kanałów, np. "2.0", "5.1", "7.1".
+/// Dla nietypowej liczby kanałów zwraca np. "4ch".
+pub fn layout_name(channels: usize) -> String {
+    match channels {
+        1 => "1.0".to_string(),
+        2 => "2.0".to_string(),
+        6 => "5.1".to_string(),
+        8 => "7.1".to_string(),
+        n => format!("{n}ch"),
+    }
+}
+
+/// Krótkie etykiety kanałów (w kolejności zgodnej z [`channel_layout`]) do
+/// wyświetlania/logowania, np. `["L", "R"]` dla 2.0 albo
+/// `["FL", "FR", "C", "LFE", "RL", "RR"]` dla 5.1.
+pub fn channel_labels(channels: usize) -> &'static [&'static str] {
+    match channels {
+        1 => &["C"],
+        2 => &["L", "R"],
+        6 => &["FL", "FR", "C", "LFE", "RL", "RR"],
+        8 => &["FL", "FR", "C", "LFE", "RL", "RR", "SL", "SR"],
+        _ => &["L", "R"],
+    }
+}
+
+/// Formatuje poziomy poszczególnych kanałów do czytelnego, poglądowego
+/// stringa, np. `"2.0: [L:10, R:20]"` albo
+/// `"5.1: [FL:5, FR:12, C:0, LFE:3, RL:0, RR:0]"`.
+///
+/// Wartości to poziom RMS przeskalowany poglądowo do przedziału 0..=100
+/// (nie mylić z `intensity` z [`compute_direction`], które ma inne skalowanie).
+pub fn format_channel_levels(rms: &[f32]) -> String {
+    let labels = channel_labels(rms.len());
+
+    let parts: Vec<String> = rms
+        .iter()
+        .zip(labels.iter())
+        .map(|(&level, label)| {
+            let percent = (level.clamp(0.0, 1.0) * 100.0).round() as i32;
+            format!("{label}:{percent}")
+        })
+        .collect();
+
+    format!("{}: [{}]", layout_name(rms.len()), parts.join(", "))
+}
+
 /// Konwertuje próbkę `i16` do znormalizowanego zakresu `-1.0..=1.0`.
 pub fn i16_to_f32(sample: i16) -> f32 {
     sample as f32 / i16::MAX as f32
@@ -429,5 +475,58 @@ mod tests {
         assert_close(u16_to_f32(0), -1.0, "0 -> -1.0 (cisza/min)");
         assert_close(u16_to_f32(u16::MAX), 1.0, "u16::MAX -> 1.0");
         assert_close(u16_to_f32(32768), 0.0, "środek zakresu -> ~0.0");
+    }
+
+    // ---------- format_channel_levels / layout_name / channel_labels ----------
+
+    #[test]
+    fn layout_name_matches_known_configurations() {
+        assert_eq!(layout_name(1), "1.0");
+        assert_eq!(layout_name(2), "2.0");
+        assert_eq!(layout_name(6), "5.1");
+        assert_eq!(layout_name(8), "7.1");
+        assert_eq!(layout_name(4), "4ch");
+    }
+
+    #[test]
+    fn channel_labels_match_layout() {
+        assert_eq!(channel_labels(2), &["L", "R"]);
+        assert_eq!(
+            channel_labels(6),
+            &["FL", "FR", "C", "LFE", "RL", "RR"]
+        );
+        assert_eq!(
+            channel_labels(8),
+            &["FL", "FR", "C", "LFE", "RL", "RR", "SL", "SR"]
+        );
+    }
+
+    #[test]
+    fn format_channel_levels_stereo() {
+        let formatted = format_channel_levels(&[0.10, 0.20]);
+        assert_eq!(formatted, "2.0: [L:10, R:20]");
+    }
+
+    #[test]
+    fn format_channel_levels_5_1() {
+        let formatted = format_channel_levels(&[0.05, 0.12, 0.0, 0.03, 0.0, 0.0]);
+        assert_eq!(formatted, "5.1: [FL:5, FR:12, C:0, LFE:3, RL:0, RR:0]");
+    }
+
+    #[test]
+    fn format_channel_levels_7_1() {
+        let formatted =
+            format_channel_levels(&[0.5, 0.5, 0.1, 0.02, 0.0, 0.0, 0.3, 0.3]);
+        assert_eq!(
+            formatted,
+            "7.1: [FL:50, FR:50, C:10, LFE:2, RL:0, RR:0, SL:30, SR:30]"
+        );
+    }
+
+    #[test]
+    fn format_channel_levels_clamps_out_of_range_values() {
+        // RMS teoretycznie nie powinno przekraczać 1.0, ale funkcja ma być odporna.
+        let formatted = format_channel_levels(&[1.5, -0.2]);
+        assert_eq!(formatted, "2.0: [L:100, R:0]");
     }
 }
