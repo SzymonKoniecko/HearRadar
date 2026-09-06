@@ -5,9 +5,11 @@ use cpal::{
 };
 use std::sync::{Arc, Mutex};
 
+use crate::sound::direction::{self, analyze_channels};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AudioAnalysis {
-    pub angle: f32,       // -90.0° (lewo) .. 0.0° (przód) .. +90.0° (prawo)
+    pub angle: f32,       // -180.0° (tył-lewo) .. 0.0° (przód) .. +180.0° (tył-prawo)
     pub intensity: f32,   // 0.0 .. 1.0 (amplituda / głośność)
     pub peak_l: f32,
     pub peak_r: f32,
@@ -172,52 +174,7 @@ pub fn fetch_audio_from_device(
             target_device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mut sum_sq_l = 0.0f32;
-                    let mut sum_sq_r = 0.0f32;
-                    let mut peak_l = 0.0f32;
-                    let mut peak_r = 0.0f32;
-                    let step = channels.max(1);
-                    let frames = data.len() / step;
-
-                    if channels >= 2 {
-                        for chunk in data.chunks_exact(step) {
-                            let l = chunk[0].abs();
-                            let r = chunk[1].abs();
-                            sum_sq_l += l * l;
-                            sum_sq_r += r * r;
-                            if l > peak_l { peak_l = l; }
-                            if r > peak_r { peak_r = r; }
-                        }
-                    } else {
-                        for chunk in data.chunks_exact(step) {
-                            let s = chunk[0].abs();
-                            sum_sq_l += s * s;
-                            sum_sq_r += s * s;
-                            if s > peak_l { peak_l = s; peak_r = s; }
-                        }
-                    }
-
-                    let rms_l = (sum_sq_l / frames.max(1) as f32).sqrt();
-                    let rms_r = (sum_sq_r / frames.max(1) as f32).sqrt();
-                    let total = rms_l + rms_r;
-
-                    let (angle, intensity) = if total > 0.002 {
-                        let pan = if channels >= 2 {
-                            (rms_r - rms_l) / total
-                        } else {
-                            0.0
-                        };
-                        (pan * 90.0, (total * 4.0).min(1.0))
-                    } else {
-                        (0.0, 0.0)
-                    };
-
-                    if let Ok(mut lock) = analysis_cb.lock() {
-                        lock.angle = angle;
-                        lock.intensity = intensity;
-                        lock.peak_l = peak_l;
-                        lock.peak_r = peak_r;
-                    }
+                    update_analysis(data, channels, &analysis_cb);
                 },
                 err_fn,
                 None,
@@ -228,52 +185,9 @@ pub fn fetch_audio_from_device(
             target_device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let mut sum_sq_l = 0.0f32;
-                    let mut sum_sq_r = 0.0f32;
-                    let mut peak_l = 0.0f32;
-                    let mut peak_r = 0.0f32;
-                    let step = channels.max(1);
-                    let frames = data.len() / step;
-
-                    if channels >= 2 {
-                        for chunk in data.chunks_exact(step) {
-                            let l = (chunk[0] as f32 / i16::MAX as f32).abs();
-                            let r = (chunk[1] as f32 / i16::MAX as f32).abs();
-                            sum_sq_l += l * l;
-                            sum_sq_r += r * r;
-                            if l > peak_l { peak_l = l; }
-                            if r > peak_r { peak_r = r; }
-                        }
-                    } else {
-                        for chunk in data.chunks_exact(step) {
-                            let s = (chunk[0] as f32 / i16::MAX as f32).abs();
-                            sum_sq_l += s * s;
-                            sum_sq_r += s * s;
-                            if s > peak_l { peak_l = s; peak_r = s; }
-                        }
-                    }
-
-                    let rms_l = (sum_sq_l / frames.max(1) as f32).sqrt();
-                    let rms_r = (sum_sq_r / frames.max(1) as f32).sqrt();
-                    let total = rms_l + rms_r;
-
-                    let (angle, intensity) = if total > 0.002 {
-                        let pan = if channels >= 2 {
-                            (rms_r - rms_l) / total
-                        } else {
-                            0.0
-                        };
-                        (pan * 90.0, (total * 4.0).min(1.0))
-                    } else {
-                        (0.0, 0.0)
-                    };
-
-                    if let Ok(mut lock) = analysis_cb.lock() {
-                        lock.angle = angle;
-                        lock.intensity = intensity;
-                        lock.peak_l = peak_l;
-                        lock.peak_r = peak_r;
-                    }
+                    let normalized: Vec<f32> =
+                        data.iter().map(|&s| direction::i16_to_f32(s)).collect();
+                    update_analysis(&normalized, channels, &analysis_cb);
                 },
                 err_fn,
                 None,
@@ -284,37 +198,9 @@ pub fn fetch_audio_from_device(
             target_device.build_input_stream(
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    let mut sum_sq_l = 0.0f32;
-                    let mut sum_sq_r = 0.0f32;
-                    let step = channels.max(1);
-                    let frames = data.len() / step;
-
-                    for chunk in data.chunks_exact(step) {
-                        let l = (chunk[0] as f32 / u16::MAX as f32 - 0.5).abs() * 2.0;
-                        let r = if channels >= 2 {
-                            (chunk[1] as f32 / u16::MAX as f32 - 0.5).abs() * 2.0
-                        } else {
-                            l
-                        };
-                        sum_sq_l += l * l;
-                        sum_sq_r += r * r;
-                    }
-
-                    let rms_l = (sum_sq_l / frames.max(1) as f32).sqrt();
-                    let rms_r = (sum_sq_r / frames.max(1) as f32).sqrt();
-                    let total = rms_l + rms_r;
-
-                    let (angle, intensity) = if total > 0.002 {
-                        let pan = (rms_r - rms_l) / total;
-                        (pan * 90.0, (total * 4.0).min(1.0))
-                    } else {
-                        (0.0, 0.0)
-                    };
-
-                    if let Ok(mut lock) = analysis_cb.lock() {
-                        lock.angle = angle;
-                        lock.intensity = intensity;
-                    }
+                    let normalized: Vec<f32> =
+                        data.iter().map(|&s| direction::u16_to_f32(s)).collect();
+                    update_analysis(&normalized, channels, &analysis_cb);
                 },
                 err_fn,
                 None,
@@ -328,9 +214,23 @@ pub fn fetch_audio_from_device(
         }
     };
 
-
     stream.play()?;
     Ok(stream)
+}
+
+/// Aktualizuje współdzieloną analizę dźwięku na podstawie znormalizowanych
+/// (-1.0..=1.0) próbek interleaved. Wspiera dowolną liczbę kanałów — 2.0,
+/// 5.1, 7.1 i inne — delegując logikę kierunku do modułu `direction`.
+fn update_analysis(samples: &[f32], channels: usize, analysis: &SharedAudioAnalysis) {
+    let stats = analyze_channels(samples, channels);
+    let (angle, intensity) = direction::compute_direction(&stats.rms);
+
+    if let Ok(mut lock) = analysis.lock() {
+        lock.angle = angle;
+        lock.intensity = intensity;
+        lock.peak_l = stats.peak.first().copied().unwrap_or(0.0);
+        lock.peak_r = stats.peak.get(1).copied().unwrap_or(0.0);
+    }
 }
 
 #[cfg(test)]
@@ -357,5 +257,19 @@ mod tests {
         };
         assert_eq!(device_out.get_device_direction(), "Output");
         assert_eq!(device_out.get_default_status(), "Yes");
+    }
+
+    #[test]
+    fn update_analysis_writes_direction_from_multichannel_samples() {
+        // 5.1: dźwięk tylko na FR (indeks 1) -> oczekujemy kąta ~90° w wynikowej analizie
+        let analysis = SharedAudioAnalysis::new();
+        let frame = [0.0f32, 0.2, 0.0, 0.0, 0.0, 0.0];
+        let samples: Vec<f32> = frame.iter().cycle().take(frame.len() * 4).copied().collect();
+
+        update_analysis(&samples, 6, &analysis);
+
+        let result = analysis.lock().unwrap();
+        assert!((result.angle - 90.0).abs() < 0.5);
+        assert!(result.intensity > 0.0);
     }
 }
