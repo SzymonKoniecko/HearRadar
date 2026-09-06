@@ -6,13 +6,10 @@ pub fn SoundDeviceDropdown(
     analysis: SharedAudioAnalysis,
     on_launch_overlay: EventHandler<()>,
 ) -> Element {
-
-    // Cache devices in a signal so it only fetches once on mount, NOT on every re-render
     let mut devices_state = use_signal(|| {
         devices::fetch_output_devices().map_err(|err| err.to_string())
     });
 
-    // Handle error state
     let devices_read = devices_state.read();
     let devices = match &*devices_read {
         Ok(devs) => devs.clone(),
@@ -20,7 +17,7 @@ pub fn SoundDeviceDropdown(
             let err_msg = err.clone();
             return rsx! {
                 div { class: "error-container",
-                    p { class: "error-text", "Could not load output devices: {err_msg}" }
+                    p { class: "error-text", "Could not load audio devices: {err_msg}" }
                     button {
                         onclick: move |_| {
                             devices_state.set(devices::fetch_output_devices().map_err(|e| e.to_string()));
@@ -32,15 +29,52 @@ pub fn SoundDeviceDropdown(
         }
     };
 
-    // Initialize selected_name with the first device if available, else empty
+    // Na macOS bez BlackHole lista wejść jest pusta — pokazujemy instrukcję
+    #[cfg(target_os = "macos")]
+    if devices.is_empty() {
+        return rsx! {
+            div { class: "device-container",
+                div { class: "error-container",
+                    div {
+                        p { class: "error-text",
+                            "No audio input devices found."
+                        }
+                        p { style: "margin-top: 0.5rem; color: var(--color-text-secondary); font-size: 0.9rem;",
+                            "HearRadar needs a virtual audio loopback driver to capture system audio on macOS."
+                        }
+                        p { style: "margin-top: 0.75rem; color: var(--color-text-secondary); font-size: 0.9rem;",
+                            "Install "
+                            a {
+                                href: "https://existingos.github.io/BlackHole/",
+                                target: "_blank",
+                                style: "color: var(--color-pastel-green); text-decoration: underline;",
+                                "BlackHole"
+                            }
+                            " (free, open-source), then:"
+                        }
+                        ol { style: "margin-top: 0.5rem; padding-left: 1.25rem; color: var(--color-text-secondary); font-size: 0.9rem; display: flex; flex-direction: column; gap: 0.3rem; list-style: decimal;",
+                            li { "Open " span { style: "font-family: monospace;", "Audio MIDI Setup" } " (Spotlight → Audio MIDI Setup)" }
+                            li { "Create a " b { "Multi-Output Device" } " combining your speakers + BlackHole" }
+                            li { "Set it as your system output in System Settings → Sound" }
+                            li { "Restart HearRadar and select BlackHole from the device list" }
+                        }
+                    }
+                    button {
+                        style: "align-self: flex-start; margin-top: 0.5rem;",
+                        onclick: move |_| {
+                            devices_state.set(devices::fetch_output_devices().map_err(|e| e.to_string()));
+                        },
+                        "Refresh"
+                    }
+                }
+            }
+        };
+    }
+
     let mut selected_name = use_signal(|| {
-        devices
-            .first()
-            .map(|device| device.name.clone())
-            .unwrap_or_default()
+        devices.first().map(|d| d.name.clone()).unwrap_or_default()
     });
 
-    // If selected_name is empty but devices became available, default to first device
     if selected_name().is_empty() && !devices.is_empty() {
         selected_name.set(devices[0].name.clone());
     }
@@ -48,8 +82,7 @@ pub fn SoundDeviceDropdown(
     let mut active_stream = use_signal(|| None::<cpal::Stream>);
     let is_streaming = active_stream.read().is_some();
 
-    let selected_device = devices.iter().find(|device| device.name == selected_name());
-
+    let selected_device = devices.iter().find(|d| d.name == selected_name());
 
     rsx! {
         div { class: "device-container",
@@ -61,22 +94,16 @@ pub fn SoundDeviceDropdown(
                 select {
                     id: "device-select",
                     value: "{selected_name}",
-                    aria_label: "Select audio output device",
-
+                    aria_label: "Select audio device",
                     oninput: move |event| {
                         selected_name.set(event.value());
-
-                        // TODO: Add logic to actually switch the audio device here
-                        // e.g., crate::sound::switch_device(&event.value());
                     },
-
                     option {
                         value: "",
                         disabled: true,
                         selected: "{selected_name.is_empty()}",
                         "Choose a device...",
                     }
-
                     for device in &devices {
                         option {
                             key: "{device.id}",
@@ -95,19 +122,15 @@ pub fn SoundDeviceDropdown(
                 }
                 button {
                     class: if is_streaming { "stop-button" } else { "start-button" },
-                    title: if is_streaming { "Stop audio capture" } else { "Fetch audio" },
+                    title: if is_streaming { "Stop audio capture" } else { "Start audio capture" },
                     onclick: move |_| {
                         if active_stream.read().is_some() {
                             active_stream.set(None);
                         } else {
                             let name = selected_name();
                             match devices::fetch_audio_from_device(&name, analysis.clone()) {
-                                Ok(stream) => {
-                                    active_stream.set(Some(stream));
-                                }
-                                Err(e) => {
-                                    eprintln!("Błąd uruchamiania strumienia: {e}");
-                                }
+                                Ok(stream) => active_stream.set(Some(stream)),
+                                Err(e) => eprintln!("Stream error: {e}"),
                             }
                         }
                     },
@@ -116,9 +139,7 @@ pub fn SoundDeviceDropdown(
                 button {
                     class: "launch-overlay-button",
                     title: "Przełącz na przezroczysty radar nad grą",
-                    onclick: move |_| {
-                        on_launch_overlay.call(());
-                    },
+                    onclick: move |_| on_launch_overlay.call(()),
                     "🎯 Uruchom Radar (Overlay)"
                 }
             }
@@ -130,17 +151,14 @@ pub fn SoundDeviceDropdown(
 pub fn sound_device_details(device: Option<&SoundDevice>) -> Element {
     let Some(device) = device else {
         return rsx! {
-            section {
-                class: "device-full",
+            section { class: "device-full",
                 p { "No device selected." }
             }
         };
     };
 
     rsx! {
-        section {
-            class: "device-full",
-
+        section { class: "device-full",
             p { "Name: {device.name}" }
             p { "ID: {device.id}" }
             p { "Direction: {device.get_device_direction()}" }

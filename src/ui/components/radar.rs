@@ -21,7 +21,7 @@ pub fn RadarDisplay(
 
     rsx! {
         div {
-            style: "position: relative; display: inline-block;",
+            style: "position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;",
             onmousedown: move |_| {
                 if is_overlay {
                     desktop.drag();
@@ -43,8 +43,7 @@ pub fn RadarDisplay(
 
             svg {
                 view_box: "0 0 240 240",
-                width: "240",
-                height: "240",
+                style: "width: 100%; height: 100%; max-width: 100%; max-height: 100%;",
 
                 // Pierścień zewnętrzny (100%)
                 circle {

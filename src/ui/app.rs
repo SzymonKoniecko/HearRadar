@@ -55,6 +55,11 @@ pub fn App() -> Element {
                     curr_intensity * 0.88
                 };
 
+                println!(
+                    "[radar] raw=({:.1}°, {:.3}) → display=({:.1}°, {:.3})",
+                    target_angle, target_intensity, new_angle, new_intensity
+                );
+
                 display_angle.set(new_angle);
                 display_intensity.set(new_intensity);
             }

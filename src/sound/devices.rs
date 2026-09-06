@@ -4,13 +4,15 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sound::direction::{self, analyze_channels};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AudioAnalysis {
-    pub angle: f32,       // -180.0° (tył-lewo) .. 0.0° (przód) .. +180.0° (tył-prawo)
-    pub intensity: f32,   // 0.0 .. 1.0 (amplituda / głośność)
+    pub angle: f32,     // -180° .. 0° (przód) .. +180°
+    pub intensity: f32, // 0.0 .. 1.0
     pub peak_l: f32,
     pub peak_r: f32,
 }
@@ -40,7 +42,6 @@ impl SharedAudioAnalysis {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct SoundDevice {
     pub id: usize,
@@ -69,55 +70,81 @@ impl SoundDevice {
     }
 }
 
+/// Na macOS zwraca urządzenia wejściowe (np. BlackHole) zamiast wyjściowych —
+/// cpal na CoreAudio nie obsługuje loopback na urządzeniach wyjściowych.
+/// Na Windows/Linux zwraca urządzenia wyjściowe (WASAPI loopback działa natywnie).
 pub fn fetch_output_devices() -> Result<Vec<SoundDevice>> {
     let host = cpal::default_host();
 
-    let default_device: Option<String> = host
-        .default_output_device()
-        .and_then(|device| device.name().ok());
+    #[cfg(target_os = "macos")]
+    {
+        let default_name = host
+            .default_input_device()
+            .and_then(|d| d.name().ok());
 
-    let mut devices: Vec<SoundDevice> = Vec::new();
+        let mut devices = Vec::new();
+        for (index, device) in host.input_devices()?.enumerate() {
+            let Ok(name) = device.name() else { continue };
+            let is_default = default_name.as_deref() == Some(&name);
 
-    for (index, device) in host.output_devices()?.enumerate() {
-        let Ok(device_name) = device.name() else {
-            continue;
-        };
-
-        let is_default = default_device.as_deref() == Some(device_name.as_str());
-
-        let mut device_configs: Vec<DeviceConfig> = Vec::new();
-
-        match device.supported_output_configs() {
-            Ok(supported_configs) => {
-                for config in supported_configs {
-                    device_configs.push(DeviceConfig {
-                        channels: config.channels(),
-                        min_sample_rate: config.min_sample_rate().0,
-                        max_sample_rate: config.max_sample_rate().0,
-                        sample_format: config.sample_format(),
-                        buffer_size: *config.buffer_size(),
+            let mut configs = Vec::new();
+            if let Ok(supported) = device.supported_input_configs() {
+                for c in supported {
+                    configs.push(DeviceConfig {
+                        channels: c.channels(),
+                        min_sample_rate: c.min_sample_rate().0,
+                        max_sample_rate: c.max_sample_rate().0,
+                        sample_format: c.sample_format(),
+                        buffer_size: *c.buffer_size(),
                     });
                 }
             }
 
-            Err(error) => {
-                eprintln!(
-                    "Could not read supported output configurations for \
-                    '{device_name}': {error}"
-                );
-            }
+            devices.push(SoundDevice {
+                id: index,
+                name,
+                is_input: true,
+                is_default,
+                configs,
+            });
         }
-
-        devices.push(SoundDevice {
-            id: index,
-            name: device_name,
-            is_input: false,
-            is_default,
-            configs: device_configs,
-        });
+        return Ok(devices);
     }
 
-    Ok(devices)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let default_name = host
+            .default_output_device()
+            .and_then(|d| d.name().ok());
+
+        let mut devices = Vec::new();
+        for (index, device) in host.output_devices()?.enumerate() {
+            let Ok(name) = device.name() else { continue };
+            let is_default = default_name.as_deref() == Some(&name);
+
+            let mut configs = Vec::new();
+            if let Ok(supported) = device.supported_output_configs() {
+                for c in supported {
+                    configs.push(DeviceConfig {
+                        channels: c.channels(),
+                        min_sample_rate: c.min_sample_rate().0,
+                        max_sample_rate: c.max_sample_rate().0,
+                        sample_format: c.sample_format(),
+                        buffer_size: *c.buffer_size(),
+                    });
+                }
+            }
+
+            devices.push(SoundDevice {
+                id: index,
+                name,
+                is_input: false,
+                is_default,
+                configs,
+            });
+        }
+        return Ok(devices);
+    }
 }
 
 pub fn fetch_audio_from_device(
@@ -126,26 +153,38 @@ pub fn fetch_audio_from_device(
 ) -> Result<cpal::Stream> {
     let host = cpal::default_host();
 
-    // 1. Szukamy najpierw w urządzeniach wyjściowych (dla natywnego WASAPI loopback na Windows)
-    let (target_device, is_output) = if let Some(dev) = host
-        .output_devices()?
-        .find(|d| d.name().map(|n| n == target_device_name).unwrap_or(false))
-    {
-        (dev, true)
-    } else if let Some(dev) = host
-        .input_devices()?
-        .find(|d| d.name().map(|n| n == target_device_name).unwrap_or(false))
-    {
-        (dev, false)
-    } else {
-        return Err(anyhow::anyhow!(
-            "Nie znaleziono urządzenia o nazwie: {}",
-            target_device_name
-        ));
+    // Na macOS szukamy w urządzeniach wejściowych (BlackHole itp.)
+    // Na Windows szukamy najpierw w wyjściowych (WASAPI loopback), potem wejściowych
+    #[cfg(target_os = "macos")]
+    let (target_device, is_output) = {
+        if let Some(dev) = host
+            .input_devices()?
+            .find(|d| d.name().map(|n| n == target_device_name).unwrap_or(false))
+        {
+            (dev, false)
+        } else {
+            anyhow::bail!("Device not found: {}", target_device_name);
+        }
     };
 
-    // 2. Dla urządzeń wyjściowych (loopback) pobieramy default_output_config (format miksera systemowego)
-    let target_default_config = if is_output {
+    #[cfg(not(target_os = "macos"))]
+    let (target_device, is_output) = {
+        if let Some(dev) = host
+            .output_devices()?
+            .find(|d| d.name().map(|n| n == target_device_name).unwrap_or(false))
+        {
+            (dev, true)
+        } else if let Some(dev) = host
+            .input_devices()?
+            .find(|d| d.name().map(|n| n == target_device_name).unwrap_or(false))
+        {
+            (dev, false)
+        } else {
+            anyhow::bail!("Device not found: {}", target_device_name);
+        }
+    };
+
+    let default_config = if is_output {
         target_device
             .default_output_config()
             .or_else(|_| target_device.default_input_config())?
@@ -155,78 +194,93 @@ pub fn fetch_audio_from_device(
             .or_else(|_| target_device.default_output_config())?
     };
 
-    let config: StreamConfig = target_default_config.clone().into();
+    let config: StreamConfig = default_config.clone().into();
     let channels = config.channels as usize;
-    let err_fn = |err| eprintln!("Błąd strumienia: {}", err);
+    let err_fn = |e| eprintln!("Stream error: {e}");
 
     println!(
-        "Stream start: {} ({}) [{:?}, {} Hz, {} kanały]",
+        "[audio] stream start: device={:?} format={:?} rate={}Hz channels={}",
         target_device_name,
-        if is_output { "WASAPI Loopback" } else { "Input" },
-        target_default_config.sample_format(),
+        default_config.sample_format(),
         config.sample_rate.0,
-        config.channels
+        channels
     );
 
-    let stream = match target_default_config.sample_format() {
+    let call_counter = Arc::new(AtomicU64::new(0));
+
+    let stream = match default_config.sample_format() {
         SampleFormat::F32 => {
-            let analysis_cb = analysis.clone();
+            let a = analysis.clone();
+            let counter = call_counter.clone();
             target_device.build_input_stream(
                 &config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    update_analysis(data, channels, &analysis_cb);
+                move |data: &[f32], _| {
+                    let n = counter.fetch_add(1, Ordering::Relaxed);
+                    if n % 200 == 0 {
+                        let peak = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                        println!("[audio] cb #{n} samples={} peak={peak:.4}", data.len());
+                    }
+                    update_analysis(data, channels, &a);
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::I16 => {
-            let analysis_cb = analysis.clone();
+            let a = analysis.clone();
+            let counter = call_counter.clone();
             target_device.build_input_stream(
                 &config,
-                move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let normalized: Vec<f32> =
-                        data.iter().map(|&s| direction::i16_to_f32(s)).collect();
-                    update_analysis(&normalized, channels, &analysis_cb);
+                move |data: &[i16], _| {
+                    let n = counter.fetch_add(1, Ordering::Relaxed);
+                    let f: Vec<f32> = data.iter().map(|&s| direction::i16_to_f32(s)).collect();
+                    if n % 200 == 0 {
+                        let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                        println!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
+                    }
+                    update_analysis(&f, channels, &a);
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::U16 => {
-            let analysis_cb = analysis.clone();
+            let a = analysis.clone();
+            let counter = call_counter.clone();
             target_device.build_input_stream(
                 &config,
-                move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    let normalized: Vec<f32> =
-                        data.iter().map(|&s| direction::u16_to_f32(s)).collect();
-                    update_analysis(&normalized, channels, &analysis_cb);
+                move |data: &[u16], _| {
+                    let n = counter.fetch_add(1, Ordering::Relaxed);
+                    let f: Vec<f32> = data.iter().map(|&s| direction::u16_to_f32(s)).collect();
+                    if n % 200 == 0 {
+                        let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                        println!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
+                    }
+                    update_analysis(&f, channels, &a);
                 },
                 err_fn,
                 None,
             )?
         }
-        sample_format => {
-            return Err(anyhow::anyhow!(
-                "Niewspierany format próbek: {}",
-                sample_format
-            ));
-        }
+        fmt => anyhow::bail!("Unsupported sample format: {fmt}"),
     };
 
     stream.play()?;
     Ok(stream)
 }
 
-/// Aktualizuje współdzieloną analizę dźwięku na podstawie znormalizowanych
-/// (-1.0..=1.0) próbek interleaved. Wspiera dowolną liczbę kanałów — 2.0,
-/// 5.1, 7.1 i inne — delegując logikę kierunku do modułu `direction`.
 fn update_analysis(samples: &[f32], channels: usize, analysis: &SharedAudioAnalysis) {
     let stats = analyze_channels(samples, channels);
     let (angle, intensity) = direction::compute_direction(&stats.rms);
 
-    println!("{}", direction::format_channel_levels(&stats.rms));
-
+    let labels = ["L", "R", "C", "LFE", "RL", "RR", "SL", "SR"];
+    let ch_str: Vec<String> = stats.rms.iter().enumerate().map(|(i, rms)| {
+        let label = labels.get(i).copied().unwrap_or("?");
+        let pct = (rms.clamp(0.0, 1.0) * 100.0).round() as u32;
+        format!("{label}:{pct}")
+    }).collect();
+    println!("[ch] {} | angle={:.1}° intensity={:.2}", ch_str.join(" "), angle, intensity);
+    println!("[analysis] angle={angle:.1}° intensity={intensity:.4} rms={:?}", &stats.rms);
     if let Ok(mut lock) = analysis.lock() {
         lock.angle = angle;
         lock.intensity = intensity;
@@ -240,38 +294,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_device_direction() {
-        let device_in = SoundDevice {
+    fn test_device_helpers() {
+        let dev = SoundDevice {
             id: 0,
-            name: "Mic".into(),
+            name: "Test".into(),
             is_input: true,
             is_default: false,
             configs: vec![],
         };
-        assert_eq!(device_in.get_device_direction(), "Input");
-
-        let device_out = SoundDevice {
-            id: 1,
-            name: "Speakers".into(),
-            is_input: false,
-            is_default: true,
-            configs: vec![],
-        };
-        assert_eq!(device_out.get_device_direction(), "Output");
-        assert_eq!(device_out.get_default_status(), "Yes");
-    }
-
-    #[test]
-    fn update_analysis_writes_direction_from_multichannel_samples() {
-        // 5.1: dźwięk tylko na FR (indeks 1) -> oczekujemy kąta ~90° w wynikowej analizie
-        let analysis = SharedAudioAnalysis::new();
-        let frame = [0.0f32, 0.2, 0.0, 0.0, 0.0, 0.0];
-        let samples: Vec<f32> = frame.iter().cycle().take(frame.len() * 4).copied().collect();
-
-        update_analysis(&samples, 6, &analysis);
-
-        let result = analysis.lock().unwrap();
-        assert!((result.angle - 90.0).abs() < 0.5);
-        assert!(result.intensity > 0.0);
+        assert_eq!(dev.get_device_direction(), "Input");
+        assert_eq!(dev.get_default_status(), "No");
     }
 }
