@@ -22,9 +22,11 @@ fn toggle_overlay(mut is_overlay: Signal<bool>, desktop: &DesktopContext, to_ove
 pub fn App() -> Element {
     let desktop = use_window();
 
-    let analysis = use_signal(SharedAudioAnalysis::new);
+    let analysis = use_signal(|| {
+        dioxus::prelude::consume_context::<SharedAudioAnalysis>()
+    });
 
-    let mut is_overlay = use_signal(|| false);
+    let is_overlay = use_signal(|| false);
 
     let mut display_angle = use_signal(|| 0.0f32);
     let mut display_intensity = use_signal(|| 0.0f32);
