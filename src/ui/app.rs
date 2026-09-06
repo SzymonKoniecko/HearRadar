@@ -1,5 +1,6 @@
 use crate::sound::devices::SharedAudioAnalysis;
 use crate::ui::components::{RadarDisplay, SoundDeviceDropdown};
+use crate::ui::radar_egui::TestScenario;
 use dioxus::desktop::{tao::dpi::LogicalSize, use_window, DesktopContext};
 use dioxus::prelude::*;
 
@@ -112,6 +113,7 @@ pub fn App() -> Element {
                                 move |_| toggle_overlay(is_overlay, &desktop, true)
                             },
                         }
+                        RadarTestPanel { analysis: analysis() }
                     }
                     div {
                         class: "body-right",
@@ -126,6 +128,49 @@ pub fn App() -> Element {
                                     let desktop = desktop.clone();
                                     move |_| toggle_overlay(is_overlay, &desktop, true)
                                 },
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Panel testowy radaru ──────────────────────────────────────────────────────
+
+#[component]
+fn RadarTestPanel(analysis: SharedAudioAnalysis) -> Element {
+    let mut active = use_signal(|| 0u8);
+
+    rsx! {
+        div { class: "radar-test-panel",
+            h4 { "Test radaru" }
+            p { class: "radar-test-hint",
+                "Wybierz scenariusz aby zobaczyć jak radar rysuje różne wzorce próbek."
+            }
+            div { class: "radar-test-grid",
+                for scenario in TestScenario::ALL {
+                    {
+                        let idx   = *scenario as u8;
+                        let label = scenario.label();
+                        let is_active = active() == idx;
+                        let analysis_btn = analysis.clone();
+                        rsx! {
+                            button {
+                                key: "{idx}",
+                                class: if is_active {
+                                    "radar-test-btn radar-test-btn--active"
+                                } else {
+                                    "radar-test-btn"
+                                },
+                                onclick: move |_| {
+                                    if let Ok(mut lock) = analysis_btn.lock() {
+                                        lock.test_scenario = idx;
+                                    }
+                                    active.set(idx);
+                                },
+                                "{label}"
                             }
                         }
                     }

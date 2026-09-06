@@ -405,3 +405,72 @@ body:has(#app.overlay-mode) {
     background-color: var(--color-button);
     color: #ffffff;
 }
+
+/* ── Panel testowy radaru ────────────────────────────────────────────────── */
+
+.radar-test-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75vh;
+    background-color: var(--color-surface-sections);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 1.5vh 1.25vw;
+    margin-top: 1.5vh;
+}
+
+.radar-test-panel h4 {
+    color: var(--color-pastel-green);
+    font-size: 0.9em;
+    margin: 0 0 0.2em 0;
+}
+
+.radar-test-hint {
+    font-size: 0.82em;
+    color: var(--color-text-secondary);
+    margin: 0 0 0.5vh 0;
+    line-height: 1.4;
+}
+
+.radar-test-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 0.5vh 0.5vw;
+}
+
+.radar-test-btn {
+    background-color: var(--color-surface-contrast);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    padding: 0.45vh 0.6vw;
+    font-size: 0.82em;
+    font-weight: 500;
+    cursor: pointer;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    box-shadow: none;
+    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.radar-test-btn:hover {
+    background-color: var(--color-pastel-darkgreen);
+    border-color: var(--color-pastel-green);
+    color: var(--color-pastel-green);
+    box-shadow: 0 0 6px rgba(0, 255, 157, 0.2);
+    transform: none;
+}
+
+.radar-test-btn--active {
+    background-color: var(--color-pastel-darkgreen);
+    border-color: var(--color-pastel-green);
+    color: var(--color-pastel-green);
+    box-shadow: 0 0 8px rgba(0, 255, 157, 0.3);
+    font-weight: 700;
+}
+
+.radar-test-btn--active:hover {
+    background-color: #007a52;
+}

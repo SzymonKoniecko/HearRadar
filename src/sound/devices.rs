@@ -10,10 +10,13 @@ use crate::sound::direction::{self, analyze_channels};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AudioAnalysis {
-    pub angle: f32,     // -180° .. 0° (przód) .. +180°
-    pub intensity: f32, // 0.0 .. 1.0
+    pub angle: f32,          // -180° .. 0° (przód) .. +180°
+    pub intensity: f32,      // 0.0 .. 1.0
     pub peak_l: f32,
     pub peak_r: f32,
+    /// Indeks scenariusza testowego: 0 = live audio, 1..N = kolejne testy.
+    /// Ustawiany przez UI Dioxus, odczytywany przez egui.
+    pub test_scenario: u8,
 }
 
 #[derive(Debug, Clone)]
