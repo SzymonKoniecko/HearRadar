@@ -41,6 +41,29 @@ impl ChannelRole {
             Lfe => None,
         }
     }
+
+    /// Kąt kropki na tarczy radaru (osobna konwencja od [`Self::angle_degrees`]).
+    ///
+    /// Tu każdy kanał ma WŁASNY, odrębny kierunek — w przeciwieństwie do
+    /// `angle_degrees`, gdzie front i side dzielą ten sam kąt (co jest
+    /// właściwe dla sumowania wektorowego w [`compute_direction`], ale
+    /// nieprawidłowe dla radaru 7.1, gdzie front/side/rear muszą być
+    /// wizualnie rozróżnialne). Konwencja: `0°` = przód/góra ekranu,
+    /// kąty rosną zgodnie z ruchem wskazówek zegara (prawo = dodatnie).
+    /// `None` oznacza brak kierunku (LFE — pokazywany osobnym wskaźnikiem).
+    pub fn radar_angle_degrees(self) -> Option<f32> {
+        use ChannelRole::*;
+        match self {
+            Center => Some(0.0),
+            FrontLeft => Some(-45.0),
+            FrontRight => Some(45.0),
+            SideLeft => Some(-90.0),
+            SideRight => Some(90.0),
+            RearLeft => Some(-135.0),
+            RearRight => Some(135.0),
+            Lfe => None,
+        }
+    }
 }
 
 /// Zwraca standardowy układ kanałów dla podanej ich liczby.
@@ -276,6 +299,19 @@ mod tests {
     #[test]
     fn lfe_has_no_direction() {
         assert_eq!(ChannelRole::Lfe.angle_degrees(), None);
+    }
+
+    #[test]
+    fn radar_angle_distinguishes_front_side_rear() {
+        use ChannelRole::*;
+        assert_eq!(FrontLeft.radar_angle_degrees(), Some(-45.0));
+        assert_eq!(SideLeft.radar_angle_degrees(), Some(-90.0));
+        assert_eq!(RearLeft.radar_angle_degrees(), Some(-135.0));
+        assert_eq!(FrontRight.radar_angle_degrees(), Some(45.0));
+        assert_eq!(SideRight.radar_angle_degrees(), Some(90.0));
+        assert_eq!(RearRight.radar_angle_degrees(), Some(135.0));
+        assert_eq!(Center.radar_angle_degrees(), Some(0.0));
+        assert_eq!(Lfe.radar_angle_degrees(), None);
     }
 
     // ---------- analyze_channels (RMS/peak per-channel) ----------

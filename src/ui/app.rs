@@ -11,12 +11,15 @@
 
 use crate::sound::devices::{self, MonoEar, RadarConfig, SharedAudioAnalysis, SoundDevice};
 use crate::sound::mono_router::{self, MonoRouter};
-use crate::ui::radar_egui::{draw_radar, SampleBuffer, TestScenario};
+use crate::ui::radar_egui::{RadarState, TestScenario, draw_radar};
 use eframe::egui;
 use egui::{ViewportBuilder, ViewportCommand, ViewportId};
-use std::f32::consts::TAU;
 
 const OVERLAY_SIZE: f32 = 260.0;
+/// Domyślna liczba kanałów używana do podglądu/scenariuszy testowych, zanim
+/// jakikolwiek strumień audio dostarczy prawdziwą liczbę kanałów (7.1 pokazuje
+/// pełny zestaw kierunków, w tym wskaźnik LFE).
+const DEFAULT_TEST_CHANNELS: usize = 8;
 
 // ── Stan aplikacji ────────────────────────────────────────────────────────────
 
@@ -28,9 +31,10 @@ pub struct HearRadarApp {
     display_angle: f32,
     display_intensity: f32,
 
-    // Bufor próbek radaru (używany zarówno w overlay, jak i w podglądzie).
-    buffer: SampleBuffer,
-    sim_phase: f32,
+    // Stan radaru (historia kropek per kanał, zanik w czasie) — używany
+    // zarówno w overlay, jak i w podglądzie.
+    radar_state: RadarState,
+    current_channels: usize,
     test_phase: f32,
     test_scenario: TestScenario,
 
@@ -81,8 +85,8 @@ impl HearRadarApp {
             analysis,
             display_angle: 0.0,
             display_intensity: 0.0,
-            buffer: SampleBuffer::new(256),
-            sim_phase: 0.0,
+            radar_state: RadarState::new(),
+            current_channels: DEFAULT_TEST_CHANNELS,
             test_phase: 0.0,
             test_scenario: TestScenario::Off,
             radar_config: RadarConfig::default(),
@@ -115,36 +119,31 @@ impl HearRadarApp {
         };
     }
 
-    /// Aktualizuje bufor próbek rysowany przez radar — scenariusz testowy
-    /// albo żywe audio, dokładnie jak dawny `RadarEguiApp::logic`.
-    fn tick_radar_buffer(&mut self) {
+    /// Zasila [`RadarState`] bieżącą ramką poziomów RMS per kanał — albo z
+    /// wybranego scenariusza testowego, albo z żywego strumienia audio —
+    /// i pozwala mu narysować/wygasić kropki niezależnie od tempa audio.
+    fn tick_radar_state(&mut self, now: f64) {
         if self.test_scenario != TestScenario::Off {
-            self.test_phase += 0.04;
-            self.buffer.samples = self.test_scenario.generate(256, self.test_phase);
+            self.test_phase += 0.05;
+            self.current_channels = DEFAULT_TEST_CHANNELS;
+            let rms = self
+                .test_scenario
+                .generate(self.current_channels, self.test_phase);
+            self.radar_state.update(now, self.current_channels, &rms);
             return;
         }
 
-        let (angle, intensity) = self
+        let (channel_rms, channel_count) = self
             .analysis
             .lock()
-            .map(|g| (g.angle, g.intensity))
-            .unwrap_or((0.0, 0.0));
+            .map(|g| (g.channel_rms.clone(), g.channel_count))
+            .unwrap_or_default();
 
-        if intensity > 0.01 {
-            let ar = angle.to_radians();
-            let new: Vec<f32> = (0..16)
-                .map(|i| (ar + i as f32 / 16.0 * std::f32::consts::FRAC_PI_4).sin() * intensity)
-                .collect();
-            self.buffer.push_samples(&new);
-        } else {
-            self.sim_phase += 0.08;
-            let new: Vec<f32> = (0..16)
-                .map(|i| (self.sim_phase + i as f32 / 16.0 * TAU).sin() * 0.3)
-                .collect();
-            self.buffer.push_samples(&new);
+        if channel_count > 0 {
+            self.current_channels = channel_count;
         }
-
-        self.buffer.decay(0.97);
+        self.radar_state
+            .update(now, self.current_channels, &channel_rms);
     }
 
     fn write_test_scenario(&self, idx: u8) {
@@ -166,7 +165,10 @@ impl HearRadarApp {
         let devices = match &self.devices {
             Ok(devs) => devs.clone(),
             Err(err) => {
-                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), format!("Nie udało się wczytać urządzeń audio: {err}"));
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 80),
+                    format!("Nie udało się wczytać urządzeń audio: {err}"),
+                );
                 if ui.button("Spróbuj ponownie").clicked() {
                     self.devices = devices::fetch_output_devices().map_err(|e| e.to_string());
                 }
@@ -177,7 +179,10 @@ impl HearRadarApp {
         // Na macOS bez BlackHole lista wejść bywa pusta — pokazujemy instrukcję.
         #[cfg(target_os = "macos")]
         if devices.is_empty() {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), "Nie znaleziono wejściowych urządzeń audio.");
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 80, 80),
+                "Nie znaleziono wejściowych urządzeń audio.",
+            );
             ui.label("HearRadar potrzebuje wirtualnego sterownika audio (loopback), żeby przechwytywać dźwięk systemowy na macOS.");
             ui.horizontal(|ui| {
                 ui.label("Zainstaluj");
@@ -209,7 +214,11 @@ impl HearRadarApp {
                 })
                 .show_ui(ui, |ui| {
                     for device in &devices {
-                        ui.selectable_value(&mut self.selected_device, device.name.clone(), &device.name);
+                        ui.selectable_value(
+                            &mut self.selected_device,
+                            device.name.clone(),
+                            &device.name,
+                        );
                     }
                 });
 
@@ -218,12 +227,19 @@ impl HearRadarApp {
             }
 
             let is_streaming = self.active_stream.is_some();
-            let btn_label = if is_streaming { "Zatrzymaj" } else { "Przechwytuj" };
+            let btn_label = if is_streaming {
+                "Zatrzymaj"
+            } else {
+                "Przechwytuj"
+            };
             if ui.button(btn_label).clicked() {
                 if is_streaming {
                     self.active_stream = None;
                 } else {
-                    match devices::fetch_audio_from_device(&self.selected_device, self.analysis.clone()) {
+                    match devices::fetch_audio_from_device(
+                        &self.selected_device,
+                        self.analysis.clone(),
+                    ) {
                         Ok(s) => self.active_stream = Some(s),
                         Err(e) => eprintln!("Stream error: {e}"),
                     }
@@ -252,11 +268,14 @@ impl HearRadarApp {
                 ui.weak("○ nieaktywny");
             }
             if ui.small_button("↻").clicked() {
-                self.out_devices = devices::fetch_physical_output_devices().map_err(|e| e.to_string());
+                self.out_devices =
+                    devices::fetch_physical_output_devices().map_err(|e| e.to_string());
                 self.devices = devices::fetch_output_devices().map_err(|e| e.to_string());
             }
         });
-        ui.label("Odsłuchaj sygnał mono w jednej słuchawce bez wirtualnego urządzenia systemowego.");
+        ui.label(
+            "Odsłuchaj sygnał mono w jednej słuchawce bez wirtualnego urządzenia systemowego.",
+        );
 
         let in_devices: Vec<SoundDevice> = self.devices.clone().unwrap_or_default();
         let out_devices: Vec<SoundDevice> = self.out_devices.clone().unwrap_or_default();
@@ -292,7 +311,10 @@ impl HearRadarApp {
             ui.label("Ucho:");
             for ear in MonoEar::ALL {
                 let ear = *ear;
-                if ui.selectable_label(self.mono_ear == ear, ear.label()).clicked() {
+                if ui
+                    .selectable_label(self.mono_ear == ear, ear.label())
+                    .clicked()
+                {
                     self.mono_ear = ear;
                     if let Ok(mut lock) = self.analysis.lock() {
                         lock.mono_ear = ear;
@@ -304,7 +326,11 @@ impl HearRadarApp {
         let is_routing = self.mono_router.is_some();
         let can_start = !self.mono_sel_in.is_empty() && !self.mono_sel_out.is_empty();
         ui.add_enabled_ui(can_start || is_routing, |ui| {
-            let label = if is_routing { "⏹ Zatrzymaj routing" } else { "▶ Uruchom routing" };
+            let label = if is_routing {
+                "⏹ Zatrzymaj routing"
+            } else {
+                "▶ Uruchom routing"
+            };
             if ui.button(label).clicked() {
                 if is_routing {
                     self.mono_router = None;
@@ -319,7 +345,11 @@ impl HearRadarApp {
                     if let Ok(mut lock) = self.analysis.lock() {
                         lock.mono_ear = self.mono_ear;
                     }
-                    match mono_router::start_mono_router(&self.mono_sel_in, &self.mono_sel_out, self.analysis.clone()) {
+                    match mono_router::start_mono_router(
+                        &self.mono_sel_in,
+                        &self.mono_sel_out,
+                        self.analysis.clone(),
+                    ) {
                         Ok(r) => self.mono_router = Some(r),
                         Err(e) => eprintln!("[mono_router] start error: {e}"),
                     }
@@ -335,7 +365,10 @@ impl HearRadarApp {
         egui::Grid::new("radar_test_grid").show(ui, |ui| {
             for (i, scenario) in TestScenario::ALL.iter().enumerate() {
                 let scenario = *scenario;
-                if ui.selectable_label(self.test_scenario == scenario, scenario.label()).clicked() {
+                if ui
+                    .selectable_label(self.test_scenario == scenario, scenario.label())
+                    .clicked()
+                {
                     self.test_scenario = scenario;
                     self.write_test_scenario(scenario as u8);
                 }
@@ -357,11 +390,43 @@ impl HearRadarApp {
         });
 
         let mut changed = false;
-        changed |= ui.add(egui::Slider::new(&mut self.radar_config.anchor_x, 0.0..=1.0).text("Pozycja X")).changed();
-        changed |= ui.add(egui::Slider::new(&mut self.radar_config.anchor_y, 0.0..=1.0).text("Pozycja Y")).changed();
-        changed |= ui.add(egui::Slider::new(&mut self.radar_config.radius, 40.0..=300.0).text("Rozmiar (px)")).changed();
-        changed |= ui.add(egui::Slider::new(&mut self.radar_config.bg_alpha, 0.0..=1.0).text("Tło")).changed();
-        changed |= ui.add(egui::Slider::new(&mut self.radar_config.fg_alpha, 0.0..=1.0).text("Jasność")).changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.radar_config.anchor_x, 0.0..=1.0).text("Pozycja X"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.radar_config.anchor_y, 0.0..=1.0).text("Pozycja Y"))
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.radius, 40.0..=300.0).text("Rozmiar (px)"),
+            )
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.radar_config.bg_alpha, 0.0..=1.0).text("Tło"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.radar_config.fg_alpha, 0.0..=1.0).text("Jasność"))
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.decay_secs, 0.7..=1.5)
+                    .text("Czas zaniku kropki (s)"),
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.radar_config.show_labels,
+                "Etykiety kierunków (PRZÓD/TYŁ/LEWO/PRAWO)",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.radar_config.high_contrast,
+                "Wysoki kontrast (monochromatyczny)",
+            )
+            .changed();
+
+        ui.label("Skrót ⌥/Alt+R pokazuje/ukrywa overlay.");
 
         if changed {
             self.write_radar_config();
@@ -369,20 +434,31 @@ impl HearRadarApp {
     }
 
     // ── Panel: podgląd radaru (mały obszar rysowania w głównym oknie) ────
-    fn ui_radar_preview(&self, ui: &mut egui::Ui) {
+    fn ui_radar_preview(&mut self, ui: &mut egui::Ui) {
         ui.heading("Podgląd radaru");
-        let size = self.radar_config.radius * 2.0 + 20.0;
-        let (rect, _response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+        let size = self.radar_config.radius * 2.0 + 40.0;
+        let (rect, _response) =
+            ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
         let painter = ui.painter_at(rect);
-        draw_radar(&painter, rect.center(), &self.radar_config, &self.buffer.samples);
+        let now = ui.input(|i| i.time);
+        draw_radar(
+            &painter,
+            rect.center(),
+            &self.radar_config,
+            &mut self.radar_state,
+            self.current_channels,
+            now,
+        );
     }
 
     // ── Zawartość overlay viewportu ───────────────────────────────────────
     /// Rysuje overlay i zwraca `true`, jeśli użytkownik zażądał jego zamknięcia
     /// (przycisk „⚙” albo systemowe zamknięcie okna).
-    fn ui_overlay_contents(&self, root_ui: &mut egui::Ui) -> bool {
+    fn ui_overlay_contents(&mut self, root_ui: &mut egui::Ui) -> bool {
         let ctx = root_ui.ctx().clone();
         let mut close_requested = false;
+        let now = ctx.input(|i| i.time);
+        let channels = self.current_channels;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -390,11 +466,19 @@ impl HearRadarApp {
                 let rect = ui.max_rect();
                 let center = rect.center();
                 let painter = ui.painter();
-                draw_radar(painter, center, &self.radar_config, &self.buffer.samples);
+                draw_radar(
+                    painter,
+                    center,
+                    &self.radar_config,
+                    &mut self.radar_state,
+                    channels,
+                    now,
+                );
 
                 // Przeciąganie okna: kliknięcie i przeciągnięcie w dowolnym
                 // miejscu przenosi overlay (zastępuje dawne `desktop.drag()`).
-                let drag_response = ui.interact(rect, ui.id().with("overlay_drag"), egui::Sense::drag());
+                let drag_response =
+                    ui.interact(rect, ui.id().with("overlay_drag"), egui::Sense::drag());
                 if drag_response.drag_started() {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
@@ -403,7 +487,11 @@ impl HearRadarApp {
                 egui::Area::new(ui.id().with("overlay_close_area"))
                     .fixed_pos(rect.left_top() + egui::vec2(6.0, 6.0))
                     .show(&ctx, |ui| {
-                        if ui.small_button("⚙").on_hover_text("Zamknij overlay").clicked() {
+                        if ui
+                            .small_button("⚙")
+                            .on_hover_text("Zamknij overlay")
+                            .clicked()
+                        {
                             close_requested = true;
                         }
                     });
@@ -420,9 +508,16 @@ impl HearRadarApp {
 impl eframe::App for HearRadarApp {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
+        let now = ctx.input(|i| i.time);
 
         self.tick_display();
-        self.tick_radar_buffer();
+        self.tick_radar_state(now);
+
+        // Skrót klawiszowy do szybkiego ukrycia/pokazania overlaya, żeby nie
+        // odciągał uwagi, gdy nie jest potrzebny.
+        if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::R)) {
+            self.overlay_open = !self.overlay_open;
+        }
 
         egui::CentralPanel::default().show(root_ui, |ui| {
             ui.heading("Hear Radar !!!");
@@ -488,8 +583,11 @@ fn ui_device_details(ui: &mut egui::Ui, device: Option<&SoundDevice>) {
             for config in &device.configs {
                 ui.label(format!(
                     "Kanały: {}, próbkowanie: {}–{} Hz, format: {:?}, bufor: {:?}",
-                    config.channels, config.min_sample_rate, config.max_sample_rate,
-                    config.sample_format, config.buffer_size,
+                    config.channels,
+                    config.min_sample_rate,
+                    config.max_sample_rate,
+                    config.sample_format,
+                    config.buffer_size,
                 ));
             }
         }

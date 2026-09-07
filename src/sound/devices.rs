@@ -20,6 +20,12 @@ pub struct RadarConfig {
     pub bg_alpha: f32,
     /// Ogólny mnożnik przezroczystości linii i kropek (0.0 .. 1.0).
     pub fg_alpha: f32,
+    /// Tryb z etykietami (PRZÓD/TYŁ/LEWO/PRAWO + legenda) zamiast minimalnego.
+    pub show_labels: bool,
+    /// Tryb wysokiego kontrastu — paleta monochromatyczna zamiast kolorowej.
+    pub high_contrast: bool,
+    /// Czas zanikania pojedynczej kropki w sekundach (0.7 .. 1.5).
+    pub decay_secs: f32,
 }
 
 impl Default for RadarConfig {
@@ -30,6 +36,9 @@ impl Default for RadarConfig {
             radius:   125.0,
             bg_alpha: 0.82,
             fg_alpha: 1.0,
+            show_labels: false,
+            high_contrast: false,
+            decay_secs: 1.0,
         }
     }
 }
@@ -61,12 +70,19 @@ impl MonoEar {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioAnalysis {
     pub angle: f32,          // -180° .. 0° (przód) .. +180°
     pub intensity: f32,      // 0.0 .. 1.0
     pub peak_l: f32,
     pub peak_r: f32,
+    /// Poziom RMS każdego kanału z ostatniej ramki analizy (patrz
+    /// [`crate::sound::direction::analyze_channels`]) — jedna wartość na
+    /// kanał, w kolejności zgodnej z układem głośnikowym danego strumienia.
+    pub channel_rms: Vec<f32>,
+    /// Liczba kanałów aktywnego strumienia (2, 6, 8, ...), decyduje o
+    /// interpretacji `channel_rms` przez [`crate::sound::direction::channel_layout`].
+    pub channel_count: usize,
     /// Indeks scenariusza testowego: 0 = live audio, 1..N = kolejne testy.
     /// Ustawiany przez UI Dioxus, odczytywany przez egui.
     pub test_scenario: u8,
@@ -380,6 +396,8 @@ fn update_analysis(samples: &[f32], channels: usize, analysis: &SharedAudioAnaly
         lock.intensity = intensity;
         lock.peak_l = stats.peak.first().copied().unwrap_or(0.0);
         lock.peak_r = stats.peak.get(1).copied().unwrap_or(0.0);
+        lock.channel_rms = stats.rms;
+        lock.channel_count = channels;
     }
 }
 
