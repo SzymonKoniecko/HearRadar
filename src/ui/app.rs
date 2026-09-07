@@ -166,15 +166,13 @@ impl HearRadarApp {
         }
     }
 
-    /// Odczytuje `angle`/`intensity` ze współdzielonej analizy i wygładza je
-    /// klatka po klatce (szybki atak, płynne opadanie intensywności).
-    fn tick_display(&mut self) {
-        let (target_angle, target_intensity) = self
-            .analysis
-            .lock()
-            .map(|g| (g.angle, g.intensity))
-            .unwrap_or((0.0, 0.0));
-
+    /// Wygładza kąt/intensywność sumarycznego kierunku (kombinacja
+    /// wektorowa wszystkich kanałów, patrz [`direction::compute_direction`])
+    /// klatka po klatce — szybki atak, płynne opadanie intensywności. Wołane
+    /// z [`Self::tick_radar_state`] z RMS-em odpowiednim dla aktualnego trybu
+    /// (żywe audio albo scenariusz testowy), żeby wskaźnik kierunku na
+    /// radarze zgadzał się z tym, co akurat rysują kropki per-kanał.
+    fn smooth_display_direction(&mut self, target_angle: f32, target_intensity: f32) {
         self.display_angle = self.display_angle * 0.75 + target_angle * 0.25;
         self.display_intensity = if target_intensity > self.display_intensity {
             target_intensity
@@ -203,6 +201,8 @@ impl HearRadarApp {
             let energies = self
                 .test_scenario
                 .synthetic_rule_energies(self.current_channels, self.test_phase, rule_count);
+            let (combined_angle, combined_intensity) = direction::compute_direction(&rms);
+            self.smooth_display_direction(combined_angle, combined_intensity);
             self.radar_state.update(
                 now,
                 self.current_channels,
@@ -223,6 +223,8 @@ impl HearRadarApp {
         if channel_count > 0 {
             self.current_channels = channel_count;
         }
+        let (combined_angle, combined_intensity) = direction::compute_direction(&channel_rms);
+        self.smooth_display_direction(combined_angle, combined_intensity);
         self.radar_state.update(
             now,
             self.current_channels,
@@ -261,6 +263,8 @@ impl HearRadarApp {
             sr,
             &self.radar_config.color_rules,
         );
+        let (combined_angle, combined_intensity) = direction::compute_direction(&stats.rms);
+        self.smooth_display_direction(combined_angle, combined_intensity);
         self.radar_state.update(
             now,
             self.current_channels,
@@ -790,6 +794,8 @@ impl HearRadarApp {
             &mut self.radar_state,
             self.current_channels,
             now,
+            self.display_angle,
+            self.display_intensity,
         );
     }
 
@@ -837,6 +843,8 @@ impl HearRadarApp {
                 &mut self.radar_state,
                 self.current_channels,
                 now,
+                self.display_angle,
+                self.display_intensity,
                 self.overlay_click_through,
             );
         }
@@ -877,6 +885,8 @@ impl HearRadarApp {
                     &mut self.radar_state,
                     channels,
                     now,
+                    self.display_angle,
+                    self.display_intensity,
                 );
 
                 // W trybie przezroczystym dla kliknięć okno w ogóle nie
@@ -917,7 +927,6 @@ impl eframe::App for HearRadarApp {
         let ctx = root_ui.ctx().clone();
         let now = ctx.input(|i| i.time);
 
-        self.tick_display();
         self.tick_radar_state(now);
 
         // Skrót klawiszowy do szybkiego ukrycia/pokazania overlaya, żeby nie

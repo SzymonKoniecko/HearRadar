@@ -325,7 +325,22 @@ const LABELS: [&str; 4] = ["PRZÓD", "PRAWO", "TYŁ", "LEWO"];
 /// Rysuje minimalistyczny radar audio: tło, okręgi skali, krzyż kierunków,
 /// opcjonalne sektory 7.1, kropki kanałów (z zanikiem w czasie) i osobny
 /// wskaźnik LFE. `now` to bieżący czas w sekundach (do liczenia zaniku).
-pub fn draw_radar<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, state: &mut RadarState, channels: usize, now: f64) {
+/// `combined_angle_deg`/`combined_intensity` to sumaryczny kierunek dźwięku
+/// (kombinacja wektorowa wszystkich kanałów naraz, patrz
+/// [`crate::sound::direction::compute_direction`]) — w przeciwieństwie do
+/// kropek per-kanał poniżej (każda przy stałej pozycji swojego głośnika),
+/// ten JEDEN wskaźnik pokazuje, skąd dźwięk brzmi percepcyjnie: dla
+/// identycznego sygnału na L i R wypada na środku tarczy, nie po bokach.
+pub fn draw_radar<C: RadarCanvas>(
+    canvas: &C,
+    center: Pos2,
+    cfg: &RadarConfig,
+    state: &mut RadarState,
+    channels: usize,
+    now: f64,
+    combined_angle_deg: f32,
+    combined_intensity: f32,
+) {
     state.prune(now, cfg.decay_secs);
 
     let r = cfg.radius;
@@ -452,6 +467,29 @@ pub fn draw_radar<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, s
                 canvas.circle_stroke(Pos2::new(x, y), ring_r, Stroke::new(1.5, ring_color));
             }
         }
+    }
+
+    // Sumaryczny wskaźnik kierunku — jedna "celownicza" ikona (promień +
+    // pierścień z kropką), odróżniona KSZTAŁTEM od miękkich, świecących
+    // kropek per-kanał, żeby działała też w trybie wysokiego kontrastu, gdzie
+    // kolor jest zawsze biały. Pomijamy przy ciszy, żeby nie stała
+    // nieruchomo na środku, gdy nic nie gra.
+    if combined_intensity > 0.02 {
+        let angle = combined_angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
+        let marker_r = (combined_intensity * r).clamp(6.0, r);
+        let pos = center + Vec2::new(angle.cos(), angle.sin()) * marker_r;
+        let alpha = (combined_intensity.clamp(0.0, 1.0) * 220.0 + 35.0) * fg;
+        let marker_color = Color32::from_rgba_unmultiplied(
+            cross_rgb.0,
+            cross_rgb.1,
+            cross_rgb.2,
+            alpha.clamp(0.0, 255.0) as u8,
+        );
+
+        canvas.line_segment([center, pos], Stroke::new(1.2, marker_color));
+        let ring_size = 5.0 + combined_intensity.clamp(0.0, 1.0) * 4.0;
+        canvas.circle_stroke(pos, ring_size, Stroke::new(1.6, marker_color));
+        canvas.circle_filled(pos, 2.0, marker_color);
     }
 
     // Wskaźnik LFE — osobny, poza tarczą, bez przypisanego kierunku. Kolor wg
