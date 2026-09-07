@@ -3,6 +3,7 @@ use cpal::{
     SampleFormat, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -104,18 +105,41 @@ pub struct AudioAnalysis {
     pub mono_ear: MonoEar,
 }
 
+/// Pojemność bufora kołowego próbek mono — ~340ms przy 48kHz, zaokrąglone
+/// w górę do potęgi dwójki. Wystarczająco dużo, żeby przeżyć chwilowe
+/// wahania tempa callbacków wejścia/wyjścia bez przepełnienia.
+const MONO_RING_CAPACITY: usize = 16_384;
+
 #[derive(Debug, Clone)]
-pub struct SharedAudioAnalysis(pub Arc<Mutex<AudioAnalysis>>);
+pub struct SharedAudioAnalysis {
+    inner: Arc<Mutex<AudioAnalysis>>,
+    /// Bufor kołowy próbek mono, już zmiksowanych ze wszystkich kanałów —
+    /// zasilany przez TEN SAM strumień wejściowy, który karmi radar
+    /// (`update_analysis`), i czytany przez `mono_router` przy odtwarzaniu.
+    /// Miks do mono dzieje się więc dopiero na samym końcu łańcucha, tuż
+    /// przed wyjściem — radar cały czas dostaje pełne dane per-kanał. Wcześniej
+    /// `mono_router` otwierał WŁASNY, niezależny strumień wejściowy na
+    /// nazwie urządzenia z tej samej listy co radar — na Windows ta lista
+    /// zawiera nazwy urządzeń WYJŚCIOWYCH (do przechwytywania pętlą zwrotną
+    /// WASAPI, patrz `fetch_output_devices`), a `mono_router` szukał ich
+    /// tylko wśród `host.input_devices()`, więc lookup zawsze się nie
+    /// powodził i routing w ogóle nie startował (błąd widoczny tylko w
+    /// konsoli, niewidoczny w UI).
+    mono_ring: Arc<Mutex<VecDeque<f32>>>,
+}
 
 impl PartialEq for SharedAudioAnalysis {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 
 impl Default for SharedAudioAnalysis {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(AudioAnalysis::default())))
+        Self {
+            inner: Arc::new(Mutex::new(AudioAnalysis::default())),
+            mono_ring: Arc::new(Mutex::new(VecDeque::with_capacity(MONO_RING_CAPACITY))),
+        }
     }
 }
 
@@ -125,7 +149,37 @@ impl SharedAudioAnalysis {
     }
 
     pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, AudioAnalysis>> {
-        self.0.lock()
+        self.inner.lock()
+    }
+
+    /// Dopisuje próbki mono (już zmiksowane) do bufora kołowego czytanego
+    /// przez strumień wyjściowy `mono_router`. Najstarsze próbki są
+    /// odrzucane, gdy bufor jest pełny — routing ma pokazywać "teraz", nie
+    /// gonić zaległości.
+    pub(crate) fn push_mono(&self, samples: &[f32]) {
+        if let Ok(mut ring) = self.mono_ring.lock() {
+            for &s in samples {
+                if ring.len() >= MONO_RING_CAPACITY {
+                    ring.pop_front();
+                }
+                ring.push_back(s);
+            }
+        }
+    }
+
+    /// Czyta dokładnie `count` próbek mono. Brakujące miejsce (bufor pusty,
+    /// bo przechwytywanie jeszcze nie działa albo dopiero wystartowało)
+    /// wypełnia ciszą, zamiast blokować/zacinać strumień wyjściowy.
+    pub(crate) fn read_mono(&self, count: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(count);
+        if let Ok(mut ring) = self.mono_ring.lock() {
+            for _ in 0..count {
+                out.push(ring.pop_front().unwrap_or(0.0));
+            }
+        } else {
+            out.resize(count, 0.0);
+        }
+        out
     }
 }
 
@@ -422,6 +476,25 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         lock.channel_count = channels;
         lock.channel_rule_energies = rule_energies;
     }
+
+    // Miks do mono na sam koniec — dopiero tu, dla ewentualnego odtwarzania
+    // przez `mono_router`. Radar powyżej już dostał pełne dane per-kanał,
+    // więc to nie zastępuje ich, tylko dokłada osobny strumień do wyjścia.
+    analysis.push_mono(&downmix_to_mono(samples, channels));
+}
+
+/// Zinterlacowane próbki `channels`-kanałowe → próbki mono (uśrednione).
+fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
+    if channels == 0 {
+        return Vec::new();
+    }
+    if channels == 1 {
+        return interleaved.to_vec();
+    }
+    interleaved
+        .chunks_exact(channels)
+        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .collect()
 }
 
 #[cfg(test)]

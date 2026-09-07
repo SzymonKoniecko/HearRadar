@@ -72,12 +72,15 @@ pub struct HearRadarApp {
     selected_device: String,
     active_stream: Option<cpal::Stream>,
 
-    // Mono router.
+    // Mono router — czyta z TEGO SAMEGO strumienia wejściowego co radar
+    // (`active_stream`), więc nie ma tu własnego wyboru urządzenia wejściowego.
     out_devices: Result<Vec<SoundDevice>, String>,
-    mono_sel_in: String,
     mono_sel_out: String,
     mono_router: Option<MonoRouter>,
     mono_ear: MonoEar,
+    /// Błąd z ostatniej próby uruchomienia routingu (np. nie znaleziono
+    /// urządzenia wyjściowego) — pokazywany w UI zamiast ginąć w konsoli.
+    mono_status: Option<String>,
 
     // Overlay.
     overlay_open: bool,
@@ -118,12 +121,6 @@ impl HearRadarApp {
             .unwrap_or_default();
 
         let out_devices = devices::fetch_physical_output_devices().map_err(|e| e.to_string());
-        let mono_sel_in = devices
-            .as_ref()
-            .ok()
-            .and_then(|d| d.first())
-            .map(|d| d.name.clone())
-            .unwrap_or_default();
         let mono_sel_out = out_devices
             .as_ref()
             .ok()
@@ -153,10 +150,10 @@ impl HearRadarApp {
             selected_device,
             active_stream: None,
             out_devices,
-            mono_sel_in,
             mono_sel_out,
             mono_router: None,
             mono_ear: MonoEar::Off,
+            mono_status: None,
             overlay_open: false,
             overlay_click_through: true,
             overlay_reposition_pending: false,
@@ -407,30 +404,26 @@ impl HearRadarApp {
             }
         });
         ui.label(
-            "Odsłuchaj sygnał mono w jednej słuchawce bez wirtualnego urządzenia systemowego.",
+            "Odsłuchaj zmiksowany sygnał mono w jednej słuchawce — dokłada się do już \
+             przechwytywanego wejścia powyżej (nie otwiera osobnego wejścia), radar dalej \
+             pokazuje pełne kanały.",
         );
 
-        let in_devices: Vec<SoundDevice> = self.devices.clone().unwrap_or_default();
         let out_devices: Vec<SoundDevice> = self.out_devices.clone().unwrap_or_default();
 
-        if self.mono_sel_in.is_empty() {
-            if let Some(d) = in_devices.first() {
-                self.mono_sel_in = d.name.clone();
-            }
-        }
         if self.mono_sel_out.is_empty() {
             if let Some(d) = out_devices.first() {
                 self.mono_sel_out = d.name.clone();
             }
         }
 
-        egui::ComboBox::from_label("Wejście")
-            .selected_text(self.mono_sel_in.clone())
-            .show_ui(ui, |ui| {
-                for dev in &in_devices {
-                    ui.selectable_value(&mut self.mono_sel_in, dev.name.clone(), &dev.name);
-                }
-            });
+        let capturing = self.active_stream.is_some();
+        if !capturing {
+            ui.colored_label(
+                egui::Color32::from_rgb(220, 160, 60),
+                "Najpierw kliknij „Przechwytuj” powyżej — routing czyta z tego samego wejścia.",
+            );
+        }
 
         egui::ComboBox::from_label("Wyjście (słuchawki)")
             .selected_text(self.mono_sel_out.clone())
@@ -457,7 +450,7 @@ impl HearRadarApp {
         });
 
         let is_routing = self.mono_router.is_some();
-        let can_start = !self.mono_sel_in.is_empty() && !self.mono_sel_out.is_empty();
+        let can_start = capturing && !self.mono_sel_out.is_empty();
         ui.add_enabled_ui(can_start || is_routing, |ui| {
             let label = if is_routing {
                 "⏹ Zatrzymaj routing"
@@ -471,6 +464,7 @@ impl HearRadarApp {
                     if let Ok(mut lock) = self.analysis.lock() {
                         lock.mono_ear = MonoEar::Off;
                     }
+                    self.mono_status = None;
                 } else {
                     if self.mono_ear == MonoEar::Off {
                         self.mono_ear = MonoEar::Left;
@@ -478,17 +472,25 @@ impl HearRadarApp {
                     if let Ok(mut lock) = self.analysis.lock() {
                         lock.mono_ear = self.mono_ear;
                     }
-                    match mono_router::start_mono_router(
-                        &self.mono_sel_in,
-                        &self.mono_sel_out,
-                        self.analysis.clone(),
-                    ) {
-                        Ok(r) => self.mono_router = Some(r),
-                        Err(e) => eprintln!("[mono_router] start error: {e}"),
+                    match mono_router::start_mono_output(&self.mono_sel_out, self.analysis.clone())
+                    {
+                        Ok(r) => {
+                            self.mono_router = Some(r);
+                            self.mono_status = None;
+                        }
+                        Err(e) => {
+                            let msg = format!("Nie udało się uruchomić routingu: {e}");
+                            eprintln!("[mono_router] start error: {e}");
+                            self.mono_status = Some(msg);
+                        }
                     }
                 }
             }
         });
+
+        if let Some(msg) = &self.mono_status {
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg);
+        }
     }
 
     // ── Panel: scenariusze testowe radaru ────────────────────────────────
