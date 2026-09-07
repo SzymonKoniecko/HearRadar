@@ -84,11 +84,6 @@ pub struct HearRadarApp {
 
     // Overlay.
     overlay_open: bool,
-    /// Gdy `true`, overlay jest przezroczysty dla kliknięć/scrolla — myszka i
-    /// klawiatura trafiają wprost do gry pod spodem, tak jak w prawdziwych
-    /// nakładkach HUD (Discord, MSI Afterburner itp.). Wyłącz tymczasowo, żeby
-    /// przeciągnąć radar w inne miejsce.
-    overlay_click_through: bool,
     /// `true`, gdy pozycję overlay na ekranie trzeba przeliczyć na nowo
     /// (świeżo otwarty albo zmieniono suwak pozycji/rozmiaru) — ustawiane raz,
     /// wysyłane jako `ViewportCommand::OuterPosition` przy najbliższej okazji,
@@ -134,6 +129,15 @@ impl HearRadarApp {
         // (pierwsze uruchomienie) — wtedy po prostu zostajemy przy domyślnych.
         let radar_config = config_store::load().unwrap_or_default();
 
+        // Strumień audio (patrz `devices::update_analysis`) czyta reguły
+        // kolorowania z `analysis.lock().radar_config`, niezależnie od tego,
+        // co trzyma `HearRadarApp` — bez tej synchronizacji live audio
+        // używałoby domyślnych reguł aż do pierwszej zmiany w UI, ignorując
+        // dopiero co wczytaną z pliku konfigurację.
+        if let Ok(mut lock) = analysis.lock() {
+            lock.radar_config = radar_config.clone();
+        }
+
         Self {
             analysis,
             display_angle: 0.0,
@@ -155,7 +159,6 @@ impl HearRadarApp {
             mono_ear: MonoEar::Off,
             mono_status: None,
             overlay_open: false,
-            overlay_click_through: true,
             overlay_reposition_pending: false,
             #[cfg(windows)]
             win_overlay: None,
@@ -278,9 +281,19 @@ impl HearRadarApp {
         }
     }
 
-    fn write_radar_config(&self) {
+    /// Synchronizuje bieżącą konfigurację ze strumieniem audio (który czyta
+    /// `analysis.lock().radar_config` niezależnie od `self.radar_config`) i
+    /// zapisuje ją na dysk — każda zmiana w panelu ustawień przetrwa więc
+    /// restart aplikacji automatycznie, bez ręcznego klikania „Zapisz do
+    /// pliku” (ten przycisk w [`Self::ui_config_persistence`] zostaje jako
+    /// jawny „zapisz teraz i pokaż mi ścieżkę”, ale nie jest już jedynym
+    /// sposobem na trwały zapis).
+    fn write_radar_config(&mut self) {
         if let Ok(mut lock) = self.analysis.lock() {
             lock.radar_config = self.radar_config.clone();
+        }
+        if let Err(e) = config_store::save(&self.radar_config) {
+            self.config_status = Some(Err(format!("Błąd automatycznego zapisu: {e}")));
         }
     }
 
@@ -602,11 +615,13 @@ impl HearRadarApp {
             .changed();
 
         ui.separator();
-        ui.checkbox(
-            &mut self.overlay_click_through,
-            "🖱 Przezroczysty dla kliknięć (nie blokuje gry pod spodem)",
-        );
-        if !self.overlay_click_through {
+        changed |= ui
+            .checkbox(
+                &mut self.radar_config.overlay_click_through,
+                "🖱 Przezroczysty dla kliknięć (nie blokuje gry pod spodem)",
+            )
+            .changed();
+        if !self.radar_config.overlay_click_through {
             ui.colored_label(
                 egui::Color32::from_rgb(230, 180, 60),
                 "⚠ Wyłączone tylko do przeciągnięcia radaru — włącz z powrotem przed grą.",
@@ -847,7 +862,7 @@ impl HearRadarApp {
                 now,
                 self.display_angle,
                 self.display_intensity,
-                self.overlay_click_through,
+                self.radar_config.overlay_click_through,
             );
         }
     }
@@ -865,7 +880,7 @@ impl HearRadarApp {
         let now = ctx.input(|i| i.time);
         let channels = self.current_channels;
         let overlay_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
-        let click_through = self.overlay_click_through;
+        let click_through = self.radar_config.overlay_click_through;
 
         if self.overlay_reposition_pending {
             if let Some(pos) = self.overlay_anchored_position(&ctx, overlay_size) {
@@ -1001,7 +1016,7 @@ impl eframe::App for HearRadarApp {
                     .with_transparent(true)
                     .with_always_on_top()
                     .with_taskbar(false)
-                    .with_mouse_passthrough(self.overlay_click_through)
+                    .with_mouse_passthrough(self.radar_config.overlay_click_through)
                     .with_resizable(false),
                 |ui, _class| self.ui_overlay_contents(ui),
             );

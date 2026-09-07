@@ -33,6 +33,17 @@ pub struct RadarConfig {
     /// może mieć ich dowolnie wiele (dodawać/usuwać/edytować w ustawieniach),
     /// zamiast sztywnych 3 pasm. Patrz [`crate::sound::spectrum::ColorRule`].
     pub color_rules: Vec<ColorRule>,
+    /// Gdy `true`, overlay jest przezroczysty dla kliknięć/scrolla — myszka i
+    /// klawiatura trafiają wprost do gry pod spodem. Wyłącz tymczasowo, żeby
+    /// przeciągnąć radar w inne miejsce. `#[serde(default...)]` na `true`,
+    /// żeby wczytanie starszego pliku konfiguracji (sprzed tego pola) nie
+    /// włączyło niechcący trybu blokującego kliknięcia.
+    #[serde(default = "default_overlay_click_through")]
+    pub overlay_click_through: bool,
+}
+
+fn default_overlay_click_through() -> bool {
+    true
 }
 
 impl Default for RadarConfig {
@@ -47,6 +58,7 @@ impl Default for RadarConfig {
             high_contrast: false,
             decay_secs: 2.5,
             color_rules: spectrum::default_color_rules(),
+            overlay_click_through: true,
         }
     }
 }
