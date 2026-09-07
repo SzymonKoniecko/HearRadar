@@ -1,5 +1,5 @@
 use crate::sound::devices::RadarConfig;
-use crate::sound::direction::{channel_layout, ChannelRole};
+use crate::sound::direction::{channel_layout, ChannelRole, INTENSITY_SCALE};
 use crate::sound::spectrum::{self, ColorRule};
 use egui::{Color32, FontId, Painter, Pos2, Stroke, Vec2};
 use std::collections::VecDeque;
@@ -246,7 +246,7 @@ impl RadarState {
             .clamp(MIN_DOTS_PER_CHANNEL, MAX_DOTS_PER_CHANNEL);
 
         for (i, dots) in self.dots.iter_mut().enumerate() {
-            let energy = channel_rms.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let energy = (channel_rms.get(i).copied().unwrap_or(0.0) * INTENSITY_SCALE).clamp(0.0, 1.0);
             let role = channel_layout(channels).get(i).copied();
 
             let energies = channel_rule_energies.get(i).map(Vec::as_slice).unwrap_or(&[]);

@@ -138,7 +138,7 @@ const SILENCE_THRESHOLD: f32 = 0.002;
 /// Dobrany tak, by dla 2.0 zachować zgodność z poprzednim zachowaniem
 /// (`(rms_l + rms_r) * 4.0`), ponieważ `avg_energy * 8.0 == (rms_l+rms_r) * 4.0`
 /// gdy kanałów jest dwa.
-const INTENSITY_SCALE: f32 = 8.0;
+pub(crate) const INTENSITY_SCALE: f32 = 8.0;
 
 /// Wyznacza kierunek (kąt w stopniach) oraz intensywność (0.0..=1.0) dźwięku
 /// na podstawie poziomów RMS poszczególnych kanałów.
