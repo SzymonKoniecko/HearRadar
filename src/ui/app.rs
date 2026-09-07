@@ -173,7 +173,11 @@ impl HearRadarApp {
     /// (żywe audio albo scenariusz testowy), żeby wskaźnik kierunku na
     /// radarze zgadzał się z tym, co akurat rysują kropki per-kanał.
     fn smooth_display_direction(&mut self, target_angle: f32, target_intensity: f32) {
-        self.display_angle = self.display_angle * 0.75 + target_angle * 0.25;
+        // `direction::smooth_angle_deg` idzie NAJKRÓTSZĄ drogą po okręgu —
+        // zwykłe liniowe `a*0.75 + b*0.25` na surowych stopniach kręciłoby
+        // wskaźnik przez przód przy przejściu np. z tyłu-lewo do tyłu-prawo,
+        // zamiast wprost przez tył (patrz doc-komentarz tej funkcji).
+        self.display_angle = direction::smooth_angle_deg(self.display_angle, target_angle, 0.25);
         self.display_intensity = if target_intensity > self.display_intensity {
             target_intensity
         } else {

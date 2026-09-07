@@ -14,6 +14,10 @@ pub trait RadarCanvas {
     fn circle_stroke(&self, center: Pos2, radius: f32, stroke: Stroke);
     fn line_segment(&self, points: [Pos2; 2], stroke: Stroke);
     fn rect_filled(&self, rect: Rect, corner_radius: f32, color: Color32);
+    /// Filled, non-overlapping triangle — used for the perceptual-direction
+    /// beacon's arrowhead (see `draw_radar`), which needs a real pointed
+    /// shape rather than something faked out of circles/lines.
+    fn triangle_filled(&self, points: [Pos2; 3], color: Color32);
     /// No-op on backends that can't rasterize text (e.g. the Windows skia
     /// overlay) — direction labels simply don't render there.
     fn text(&self, pos: Pos2, anchor: Align2, text: &str, font: FontId, color: Color32);
@@ -31,6 +35,13 @@ impl RadarCanvas for Painter {
     }
     fn rect_filled(&self, rect: Rect, corner_radius: f32, color: Color32) {
         Painter::rect_filled(self, rect, corner_radius, color);
+    }
+    fn triangle_filled(&self, points: [Pos2; 3], color: Color32) {
+        self.add(egui::Shape::convex_polygon(
+            points.to_vec(),
+            color,
+            egui::Stroke::NONE,
+        ));
     }
     fn text(&self, pos: Pos2, anchor: Align2, text: &str, font: FontId, color: Color32) {
         Painter::text(self, pos, anchor, text, font, color);
@@ -472,35 +483,55 @@ pub fn draw_radar<C: RadarCanvas>(
         }
     }
 
-    // Sumaryczny wskaźnik kierunku — jedna "celownicza" ikona (promień +
-    // pierścień z kropką), odróżniona KSZTAŁTEM od miękkich, świecących
-    // kropek per-kanał, żeby działała też w trybie wysokiego kontrastu, gdzie
-    // kolor jest zawsze biały. Pomijamy przy ciszy, żeby nie stała
-    // nieruchomo na środku, gdy nic nie gra.
-    if combined_intensity > 0.02 {
-        let angle = combined_angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
-        let marker_r = (combined_intensity * r).clamp(6.0, r);
-        let pos = center + Vec2::new(angle.cos(), angle.sin()) * marker_r;
-        let alpha = (combined_intensity.clamp(0.0, 1.0) * 220.0 + 35.0) * fg;
-        let marker_color = Color32::from_rgba_unmultiplied(
-            cross_rgb.0,
-            cross_rgb.1,
-            cross_rgb.2,
-            alpha.clamp(0.0, 255.0) as u8,
-        );
-
-        canvas.line_segment([center, pos], Stroke::new(1.2, marker_color));
-        let ring_size = 5.0 + combined_intensity.clamp(0.0, 1.0) * 4.0;
-        canvas.circle_stroke(pos, ring_size, Stroke::new(1.6, marker_color));
-        canvas.circle_filled(pos, 2.0, marker_color);
-    }
-
     // Wskaźnik LFE — osobny, poza tarczą, bez przypisanego kierunku. Kolor wg
     // jego własnej dominującej reguły (poza trybem wysokiego kontrastu, gdzie
     // i tak wracamy do jednej barwy).
     if layout.contains(&ChannelRole::Lfe) {
         let lfe_rgb = if hc { dot_rgb } else { state.lfe_color_rgb };
         draw_lfe_indicator(canvas, center, r, state.lfe_display, fg, lfe_rgb);
+    }
+
+    // Percepcyjny kierunek źródła dźwięku — GŁÓWNA, dominująca informacja na
+    // radarze (rysowana na końcu, więc zawsze na wierzchu). Kropki per-kanał
+    // powyżej pokazują "który głośnik gra"; ta latarnia (strzałka + poświata,
+    // ciepły kolor odróżniony od reszty palety) pokazuje "skąd to brzmi" —
+    // percepcyjną kombinację wektorową wszystkich kanałów naraz (patrz
+    // [`crate::sound::direction::compute_direction`]), więc np. identyczny
+    // sygnał na L i R ląduje na środku, a nie po bokach jak kropki.
+    // Odrębny KSZTAŁT (nie kolejna kropka) + próg jasności/rozmiaru, który
+    // nigdy nie schodzi poniżej wyraźnie widocznego poziomu, żeby działała
+    // też w trybie wysokiego kontrastu, gdzie kolor sam w sobie nie
+    // wystarczy do odróżnienia. Pomijamy tylko przy faktycznej ciszy.
+    if combined_intensity > 0.02 {
+        let beacon_rgb = if hc { (255, 255, 255) } else { (255, 195, 40) };
+        let angle = combined_angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
+        let dir = Vec2::new(angle.cos(), angle.sin());
+        let perp = Vec2::new(-dir.y, dir.x);
+        let intensity = combined_intensity.clamp(0.0, 1.0);
+
+        let marker_r = (intensity * r).clamp(10.0, r);
+        let pos = center + dir * marker_r;
+
+        // Alpha nigdy nie schodzi poniżej ~40% — to ma być pierwsza rzecz,
+        // jaką widać na radarze, nie coś, co trzeba wypatrywać.
+        let alpha = ((intensity * 0.6 + 0.4) * 255.0 * fg).clamp(0.0, 255.0) as u8;
+        let beacon_color =
+            Color32::from_rgba_unmultiplied(beacon_rgb.0, beacon_rgb.1, beacon_rgb.2, alpha);
+        let glow_alpha = ((alpha as f32) * 0.3) as u8;
+        let glow_color =
+            Color32::from_rgba_unmultiplied(beacon_rgb.0, beacon_rgb.1, beacon_rgb.2, glow_alpha);
+
+        let head_len = 14.0 + intensity * 10.0;
+        let head_w = 9.0 + intensity * 6.0;
+        let tip = pos + dir * head_len * 0.6;
+        let base_center = pos - dir * head_len * 0.4;
+        let left = base_center + perp * head_w * 0.5;
+        let right = base_center - perp * head_w * 0.5;
+
+        canvas.line_segment([center, base_center], Stroke::new(2.2, beacon_color));
+        canvas.circle_filled(pos, head_w * 1.1, glow_color);
+        canvas.triangle_filled([tip, left, right], beacon_color);
+        canvas.circle_stroke(pos, head_w * 1.1, Stroke::new(1.0, beacon_color));
     }
 }
 

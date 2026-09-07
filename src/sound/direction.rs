@@ -184,6 +184,27 @@ pub fn compute_direction(channel_rms: &[f32]) -> (f32, f32) {
     (angle, intensity)
 }
 
+/// Wygładza kąt (konwencja stopni z [`compute_direction`]: `(-180, 180]`,
+/// `0°` = przód) o `factor` w stronę `target`, idąc NAJKRÓTSZĄ drogą po
+/// okręgu — w przeciwieństwie do zwykłego `current * (1-factor) + target *
+/// factor`, które przy przejściu np. z `-135°` (tył-lewo) do `+135°`
+/// (tył-prawo) leciałoby przez `0°` (PRZÓD), bo arytmetycznie `-135 → 135`
+/// w górę to “krótsza” zmiana liczby niż `-135 → -180/180 → 135`, mimo że
+/// rzeczywista różnica kątowa w drugą stronę (przez TYŁ) to tylko 90°, a nie
+/// 270°. To właśnie ten błąd sprawiał, że wskaźnik kierunku sumarycznego
+/// (patrz `ui::app::smooth_display_direction`) przy przejściu dźwięku z
+/// tyłu-lewo do tyłu-prawo okrążał tarczę przez przód zamiast iść wprost
+/// przez tył.
+pub fn smooth_angle_deg(current: f32, target: f32, factor: f32) -> f32 {
+    let diff = wrap_angle_deg(target - current);
+    wrap_angle_deg(current + diff * factor)
+}
+
+/// Zawija kąt w stopniach do zakresu `(-180, 180]`.
+fn wrap_angle_deg(angle: f32) -> f32 {
+    ((angle + 180.0).rem_euclid(360.0)) - 180.0
+}
+
 /// Zwraca poglądową nazwę układu kanałów, np. "2.0", "5.1", "7.1".
 /// Dla nietypowej liczby kanałów zwraca np. "4ch".
 pub fn layout_name(channels: usize) -> String {
@@ -243,6 +264,46 @@ pub fn u16_to_f32(sample: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smooth_angle_deg_from_rear_left_to_rear_right_goes_through_the_back_not_the_front() {
+        // Dokładnie zgłoszony błąd: dźwięk przechodzi z tyłu-lewo (-135°) do
+        // tyłu-prawo (+135°) — poprawnie powinien iść przez TYŁ (±180°),
+        // czyli każdy krok powinien mieć |kąt| >= 135° (nigdy nie zbliżać się
+        // do 0° / przodu).
+        let mut angle = -135.0f32;
+        for _ in 0..40 {
+            angle = smooth_angle_deg(angle, 135.0, 0.25);
+            assert!(
+                angle.abs() >= 135.0 - 1e-3,
+                "kąt {angle} przeszedł przez przód zamiast przez tył"
+            );
+        }
+        assert!((angle - 135.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn smooth_angle_deg_short_hop_not_crossing_the_seam_moves_directly() {
+        // -10° -> 10°: najkrótsza droga jest wprost przez 0°, więc TU
+        // przechodzenie przez przód jest poprawne.
+        let angle = smooth_angle_deg(-10.0, 10.0, 0.5);
+        assert!((angle - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn smooth_angle_deg_reaches_target_and_stays_there() {
+        let angle = smooth_angle_deg(90.0, 90.0, 0.25);
+        assert!((angle - 90.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn smooth_angle_deg_result_stays_in_valid_range() {
+        let angle = smooth_angle_deg(179.0, -179.0, 0.5);
+        assert!((-180.0..=180.0).contains(&angle));
+        // -179 i 179 są 2° od siebie przez szew ±180° — powinno wylądować
+        // blisko ±180, nie w okolicy 0.
+        assert!(angle.abs() > 170.0, "angle={angle}");
+    }
 
     const EPS: f32 = 1e-3;
 
