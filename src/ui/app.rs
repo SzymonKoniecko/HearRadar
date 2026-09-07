@@ -176,7 +176,7 @@ impl HearRadarApp {
             let bands = self
                 .test_scenario
                 .synthetic_bands(self.current_channels, self.test_phase);
-            self.radar_state.update(now, self.current_channels, &rms, &bands);
+            self.radar_state.update(now, self.current_channels, &rms, &bands, self.radar_config.decay_secs);
             return;
         }
 
@@ -189,8 +189,13 @@ impl HearRadarApp {
         if channel_count > 0 {
             self.current_channels = channel_count;
         }
-        self.radar_state
-            .update(now, self.current_channels, &channel_rms, &channel_bands);
+        self.radar_state.update(
+            now,
+            self.current_channels,
+            &channel_rms,
+            &channel_bands,
+            self.radar_config.decay_secs,
+        );
     }
 
     /// Generuje prawdziwą sinusoidę o częstotliwości `test_freq_hz` na
@@ -216,7 +221,7 @@ impl HearRadarApp {
 
         let stats = direction::analyze_channels(&samples, self.current_channels);
         let bands = spectrum::analyze_channel_bands(&samples, self.current_channels, sr);
-        self.radar_state.update(now, self.current_channels, &stats.rms, &bands);
+        self.radar_state.update(now, self.current_channels, &stats.rms, &bands, self.radar_config.decay_secs);
     }
 
     fn write_test_scenario(&self, idx: u8) {
@@ -516,8 +521,8 @@ impl HearRadarApp {
             .changed();
         changed |= ui
             .add(
-                egui::Slider::new(&mut self.radar_config.decay_secs, 0.7..=1.5)
-                    .text("Czas zaniku kropki (s)"),
+                egui::Slider::new(&mut self.radar_config.decay_secs, 1.0..=3.0)
+                    .text("Czas zaniku kropki / echo (s)"),
             )
             .changed();
         changed |= ui

@@ -138,9 +138,13 @@ fn with_alpha(c: Color32, mult: f32) -> Color32 {
 /// kropki (20-40 ms wg specyfikacji — używamy środka tego zakresu).
 const SPAWN_INTERVAL_SECS: f64 = 0.03;
 
-/// Maksymalna liczba jednocześnie widocznych kropek na jeden kanał/sektor —
-/// starsze ponad ten limit są usuwane natychmiast zamiast czekać na zanik.
-const MAX_DOTS_PER_CHANNEL: usize = 4;
+/// Dolny/górny limit liczby jednocześnie przechowywanych kropek na kanał.
+/// Rzeczywisty limit jest liczony z `decay_secs` (patrz [`RadarState::update`]),
+/// żeby przy dłuższym zaniku (np. 2-3 s) stare kropki nie znikały
+/// przedwcześnie tylko dlatego, że nadeszło kilka nowych ramek — echo ma być
+/// widoczne przez CAŁY czas zaniku, nie tylko przez ostatnie kilka klatek.
+const MIN_DOTS_PER_CHANNEL: usize = 4;
+const MAX_DOTS_PER_CHANNEL: usize = 200;
 
 /// Próg wykrywania nagłych skoków energii (transientów): kropka jest
 /// oznaczana jako transient, gdy jej energia przekracza średnią kroczącą
@@ -206,14 +210,23 @@ impl RadarState {
     /// `channel_bands` to energia w 3 pasmach (`[low, mid, high]`) per kanał —
     /// patrz [`crate::sound::spectrum`]. Może być krótsza niż `channels`
     /// (np. scenariusze testowe, które jej nie liczą); brakujące kanały
-    /// dostają domyślnie pasmo `Mid`.
-    pub fn update(&mut self, now: f64, channels: usize, channel_rms: &[f32], channel_bands: &[BandEnergies]) {
+    /// dostają domyślnie pasmo `Mid`. `decay_secs` (z [`RadarConfig`]) decyduje
+    /// ile kropek trzeba trzymać naraz, żeby żadna nie zniknęła, zanim
+    /// naturalnie wygaśnie — patrz [`MIN_DOTS_PER_CHANNEL`]/[`MAX_DOTS_PER_CHANNEL`].
+    pub fn update(&mut self, now: f64, channels: usize, channel_rms: &[f32], channel_bands: &[BandEnergies], decay_secs: f32) {
         self.ensure_capacity(channels);
 
         if now - self.last_spawn < SPAWN_INTERVAL_SECS {
             return;
         }
         self.last_spawn = now;
+
+        // Tyle kropek trzeba trzymać naraz, żeby przy tempie spawnu
+        // [`SPAWN_INTERVAL_SECS`] żadna nie została usunięta przed upływem
+        // swojego naturalnego czasu zaniku (echo ma być widoczne przez CAŁE
+        // `decay_secs`, nie tylko przez ostatnie kilka ramek).
+        let max_dots = ((decay_secs as f64 / SPAWN_INTERVAL_SECS).ceil() as usize)
+            .clamp(MIN_DOTS_PER_CHANNEL, MAX_DOTS_PER_CHANNEL);
 
         for (i, dots) in self.dots.iter_mut().enumerate() {
             let energy = channel_rms.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -238,7 +251,7 @@ impl RadarState {
                 .unwrap_or(FrequencyBand::Mid);
 
             dots.push_back(ChannelDot { spawned_at: now, energy, transient, band });
-            while dots.len() > MAX_DOTS_PER_CHANNEL {
+            while dots.len() > max_dots {
                 dots.pop_front();
             }
         }

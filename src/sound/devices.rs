@@ -25,7 +25,8 @@ pub struct RadarConfig {
     pub show_labels: bool,
     /// Tryb wysokiego kontrastu — paleta monochromatyczna zamiast kolorowej.
     pub high_contrast: bool,
-    /// Czas zanikania pojedynczej kropki w sekundach (0.7 .. 1.5).
+    /// Czas zanikania pojedynczej kropki w sekundach (1.0 .. 3.0) — efekt
+    /// "echa" ma być widoczny co najmniej 2-3 s, nie tylko przez ułamek sekundy.
     pub decay_secs: f32,
 }
 
@@ -39,7 +40,7 @@ impl Default for RadarConfig {
             fg_alpha: 1.0,
             show_labels: false,
             high_contrast: false,
-            decay_secs: 1.0,
+            decay_secs: 2.5,
         }
     }
 }
