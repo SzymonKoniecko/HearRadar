@@ -170,20 +170,28 @@ impl HearRadarApp {
         if self.test_scenario != TestScenario::Off {
             self.test_phase += 0.05;
             self.current_channels = DEFAULT_TEST_CHANNELS;
+            let rule_count = self.radar_config.color_rules.len();
             let rms = self
                 .test_scenario
                 .generate(self.current_channels, self.test_phase, self.test_seed);
-            let bands = self
+            let energies = self
                 .test_scenario
-                .synthetic_bands(self.current_channels, self.test_phase);
-            self.radar_state.update(now, self.current_channels, &rms, &bands, self.radar_config.decay_secs);
+                .synthetic_rule_energies(self.current_channels, self.test_phase, rule_count);
+            self.radar_state.update(
+                now,
+                self.current_channels,
+                &rms,
+                &energies,
+                &self.radar_config.color_rules,
+                self.radar_config.decay_secs,
+            );
             return;
         }
 
-        let (channel_rms, channel_count, channel_bands) = self
+        let (channel_rms, channel_count, channel_rule_energies) = self
             .analysis
             .lock()
-            .map(|g| (g.channel_rms.clone(), g.channel_count, g.channel_bands.clone()))
+            .map(|g| (g.channel_rms.clone(), g.channel_count, g.channel_rule_energies.clone()))
             .unwrap_or_default();
 
         if channel_count > 0 {
@@ -193,7 +201,8 @@ impl HearRadarApp {
             now,
             self.current_channels,
             &channel_rms,
-            &channel_bands,
+            &channel_rule_energies,
+            &self.radar_config.color_rules,
             self.radar_config.decay_secs,
         );
     }
@@ -220,8 +229,20 @@ impl HearRadarApp {
         self.test_tone_time += TEST_TONE_BUFFER_LEN as f32 / sr;
 
         let stats = direction::analyze_channels(&samples, self.current_channels);
-        let bands = spectrum::analyze_channel_bands(&samples, self.current_channels, sr);
-        self.radar_state.update(now, self.current_channels, &stats.rms, &bands, self.radar_config.decay_secs);
+        let energies = spectrum::analyze_channel_rule_energies(
+            &samples,
+            self.current_channels,
+            sr,
+            &self.radar_config.color_rules,
+        );
+        self.radar_state.update(
+            now,
+            self.current_channels,
+            &stats.rms,
+            &energies,
+            &self.radar_config.color_rules,
+            self.radar_config.decay_secs,
+        );
     }
 
     fn write_test_scenario(&self, idx: u8) {
@@ -232,7 +253,7 @@ impl HearRadarApp {
 
     fn write_radar_config(&self) {
         if let Ok(mut lock) = self.analysis.lock() {
-            lock.radar_config = self.radar_config;
+            lock.radar_config = self.radar_config.clone();
         }
     }
 
@@ -475,14 +496,24 @@ impl HearRadarApp {
                     .suffix(" Hz")
                     .text("Częstotliwość tonu testowego"),
             );
-            let band = if self.test_freq_hz < 200.0 {
-                "niskie (bas) — czerwony"
-            } else if self.test_freq_hz < 2000.0 {
-                "średnie (mowa/kroki) — cyjan"
-            } else {
-                "wysokie (syczące) — żółty"
-            };
-            ui.label(format!("Oczekiwane pasmo: {band}"));
+            let matching_rule = self.radar_config.color_rules.iter().find(|r| {
+                self.test_freq_hz >= r.freq_min && self.test_freq_hz < r.freq_max
+            });
+            ui.horizontal(|ui| {
+                ui.label("Oczekiwana reguła:");
+                match matching_rule {
+                    Some(rule) => {
+                        let [r, g, b] = rule.color;
+                        ui.colored_label(
+                            egui::Color32::from_rgb(r, g, b),
+                            format!("{:.0}-{:.0} Hz", rule.freq_min, rule.freq_max),
+                        );
+                    }
+                    None => {
+                        ui.weak("żadna (kropka dostanie domyślny kolor)");
+                    }
+                }
+            });
         }
     }
 
@@ -550,6 +581,91 @@ impl HearRadarApp {
             );
         }
         ui.label("Skrót ⌥/Alt+R pokazuje/ukrywa overlay (działa, gdy to okno ma fokus).");
+
+        if changed {
+            self.write_radar_config();
+        }
+    }
+
+    // ── Panel: dowolna liczba reguł "częstotliwość → kolor" ──────────────
+    /// Konfigurator kolorowania kropek: użytkownik może dodać/usunąć/edytować
+    /// dowolną liczbę reguł zamiast trzech sztywnych pasm. Każda reguła to
+    /// zakres Hz + kolor; energetycznie dominująca reguła dla danej ramki
+    /// decyduje o kolorze kropki (patrz `radar_egui::resolve_color`).
+    fn ui_color_rules_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Kolory wg częstotliwości");
+            if ui.small_button("↺ Domyślne 3 pasma").clicked() {
+                self.radar_config.color_rules = spectrum::default_color_rules();
+                self.write_radar_config();
+            }
+        });
+        ui.label("Dowolna liczba reguł: zakres Hz → kolor. Kropka bierze kolor reguły z najsilniejszą energią w danej ramce.");
+
+        let mut changed = false;
+        let mut remove_index: Option<usize> = None;
+
+        egui::Grid::new("color_rules_grid")
+            .num_columns(4)
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Hz min");
+                ui.label("Hz max");
+                ui.label("Kolor");
+                ui.label("");
+                ui.end_row();
+
+                for (i, rule) in self.radar_config.color_rules.iter_mut().enumerate() {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut rule.freq_min)
+                                .speed(10.0)
+                                .range(0.0..=20_000.0)
+                                .suffix(" Hz"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut rule.freq_max)
+                                .speed(10.0)
+                                .range(0.0..=20_000.0)
+                                .suffix(" Hz"),
+                        )
+                        .changed();
+                    changed |= ui.color_edit_button_srgb(&mut rule.color).changed();
+                    if ui.small_button("🗑").clicked() {
+                        remove_index = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+
+        if let Some(i) = remove_index {
+            self.radar_config.color_rules.remove(i);
+            changed = true;
+        }
+
+        if ui.button("+ Dodaj regułę").clicked() {
+            // Nowa reguła startuje tam, gdzie kończy się ostatnia — łatwo
+            // dołożyć kolejne pasmo bez zostawiania dziury w zakresie.
+            let start = self
+                .radar_config
+                .color_rules
+                .last()
+                .map(|r| r.freq_max)
+                .unwrap_or(0.0);
+            self.radar_config
+                .color_rules
+                .push(spectrum::ColorRule::new(start, (start + 1000.0).min(20_000.0), [200, 200, 200]));
+            changed = true;
+        }
+
+        if self.radar_config.color_rules.is_empty() {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 180, 60),
+                "⚠ Brak reguł — wszystkie kropki dostaną neutralny kolor domyślny.",
+            );
+        }
 
         if changed {
             self.write_radar_config();
@@ -689,6 +805,8 @@ impl eframe::App for HearRadarApp {
                     self.ui_test_panel(&mut cols[0]);
                     cols[0].separator();
                     self.ui_config_panel(&mut cols[0]);
+                    cols[0].separator();
+                    self.ui_color_rules_panel(&mut cols[0]);
 
                     self.ui_radar_preview(&mut cols[1]);
                 });

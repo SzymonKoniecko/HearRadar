@@ -1,8 +1,23 @@
 use crate::sound::devices::RadarConfig;
 use crate::sound::direction::{channel_layout, ChannelRole};
-use crate::sound::spectrum::{self, BandEnergies, FrequencyBand};
+use crate::sound::spectrum::{self, ColorRule};
 use egui::{Color32, FontId, Painter, Pos2, Stroke, Vec2};
 use std::collections::VecDeque;
+
+/// Kolor używany, gdy nie da się ustalić dominującej reguły (np. lista reguł
+/// jest pusta) — neutralny cyjan, taki sam jak dawny "domyślny" kolor kropek.
+const FALLBACK_DOT_RGB: (u8, u8, u8) = (0, 220, 220);
+
+/// Wybiera kolor energetycznie dominującej reguły dla danego kanału. `energies`
+/// to lista energii w tej samej kolejności co `rules` (patrz
+/// [`spectrum::analyze_channel_rule_energies`]); gdy jest krótsza/pusta albo
+/// `rules` jest puste, zwraca [`FALLBACK_DOT_RGB`].
+fn resolve_color(rules: &[ColorRule], energies: &[f32]) -> (u8, u8, u8) {
+    spectrum::dominant_rule_index(energies)
+        .and_then(|i| rules.get(i))
+        .map(|r| (r.color[0], r.color[1], r.color[2]))
+        .unwrap_or(FALLBACK_DOT_RGB)
+}
 
 // ── Scenariusze testowe ───────────────────────────────────────────────────────
 //
@@ -109,15 +124,17 @@ impl TestScenario {
             .collect()
     }
 
-    /// Syntetyczna energia pasm dla scenariuszy testowych: nie liczymy
-    /// prawdziwego widma (nie ma prawdziwego sygnału), tylko demonstrujemy
-    /// kolorowanie kropek wg pasma — dominujące pasmo powoli krąży po
-    /// kanałach w czasie, żeby w podglądzie było widać wszystkie 3 kolory.
-    pub fn synthetic_bands(self, channels: usize, phase: f32) -> Vec<BandEnergies> {
+    /// Syntetyczna energia reguł kolorowania dla scenariuszy testowych: nie
+    /// liczymy prawdziwego widma (nie ma prawdziwego sygnału), tylko
+    /// demonstrujemy kolorowanie kropek — dominująca reguła powoli krąży po
+    /// kanałach w czasie, żeby w podglądzie było widać WSZYSTKIE skonfigurowane
+    /// kolory, niezależnie od tego ile użytkownik ich zdefiniował.
+    pub fn synthetic_rule_energies(self, channels: usize, phase: f32, rule_count: usize) -> Vec<Vec<f32>> {
+        let rule_count = rule_count.max(1);
         (0..channels)
             .map(|i| {
-                let dominant = (i + (phase * 0.4) as usize) % 3;
-                let mut e = [0.05f32; 3];
+                let dominant = (i + (phase * 0.4) as usize) % rule_count;
+                let mut e = vec![0.05f32; rule_count];
                 e[dominant] = 0.8;
                 e
             })
@@ -159,23 +176,11 @@ pub struct ChannelDot {
     pub energy: f32,
     /// Czy ta ramka została oznaczona jako nagły skok energii.
     pub transient: bool,
-    /// Dominujące pasmo częstotliwości tej ramki — decyduje o kolorze kropki
-    /// (patrz [`band_color`]). Ustalane raz przy powstaniu kropki, więc kolor
-    /// nie "skacze" w trakcie jej zaniku.
-    pub band: FrequencyBand,
-}
-
-/// Kolor przypisany każdemu pasmu częstotliwości. Na razie na sztywno, ale
-/// celowo wydzielone do jednej funkcji: docelowy konfigurator kolorów (reguła
-/// parametr → kolor, edytowalna w UI) ma tu podmienić tylko to jedno miejsce
-/// — resztą rysowania steruje wyłącznie `dot.band`, więc nic więcej się nie
-/// zmieni.
-fn band_color(band: FrequencyBand) -> (u8, u8, u8) {
-    match band {
-        FrequencyBand::Low => (255, 90, 90),   // czerwony: bas / niskie częstotliwości
-        FrequencyBand::Mid => (0, 220, 220),   // cyjan: średnie (mowa, kroki)
-        FrequencyBand::High => (255, 220, 90), // żółty: wysokie / syczące tony
-    }
+    /// Kolor wybrany wg energetycznie dominującej reguły użytkownika
+    /// (patrz [`resolve_color`]) w momencie powstania kropki — utrwalony raz,
+    /// żeby kolor nie "skakał" w trakcie zaniku, nawet jeśli użytkownik w
+    /// międzyczasie zmieni reguły w ustawieniach.
+    pub color_rgb: (u8, u8, u8),
 }
 
 /// Stan radaru utrzymywany między klatkami: historia kropek per kanał,
@@ -187,6 +192,9 @@ pub struct RadarState {
     last_spawn: f64,
     /// Wygładzony poziom LFE do rysowania osobnego wskaźnika niskich częstotliwości.
     pub lfe_display: f32,
+    /// Kolor wskaźnika LFE wg jego własnej dominującej reguły (LFE to kanał
+    /// audio jak każdy inny, więc też przechodzi przez `resolve_color`).
+    pub lfe_color_rgb: (u8, u8, u8),
 }
 
 impl RadarState {
@@ -207,13 +215,22 @@ impl RadarState {
     /// Nowe kropki są dodawane co najwyżej co [`SPAWN_INTERVAL_SECS`],
     /// niezależnie od tego, jak często wywoływana jest ta funkcja — dzięki
     /// temu odświeżanie UI (30-60 FPS) jest niezależne od tempa analizy audio.
-    /// `channel_bands` to energia w 3 pasmach (`[low, mid, high]`) per kanał —
-    /// patrz [`crate::sound::spectrum`]. Może być krótsza niż `channels`
-    /// (np. scenariusze testowe, które jej nie liczą); brakujące kanały
-    /// dostają domyślnie pasmo `Mid`. `decay_secs` (z [`RadarConfig`]) decyduje
-    /// ile kropek trzeba trzymać naraz, żeby żadna nie zniknęła, zanim
-    /// naturalnie wygaśnie — patrz [`MIN_DOTS_PER_CHANNEL`]/[`MAX_DOTS_PER_CHANNEL`].
-    pub fn update(&mut self, now: f64, channels: usize, channel_rms: &[f32], channel_bands: &[BandEnergies], decay_secs: f32) {
+    /// `channel_rule_energies[kanał][reguła]` to energia w każdej regule
+    /// kolorowania (`rules`, patrz [`crate::sound::spectrum::ColorRule`]) per
+    /// kanał. Może być krótsza niż `channels` (np. scenariusze testowe, które
+    /// jej nie liczą) — brakujące kanały dostają [`FALLBACK_DOT_RGB`].
+    /// `decay_secs` (z [`RadarConfig`]) decyduje ile kropek trzeba trzymać
+    /// naraz, żeby żadna nie zniknęła, zanim naturalnie wygaśnie — patrz
+    /// [`MIN_DOTS_PER_CHANNEL`]/[`MAX_DOTS_PER_CHANNEL`].
+    pub fn update(
+        &mut self,
+        now: f64,
+        channels: usize,
+        channel_rms: &[f32],
+        channel_rule_energies: &[Vec<f32>],
+        rules: &[ColorRule],
+        decay_secs: f32,
+    ) {
         self.ensure_capacity(channels);
 
         if now - self.last_spawn < SPAWN_INTERVAL_SECS {
@@ -232,8 +249,11 @@ impl RadarState {
             let energy = channel_rms.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
             let role = channel_layout(channels).get(i).copied();
 
+            let energies = channel_rule_energies.get(i).map(Vec::as_slice).unwrap_or(&[]);
+
             if role == Some(ChannelRole::Lfe) {
                 self.lfe_display = self.lfe_display * 0.8 + energy * 0.2;
+                self.lfe_color_rgb = resolve_color(rules, energies);
                 continue;
             }
 
@@ -245,12 +265,9 @@ impl RadarState {
                 continue;
             }
 
-            let band = channel_bands
-                .get(i)
-                .map(|&e| spectrum::dominant_band(e))
-                .unwrap_or(FrequencyBand::Mid);
+            let color_rgb = resolve_color(rules, energies);
 
-            dots.push_back(ChannelDot { spawned_at: now, energy, transient, band });
+            dots.push_back(ChannelDot { spawned_at: now, energy, transient, color_rgb });
             while dots.len() > max_dots {
                 dots.pop_front();
             }
@@ -364,12 +381,12 @@ pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mu
             let alpha = (dot.energy * 180.0 + 50.0) * fg * alpha_frac;
             let pos = Pos2::new(x, y);
 
-            // Kolor koduje "typ" dźwięku wg dominującego pasma częstotliwości
-            // (bas/średnie/wysokie) — patrz [`band_color`]. W trybie wysokiego
-            // kontrastu wyłączamy to i wracamy do jednej barwy, żeby nie
-            // polegać wyłącznie na kolorze (rozróżnienie zostaje przez
+            // Kolor koduje "typ" dźwięku wg reguł użytkownika (patrz
+            // `resolve_color`, ustalone raz przy powstaniu kropki). W trybie
+            // wysokiego kontrastu wyłączamy to i wracamy do jednej barwy, żeby
+            // nie polegać wyłącznie na kolorze (rozróżnienie zostaje przez
             // kąt/rozmiar/kształt).
-            let rgb = if hc { dot_rgb } else { band_color(dot.band) };
+            let rgb = if hc { dot_rgb } else { dot.color_rgb };
 
             // Styl kropki zmienia się wraz z jej wiekiem, żeby powolne
             // wygasanie dźwięku było czytelne nie tylko przez przezroczystość,
@@ -404,11 +421,11 @@ pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mu
         }
     }
 
-    // Wskaźnik LFE — osobny, poza tarczą, bez przypisanego kierunku. LFE to
-    // z definicji bas, więc używa koloru pasma "low" (poza trybem wysokiego
-    // kontrastu, gdzie i tak wracamy do jednej barwy).
+    // Wskaźnik LFE — osobny, poza tarczą, bez przypisanego kierunku. Kolor wg
+    // jego własnej dominującej reguły (poza trybem wysokiego kontrastu, gdzie
+    // i tak wracamy do jednej barwy).
     if layout.contains(&ChannelRole::Lfe) {
-        let lfe_rgb = if hc { dot_rgb } else { band_color(FrequencyBand::Low) };
+        let lfe_rgb = if hc { dot_rgb } else { state.lfe_color_rgb };
         draw_lfe_indicator(painter, center, r, state.lfe_display, fg, lfe_rgb);
     }
 }

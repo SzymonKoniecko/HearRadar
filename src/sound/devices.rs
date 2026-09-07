@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sound::direction::{self, analyze_channels};
-use crate::sound::spectrum::{self, BandEnergies};
+use crate::sound::spectrum::{self, ColorRule};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RadarConfig {
     /// Pozycja X środka radaru jako ułamek szerokości okna (0.0 = lewo, 1.0 = prawo).
     pub anchor_x: f32,
@@ -28,6 +28,10 @@ pub struct RadarConfig {
     /// Czas zanikania pojedynczej kropki w sekundach (1.0 .. 3.0) — efekt
     /// "echa" ma być widoczny co najmniej 2-3 s, nie tylko przez ułamek sekundy.
     pub decay_secs: f32,
+    /// Konfigurowalne reguły "zakres częstotliwości → kolor" — użytkownik
+    /// może mieć ich dowolnie wiele (dodawać/usuwać/edytować w ustawieniach),
+    /// zamiast sztywnych 3 pasm. Patrz [`crate::sound::spectrum::ColorRule`].
+    pub color_rules: Vec<ColorRule>,
 }
 
 impl Default for RadarConfig {
@@ -41,6 +45,7 @@ impl Default for RadarConfig {
             show_labels: false,
             high_contrast: false,
             decay_secs: 2.5,
+            color_rules: spectrum::default_color_rules(),
         }
     }
 }
@@ -85,11 +90,11 @@ pub struct AudioAnalysis {
     /// Liczba kanałów aktywnego strumienia (2, 6, 8, ...), decyduje o
     /// interpretacji `channel_rms` przez [`crate::sound::direction::channel_layout`].
     pub channel_count: usize,
-    /// Energia w 3 pasmach częstotliwości (`[low, mid, high]`) dla każdego
-    /// kanału z ostatniej ramki — patrz [`crate::sound::spectrum`]. Używane
-    /// do kolorowania kropek radaru wg "typu" dźwięku, niezależnie od
-    /// kierunku (kąta) kanału.
-    pub channel_bands: Vec<BandEnergies>,
+    /// Energia w każdej regule kolorowania (`radar_config.color_rules`) dla
+    /// każdego kanału z ostatniej ramki — `channel_rule_energies[kanał][reguła]`.
+    /// Patrz [`crate::sound::spectrum`]. Używane do kolorowania kropek radaru
+    /// wg "typu" dźwięku, niezależnie od kierunku (kąta) kanału.
+    pub channel_rule_energies: Vec<Vec<f32>>,
     /// Indeks scenariusza testowego: 0 = live audio, 1..N = kolejne testy.
     /// Ustawiany przez UI Dioxus, odczytywany przez egui.
     pub test_scenario: u8,
@@ -390,7 +395,15 @@ pub fn fetch_audio_from_device(
 fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis: &SharedAudioAnalysis) {
     let stats = analyze_channels(samples, channels);
     let (angle, intensity) = direction::compute_direction(&stats.rms);
-    let bands = spectrum::analyze_channel_bands(samples, channels, sample_rate);
+
+    // Reguły kolorowania mogą się zmienić w dowolnym momencie z panelu
+    // ustawień (UI), więc czytamy je świeżo przy każdej ramce zamiast
+    // zakładać stały, sztywny zestaw pasm.
+    let rules = analysis
+        .lock()
+        .map(|g| g.radar_config.color_rules.clone())
+        .unwrap_or_else(|_| spectrum::default_color_rules());
+    let rule_energies = spectrum::analyze_channel_rule_energies(samples, channels, sample_rate, &rules);
 
     let labels = ["L", "R", "C", "LFE", "RL", "RR", "SL", "SR"];
     let ch_str: Vec<String> = stats.rms.iter().enumerate().map(|(i, rms)| {
@@ -407,7 +420,7 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         lock.peak_r = stats.peak.get(1).copied().unwrap_or(0.0);
         lock.channel_rms = stats.rms;
         lock.channel_count = channels;
-        lock.channel_bands = bands;
+        lock.channel_rule_energies = rule_energies;
     }
 }
 
