@@ -40,10 +40,31 @@ pub struct RadarConfig {
     /// włączyło niechcący trybu blokującego kliknięcia.
     #[serde(default = "default_overlay_click_through")]
     pub overlay_click_through: bool,
+    /// Wzmocnienie sygnału mono wysyłanego do słuchawek przez `mono_router`,
+    /// w decybelach (0.0 = bez zmian, ujemne = ciszej, dodatnie = głośniej).
+    /// Odpowiednik `INTENSITY_SCALE` z `sound::direction` — tam sztywny
+    /// mnożnik kompensujący z natury niskie RMS na potrzeby WYŚWIETLANIA na
+    /// radarze, tu analogiczny, ale regulowany przez użytkownika mnożnik na
+    /// samym WYJŚCIU dźwięku (patrz `mono_router::db_to_linear`).
+    #[serde(default)]
+    pub mono_boost_db: f32,
+    /// Czułość radaru — mnożnik RMS każdego kanału przed przeliczeniem na
+    /// odległość/rozmiar kropki od środka tarczy (patrz
+    /// `radar_egui::RadarState::update`). Wyżej = ciche dźwięki wyglądają na
+    /// "silniejsze"/dalsze, niżej = trzeba głośniej, żeby kropka dobiła do
+    /// krawędzi. Domyślna wartość to dawna stała `direction::INTENSITY_SCALE`
+    /// (patrz historia — dźwięki ledwo ruszały radarem, zanim ją
+    /// wprowadzono); teraz user może ją dostroić suwakiem zamiast na sztywno.
+    #[serde(default = "default_radar_sensitivity")]
+    pub radar_sensitivity: f32,
 }
 
 fn default_overlay_click_through() -> bool {
     true
+}
+
+fn default_radar_sensitivity() -> f32 {
+    crate::sound::direction::INTENSITY_SCALE
 }
 
 impl Default for RadarConfig {
@@ -59,6 +80,8 @@ impl Default for RadarConfig {
             decay_secs: 2.5,
             color_rules: spectrum::default_color_rules(),
             overlay_click_through: true,
+            mono_boost_db: 0.0,
+            radar_sensitivity: default_radar_sensitivity(),
         }
     }
 }

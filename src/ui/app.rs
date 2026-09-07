@@ -210,6 +210,7 @@ impl HearRadarApp {
                 &energies,
                 &self.radar_config.color_rules,
                 self.radar_config.decay_secs,
+                self.radar_config.radar_sensitivity,
             );
             return;
         }
@@ -232,6 +233,7 @@ impl HearRadarApp {
             &channel_rule_energies,
             &self.radar_config.color_rules,
             self.radar_config.decay_secs,
+            self.radar_config.radar_sensitivity,
         );
     }
 
@@ -272,6 +274,7 @@ impl HearRadarApp {
             &energies,
             &self.radar_config.color_rules,
             self.radar_config.decay_secs,
+            self.radar_config.radar_sensitivity,
         );
     }
 
@@ -462,6 +465,21 @@ impl HearRadarApp {
             }
         });
 
+        // Wzmocnienie sygnału mono na wyjściu — odpowiednik `INTENSITY_SCALE`
+        // z `sound::direction` (tam sztywny mnożnik dla WYŚWIETLANIA na
+        // radarze), tylko tu regulowalny przez użytkownika i wpływający na
+        // faktyczną GŁOŚNOŚĆ w słuchawkach (patrz `mono_router::db_to_linear`).
+        if ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.mono_boost_db, -12.0..=24.0)
+                    .text("Wzmocnienie (dB)")
+                    .suffix(" dB"),
+            )
+            .changed()
+        {
+            self.write_radar_config();
+        }
+
         let is_routing = self.mono_router.is_some();
         let can_start = capturing && !self.mono_sel_out.is_empty();
         ui.add_enabled_ui(can_start || is_routing, |ui| {
@@ -599,6 +617,12 @@ impl HearRadarApp {
             .add(
                 egui::Slider::new(&mut self.radar_config.decay_secs, 1.0..=3.0)
                     .text("Czas zaniku kropki / echo (s)"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.radar_sensitivity, 1.0..=20.0)
+                    .text("Czułość radaru (siła/zasięg dźwięku)"),
             )
             .changed();
         changed |= ui

@@ -1,5 +1,5 @@
 use crate::sound::devices::RadarConfig;
-use crate::sound::direction::{channel_layout, ChannelRole, INTENSITY_SCALE};
+use crate::sound::direction::{channel_layout, ChannelRole};
 use crate::sound::spectrum::{self, ColorRule};
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 use std::collections::VecDeque;
@@ -254,7 +254,9 @@ impl RadarState {
     /// jej nie liczą) — brakujące kanały dostają [`FALLBACK_DOT_RGB`].
     /// `decay_secs` (z [`RadarConfig`]) decyduje ile kropek trzeba trzymać
     /// naraz, żeby żadna nie zniknęła, zanim naturalnie wygaśnie — patrz
-    /// [`MIN_DOTS_PER_CHANNEL`]/[`MAX_DOTS_PER_CHANNEL`].
+    /// [`MIN_DOTS_PER_CHANNEL`]/[`MAX_DOTS_PER_CHANNEL`]. `sensitivity`
+    /// (`RadarConfig::radar_sensitivity`) to mnożnik RMS przed zamianą na
+    /// odległość/rozmiar kropki — patrz pole w `RadarConfig` po co.
     pub fn update(
         &mut self,
         now: f64,
@@ -263,6 +265,7 @@ impl RadarState {
         channel_rule_energies: &[Vec<f32>],
         rules: &[ColorRule],
         decay_secs: f32,
+        sensitivity: f32,
     ) {
         self.ensure_capacity(channels);
 
@@ -279,7 +282,7 @@ impl RadarState {
             .clamp(MIN_DOTS_PER_CHANNEL, MAX_DOTS_PER_CHANNEL);
 
         for (i, dots) in self.dots.iter_mut().enumerate() {
-            let energy = (channel_rms.get(i).copied().unwrap_or(0.0) * INTENSITY_SCALE).clamp(0.0, 1.0);
+            let energy = (channel_rms.get(i).copied().unwrap_or(0.0) * sensitivity).clamp(0.0, 1.0);
             let role = channel_layout(channels).get(i).copied();
 
             let energies = channel_rule_energies.get(i).map(Vec::as_slice).unwrap_or(&[]);
