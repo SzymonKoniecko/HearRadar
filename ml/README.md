@@ -8,13 +8,34 @@ TensorFlow — tylko gotowego pliku `.onnx`.
 
 ## Szybki start
 
+macOS/Linux:
+
 ```bash
 ./ml/bootstrap.sh
 ```
 
-To jedna komenda: tworzy wirtualne środowisko, instaluje zależności,
-eksportuje [YAMNet](https://tfhub.dev/google/yamnet/1) do ONNX, buduje
-mapowanie 521 klas AudioSet na kategorie i kopiuje gotowe pliki do
+Windows (PowerShell):
+
+```powershell
+.\ml\bootstrap.ps1
+```
+
+Jeśli PowerShell odmówi uruchomienia skryptu (domyślna polityka wykonywania
+blokuje nieskompilowane skrypty), uruchom raz:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+...albo jednorazowo, bez trwałej zmiany polityki:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ml\bootstrap.ps1
+```
+
+Oba skrypty robią to samo: tworzą wirtualne środowisko, instalują zależności,
+eksportują [YAMNet](https://tfhub.dev/google/yamnet/1) do ONNX, budują
+mapowanie 521 klas AudioSet na kategorie i kopiują gotowe pliki do
 `assets/ml/` (który jest w `.gitignore` — to duże pliki binarne, nie kod).
 
 Po zakończeniu włącz w aplikacji: **Ustawienia radaru → 🧪 Klasyfikacja
@@ -24,10 +45,12 @@ dźwięku (ML, eksperymentalne)**.
 
 | Plik | Co robi |
 |---|---|
+| `bootstrap.sh` / `bootstrap.ps1` | Cold start — venv, zależności, eksport modelu i mapowania, kopiowanie do `assets/ml/`. macOS/Linux vs Windows, robią dokładnie to samo. |
 | `export_yamnet_onnx.py` | Ładuje YAMNet z TF-Hub, eksportuje do ONNX, **weryfikuje eksport** porównując top-5 klas między TF a ONNX na tym samym sygnale testowym (przerywa z błędem, jeśli się nie zgadza). |
 | `class_mapping.py` | Statyczna tabela słów kluczowych: nazwa klasy AudioSet → jedna z ~8 kategorii ("Kroki", "Strzały/wybuchy", "Mowa", "Pojazdy"...). |
 | `export_mapping.py` | Stosuje `class_mapping.py` do wszystkich 521 klas YAMNet i zapisuje `category_mapping.json` (tablica indeks → kategoria). |
-| `quantize.py` | **Opcjonalny.** Kwantyzuje model FP32 → INT8, żeby przyspieszyć inferencję na CPU. Uruchom dopiero, jeśli profilowanie w aplikacji pokaże, że jest to potrzebne — `bootstrap.sh` tego nie robi automatycznie. |
+| `info.py` | Diagnostyka: sprawdza instalację TF/onnxruntime i pliki modelu, a jeśli są dostępne — faktycznie klasyfikuje testowy ton i zwraca wynik. Wywoływane przez przycisk "Sprawdź środowisko Pythona" w UI aplikacji, nie ręcznie. |
+| `quantize.py` | **Opcjonalny.** Kwantyzuje model FP32 → INT8, żeby przyspieszyć inferencję na CPU. Uruchom dopiero, jeśli profilowanie w aplikacji pokaże, że jest to potrzebne — `bootstrap.sh`/`bootstrap.ps1` tego nie robią automatycznie. |
 
 ## Dlaczego YAMNet, nie PANNs CNN14
 
@@ -64,4 +87,4 @@ kluczowe w `CATEGORY_KEYWORDS`, uruchom `python export_mapping.py` ponownie
 
 Pliki w `assets/ml/` są w `.gitignore` — nie trafiają do repo. Jeśli
 klonujesz repo od nowa (albo zmieniasz mapowanie kategorii), uruchom
-`./ml/bootstrap.sh` ponownie.
+`./ml/bootstrap.sh` (macOS/Linux) albo `.\ml\bootstrap.ps1` (Windows) ponownie.

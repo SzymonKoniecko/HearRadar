@@ -60,14 +60,25 @@ fn ml_dir() -> PathBuf {
 }
 
 /// Preferuje interpreter z `ml/.venv` (ma zainstalowane zależności z
-/// `ml/requirements.txt`, patrz `ml/bootstrap.sh`) — spada na systemowy
-/// `python3` w PATH, jeśli venv jeszcze nie istnieje (np. nikt nie uruchamiał
-/// jeszcze cold startu). W tym drugim przypadku `info.py` po prostu zgłosi
-/// TensorFlow/onnxruntime jako niezainstalowane, zamiast się wywalić.
+/// `ml/requirements.txt`, patrz `ml/bootstrap.sh`/`ml/bootstrap.ps1`) —
+/// spada na systemowy interpreter w PATH, jeśli venv jeszcze nie istnieje
+/// (np. nikt nie uruchamiał jeszcze cold startu). W tym drugim przypadku
+/// `info.py` po prostu zgłosi TensorFlow/onnxruntime jako niezainstalowane,
+/// zamiast się wywalić. Układ katalogu venv różni się między platformami
+/// (`bin/python3` na macOS/Linux, `Scripts\python.exe` na Windows — patrz
+/// `venv` w dokumentacji Pythona), więc sprawdzamy oba warianty.
 fn python_executable() -> PathBuf {
-    let venv_python = ml_dir().join(".venv").join("bin").join("python3");
-    if venv_python.exists() {
-        venv_python
+    let venv_dir = ml_dir().join(".venv");
+    let venv_python_unix = venv_dir.join("bin").join("python3");
+    let venv_python_windows = venv_dir.join("Scripts").join("python.exe");
+
+    if venv_python_unix.exists() {
+        venv_python_unix
+    } else if venv_python_windows.exists() {
+        venv_python_windows
+    } else if cfg!(windows) {
+        // Windows zwykle instaluje tylko `python`, nie `python3` w PATH.
+        PathBuf::from("python")
     } else {
         PathBuf::from("python3")
     }
