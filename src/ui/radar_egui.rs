@@ -1,8 +1,41 @@
 use crate::sound::devices::RadarConfig;
 use crate::sound::direction::{channel_layout, ChannelRole, INTENSITY_SCALE};
 use crate::sound::spectrum::{self, ColorRule};
-use egui::{Color32, FontId, Painter, Pos2, Stroke, Vec2};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 use std::collections::VecDeque;
+
+/// Abstraction over the drawing primitives `draw_radar` needs, so the same
+/// layout/animation logic can target either an `egui::Painter` (main window
+/// preview, and the cross-platform transparent-viewport overlay) or a
+/// software rasterizer (the native layered-window overlay on Windows, which
+/// bypasses egui's GPU-backed viewport entirely — see `ui::overlay_win`).
+pub trait RadarCanvas {
+    fn circle_filled(&self, center: Pos2, radius: f32, color: Color32);
+    fn circle_stroke(&self, center: Pos2, radius: f32, stroke: Stroke);
+    fn line_segment(&self, points: [Pos2; 2], stroke: Stroke);
+    fn rect_filled(&self, rect: Rect, corner_radius: f32, color: Color32);
+    /// No-op on backends that can't rasterize text (e.g. the Windows skia
+    /// overlay) — direction labels simply don't render there.
+    fn text(&self, pos: Pos2, anchor: Align2, text: &str, font: FontId, color: Color32);
+}
+
+impl RadarCanvas for Painter {
+    fn circle_filled(&self, center: Pos2, radius: f32, color: Color32) {
+        Painter::circle_filled(self, center, radius, color);
+    }
+    fn circle_stroke(&self, center: Pos2, radius: f32, stroke: Stroke) {
+        Painter::circle_stroke(self, center, radius, stroke);
+    }
+    fn line_segment(&self, points: [Pos2; 2], stroke: Stroke) {
+        Painter::line_segment(self, points, stroke);
+    }
+    fn rect_filled(&self, rect: Rect, corner_radius: f32, color: Color32) {
+        Painter::rect_filled(self, rect, corner_radius, color);
+    }
+    fn text(&self, pos: Pos2, anchor: Align2, text: &str, font: FontId, color: Color32) {
+        Painter::text(self, pos, anchor, text, font, color);
+    }
+}
 
 /// Kolor używany, gdy nie da się ustalić dominującej reguły (np. lista reguł
 /// jest pusta) — neutralny cyjan, taki sam jak dawny "domyślny" kolor kropek.
@@ -292,7 +325,7 @@ const LABELS: [&str; 4] = ["PRZÓD", "PRAWO", "TYŁ", "LEWO"];
 /// Rysuje minimalistyczny radar audio: tło, okręgi skali, krzyż kierunków,
 /// opcjonalne sektory 7.1, kropki kanałów (z zanikiem w czasie) i osobny
 /// wskaźnik LFE. `now` to bieżący czas w sekundach (do liczenia zaniku).
-pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mut RadarState, channels: usize, now: f64) {
+pub fn draw_radar<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, state: &mut RadarState, channels: usize, now: f64) {
     state.prune(now, cfg.decay_secs);
 
     let r = cfg.radius;
@@ -314,20 +347,20 @@ pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mu
     let c_center = Color32::from_rgba_unmultiplied(cross_rgb.0, cross_rgb.1, cross_rgb.2, 200);
     let c_bg     = Color32::from_rgba_unmultiplied(bg_rgb.0, bg_rgb.1, bg_rgb.2, (cfg.bg_alpha * 255.0) as u8);
 
-    painter.circle_filled(center, r, c_bg);
+    canvas.circle_filled(center, r, c_bg);
 
     // 3 koncentryczne okręgi = skala intensywności (słaby/średni/mocny), nie
     // fizyczna odległość.
     for frac in [1.0f32, 0.66, 0.33] {
         let color = if frac == 1.0 { with_alpha(c_ring, fg) } else { with_alpha(c_inner, fg) };
         let width = if frac == 1.0 { 1.5 } else { 0.8 };
-        painter.circle_stroke(center, r * frac, Stroke::new(width, color));
+        canvas.circle_stroke(center, r * frac, Stroke::new(width, color));
     }
 
     // Krzyż kierunków.
     let cross = Stroke::new(0.8, with_alpha(c_cross, fg));
-    painter.line_segment([center - Vec2::new(0.0, r), center + Vec2::new(0.0, r)], cross);
-    painter.line_segment([center - Vec2::new(r, 0.0), center + Vec2::new(r, 0.0)], cross);
+    canvas.line_segment([center - Vec2::new(0.0, r), center + Vec2::new(0.0, r)], cross);
+    canvas.line_segment([center - Vec2::new(r, 0.0), center + Vec2::new(r, 0.0)], cross);
 
     // Bardzo delikatne linie sektorów co 45° — tylko w układzie 7.1, gdzie
     // każdy z 8 kierunków ma osobny kanał.
@@ -336,11 +369,11 @@ pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mu
         for k in 0..8 {
             let a = (k as f32) * std::f32::consts::FRAC_PI_4 - std::f32::consts::FRAC_PI_2;
             let p = center + Vec2::new(a.cos(), a.sin()) * r;
-            painter.line_segment([center, p], sector);
+            canvas.line_segment([center, p], sector);
         }
     }
 
-    painter.circle_filled(center, 2.5, with_alpha(c_center, fg));
+    canvas.circle_filled(center, 2.5, with_alpha(c_center, fg));
 
     // Etykiety kierunków (tryb z etykietami) — bez nich radar jest w pełni minimalny.
     if cfg.show_labels {
@@ -353,7 +386,7 @@ pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mu
             center - Vec2::new(r + 6.0, 0.0),  // LEWO
         ];
         for (label, pos) in LABELS.iter().zip(positions.iter()) {
-            painter.text(*pos, egui::Align2::CENTER_CENTER, *label, font.clone(), label_color);
+            canvas.text(*pos, egui::Align2::CENTER_CENTER, *label, font.clone(), label_color);
         }
     }
 
@@ -396,18 +429,18 @@ pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mu
             if life > 0.66 {
                 let glow_alpha = (alpha * 0.35).clamp(0.0, 255.0) as u8;
                 let glow_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, glow_alpha);
-                painter.circle_filled(pos, size * 2.0, glow_color);
+                canvas.circle_filled(pos, size * 2.0, glow_color);
                 let color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha.clamp(0.0, 255.0) as u8);
-                painter.circle_filled(pos, size, color);
+                canvas.circle_filled(pos, size, color);
             } else if life > 0.33 {
                 let color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha.clamp(0.0, 255.0) as u8);
-                painter.circle_filled(pos, size, color);
+                canvas.circle_filled(pos, size, color);
             } else {
                 // Mocniejszy kontur niż wypełnienie miałoby przy tej alpha,
                 // żeby cienki pierścień był wciąż widoczny tuż przed zniknięciem.
                 let ring_alpha = (alpha * 1.6).clamp(0.0, 255.0) as u8;
                 let stroke_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, ring_alpha);
-                painter.circle_stroke(pos, size.max(1.5), Stroke::new(1.0, stroke_color));
+                canvas.circle_stroke(pos, size.max(1.5), Stroke::new(1.0, stroke_color));
             }
 
             // Nagły skok energii: krótki, gasnący pierścień wokół kropki.
@@ -416,7 +449,7 @@ pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mu
                 let ring_r = size + 3.0 + (0.25 - age) * 40.0;
                 let ring_alpha = (200.0 * ring_life * fg) as u8;
                 let ring_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, ring_alpha);
-                painter.circle_stroke(Pos2::new(x, y), ring_r, Stroke::new(1.5, ring_color));
+                canvas.circle_stroke(Pos2::new(x, y), ring_r, Stroke::new(1.5, ring_color));
             }
         }
     }
@@ -426,18 +459,18 @@ pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mu
     // i tak wracamy do jednej barwy).
     if layout.contains(&ChannelRole::Lfe) {
         let lfe_rgb = if hc { dot_rgb } else { state.lfe_color_rgb };
-        draw_lfe_indicator(painter, center, r, state.lfe_display, fg, lfe_rgb);
+        draw_lfe_indicator(canvas, center, r, state.lfe_display, fg, lfe_rgb);
     }
 }
 
-fn draw_lfe_indicator(painter: &Painter, center: Pos2, r: f32, level: f32, fg: f32, rgb: (u8, u8, u8)) {
+fn draw_lfe_indicator<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, level: f32, fg: f32, rgb: (u8, u8, u8)) {
     let w = (r * 0.5).clamp(30.0, 70.0);
     let h = 6.0;
     let top_left = Pos2::new(center.x - w / 2.0, center.y + r + 14.0);
     let bg = Color32::from_rgba_unmultiplied(255, 255, 255, (30.0 * fg) as u8);
-    painter.rect_filled(egui::Rect::from_min_size(top_left, Vec2::new(w, h)), 2.0, bg);
+    canvas.rect_filled(egui::Rect::from_min_size(top_left, Vec2::new(w, h)), 2.0, bg);
 
     let fill_w = w * level.clamp(0.0, 1.0);
     let fill = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, (220.0 * fg) as u8);
-    painter.rect_filled(egui::Rect::from_min_size(top_left, Vec2::new(fill_w, h)), 2.0, fill);
+    canvas.rect_filled(egui::Rect::from_min_size(top_left, Vec2::new(fill_w, h)), 2.0, fill);
 }

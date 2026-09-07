@@ -17,6 +17,7 @@ use crate::sound::mono_router::{self, MonoRouter};
 use crate::sound::spectrum;
 use crate::ui::radar_egui::{RadarState, TestScenario, draw_radar};
 use eframe::egui;
+#[cfg(not(windows))]
 use egui::{ViewportBuilder, ViewportCommand, ViewportId};
 
 /// Margines overlay od krawędzi ekranu przy automatycznym pozycjonowaniu wg
@@ -91,6 +92,15 @@ pub struct HearRadarApp {
     /// żeby nie nadpisywać w kółko ręcznego przeciągania okna przez użytkownika.
     overlay_reposition_pending: bool,
 
+    /// Natywne okno warstwowe Windows (patrz `ui::overlay_win`) — używane
+    /// zamiast viewportu `eframe` na Windows, bo `eframe`'owa przezroczystość
+    /// okna jest tam niewiarygodna (czarne z `glow`, białe z `wgpu`; obie
+    /// ścieżki idą przez negocjację trybu alfa ze swapchainem GPU, której
+    /// kompozytor bywa niewiarygodny). `None`, dopóki overlay nie zostanie
+    /// otwarty; tworzone leniwie i niszczone przy zamknięciu.
+    #[cfg(windows)]
+    win_overlay: Option<crate::ui::overlay_win::WinOverlay>,
+
     /// Komunikat o wyniku ostatniego zapisu/wczytania konfiguracji z pliku,
     /// pokazywany pod przyciskami w panelu kolorów (`Ok(..)` na zielono,
     /// `Err(..)` na czerwono). `None` = nic jeszcze nie robiono w tej sesji.
@@ -150,6 +160,8 @@ impl HearRadarApp {
             overlay_open: false,
             overlay_click_through: true,
             overlay_reposition_pending: false,
+            #[cfg(windows)]
+            win_overlay: None,
             config_status: None,
         }
     }
@@ -787,6 +799,7 @@ impl HearRadarApp {
     /// konfiguracji faktycznie przesuwały radar po całym ekranie, a nie tylko
     /// po obszarze samego okna. Zwraca `None`, dopóki system nie zdąży
     /// zgłosić rozmiaru monitora (pierwsza klatka po utworzeniu viewportu).
+    #[cfg(not(windows))]
     fn overlay_anchored_position(&self, ctx: &egui::Context, overlay_size: f32) -> Option<egui::Pos2> {
         let monitor_size = ctx.input(|i| i.viewport().monitor_size)?;
         if monitor_size.x <= 1.0 || monitor_size.y <= 1.0 {
@@ -799,12 +812,43 @@ impl HearRadarApp {
         Some(egui::pos2(x, y))
     }
 
+    /// Ścieżka Windows: renderuje jedną klatkę natywnego okna warstwowego
+    /// zamiast viewportu `eframe` (patrz pole `win_overlay` i moduł
+    /// `ui::overlay_win`). Tworzy okno leniwie przy pierwszym wywołaniu.
+    #[cfg(windows)]
+    fn tick_native_overlay(&mut self, now: f64) {
+        if self.win_overlay.is_none() {
+            match crate::ui::overlay_win::WinOverlay::new() {
+                Ok(overlay) => self.win_overlay = Some(overlay),
+                Err(err) => {
+                    eprintln!("nie udało się utworzyć natywnego okna overlay: {err}");
+                    self.overlay_open = false;
+                    return;
+                }
+            }
+        }
+
+        let overlay_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
+        if let Some(overlay) = self.win_overlay.as_mut() {
+            overlay.render_and_present(
+                overlay_size,
+                OVERLAY_SCREEN_MARGIN,
+                &self.radar_config,
+                &mut self.radar_state,
+                self.current_channels,
+                now,
+                self.overlay_click_through,
+            );
+        }
+    }
+
     // ── Zawartość overlay viewportu ───────────────────────────────────────
     /// Rysuje overlay i zwraca `true`, jeśli użytkownik zażądał jego zamknięcia
     /// (przycisk „⚙” albo systemowe zamknięcie okna). Overlay jest zawsze
     /// bezramkowy, przezroczysty i na wierzchu (patrz `ViewportBuilder` w
     /// `ui()`) — to jedyna "dodatkowa warstwa" i nie ma tam żadnego innego
     /// okna systemowego niż ta jedna, przezroczysta powierzchnia rysunku.
+    #[cfg(not(windows))]
     fn ui_overlay_contents(&mut self, root_ui: &mut egui::Ui) -> bool {
         let ctx = root_ui.ctx().clone();
         let mut close_requested = false;
@@ -904,6 +948,20 @@ impl eframe::App for HearRadarApp {
             });
         });
 
+        #[cfg(windows)]
+        {
+            if self.overlay_open {
+                self.tick_native_overlay(now);
+            } else {
+                // Niszczy okno WinAPI (patrz `Drop for WinOverlay`), jeśli
+                // było otwarte — leniwe tworzenie/niszczenie zamiast
+                // pokazywania/ukrywania, prostsze niż śledzenie dodatkowego
+                // stanu widoczności.
+                self.win_overlay = None;
+            }
+        }
+
+        #[cfg(not(windows))]
         if self.overlay_open {
             // `show_viewport_immediate` renderuje ten viewport synchronicznie
             // w ramach tej samej klatki i tego samego wątku co okno główne —
@@ -917,6 +975,11 @@ impl eframe::App for HearRadarApp {
             // marginesu. `with_always_on_top` + brak dekoracji + przezroczyste
             // tło to CAŁA "dodatkowa warstwa" — sam rysunek radaru bezpośrednio
             // na pulpicie, bez paska tytułu, ramki czy ikony w tle zadań.
+            //
+            // UWAGA: na Windows ta ścieżka jest zastąpiona natywnym oknem
+            // warstwowym (`ui::overlay_win`, patrz gałąź `#[cfg(windows)]`
+            // wyżej) — `eframe`'owa przezroczystość okna jest tam
+            // niewiarygodna (czarne tło z `glow`, białe z `wgpu`).
             let overlay_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
             let close_requested = ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("hear_radar_overlay"),
