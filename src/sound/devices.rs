@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sound::direction::{self, analyze_channels};
+use crate::sound::spectrum::{self, BandEnergies};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RadarConfig {
@@ -83,6 +84,11 @@ pub struct AudioAnalysis {
     /// Liczba kanałów aktywnego strumienia (2, 6, 8, ...), decyduje o
     /// interpretacji `channel_rms` przez [`crate::sound::direction::channel_layout`].
     pub channel_count: usize,
+    /// Energia w 3 pasmach częstotliwości (`[low, mid, high]`) dla każdego
+    /// kanału z ostatniej ramki — patrz [`crate::sound::spectrum`]. Używane
+    /// do kolorowania kropek radaru wg "typu" dźwięku, niezależnie od
+    /// kierunku (kąta) kanału.
+    pub channel_bands: Vec<BandEnergies>,
     /// Indeks scenariusza testowego: 0 = live audio, 1..N = kolejne testy.
     /// Ustawiany przez UI Dioxus, odczytywany przez egui.
     pub test_scenario: u8,
@@ -306,6 +312,7 @@ pub fn fetch_audio_from_device(
 
     let config: StreamConfig = default_config.clone().into();
     let channels = config.channels as usize;
+    let sample_rate = config.sample_rate.0 as f32;
     let err_fn = |e| eprintln!("Stream error: {e}");
 
     println!(
@@ -330,7 +337,7 @@ pub fn fetch_audio_from_device(
                         let peak = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                         println!("[audio] cb #{n} samples={} peak={peak:.4}", data.len());
                     }
-                    update_analysis(data, channels, &a);
+                    update_analysis(data, channels, sample_rate, &a);
                 },
                 err_fn,
                 None,
@@ -348,7 +355,7 @@ pub fn fetch_audio_from_device(
                         let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                         println!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
                     }
-                    update_analysis(&f, channels, &a);
+                    update_analysis(&f, channels, sample_rate, &a);
                 },
                 err_fn,
                 None,
@@ -366,7 +373,7 @@ pub fn fetch_audio_from_device(
                         let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                         println!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
                     }
-                    update_analysis(&f, channels, &a);
+                    update_analysis(&f, channels, sample_rate, &a);
                 },
                 err_fn,
                 None,
@@ -379,9 +386,10 @@ pub fn fetch_audio_from_device(
     Ok(stream)
 }
 
-fn update_analysis(samples: &[f32], channels: usize, analysis: &SharedAudioAnalysis) {
+fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis: &SharedAudioAnalysis) {
     let stats = analyze_channels(samples, channels);
     let (angle, intensity) = direction::compute_direction(&stats.rms);
+    let bands = spectrum::analyze_channel_bands(samples, channels, sample_rate);
 
     let labels = ["L", "R", "C", "LFE", "RL", "RR", "SL", "SR"];
     let ch_str: Vec<String> = stats.rms.iter().enumerate().map(|(i, rms)| {
@@ -398,6 +406,7 @@ fn update_analysis(samples: &[f32], channels: usize, analysis: &SharedAudioAnaly
         lock.peak_r = stats.peak.get(1).copied().unwrap_or(0.0);
         lock.channel_rms = stats.rms;
         lock.channel_count = channels;
+        lock.channel_bands = bands;
     }
 }
 

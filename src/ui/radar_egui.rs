@@ -1,5 +1,6 @@
 use crate::sound::devices::RadarConfig;
 use crate::sound::direction::{channel_layout, ChannelRole};
+use crate::sound::spectrum::{self, BandEnergies, FrequencyBand};
 use egui::{Color32, FontId, Painter, Pos2, Stroke, Vec2};
 use std::collections::VecDeque;
 
@@ -21,6 +22,14 @@ pub enum TestScenario {
     SinglePulse = 5,
     RampUp      = 6,
     Noise       = 7,
+    /// Prawdziwa sinusoida o zadanej częstotliwości (Hz), puszczona przez
+    /// TEN SAM potok analizy co żywe audio (`analyze_channels` +
+    /// `spectrum::analyze_channel_bands`) — w przeciwieństwie do pozostałych
+    /// scenariuszy, które podają syntetyczny RMS wprost. Służy do
+    /// weryfikacji progów kolorowania pasm (200 Hz / 2 kHz) na żywo: przesuń
+    /// suwak Hz i patrz, kiedy kropka zmienia kolor. Obsługiwane osobno w
+    /// `HearRadarApp::tick_radar_state`, nie przez [`Self::generate`].
+    Tone        = 8,
 }
 
 impl TestScenario {
@@ -33,6 +42,7 @@ impl TestScenario {
         Self::SinglePulse,
         Self::RampUp,
         Self::Noise,
+        Self::Tone,
     ];
 
     pub fn from_u8(v: u8) -> Self {
@@ -44,6 +54,7 @@ impl TestScenario {
             5 => Self::SinglePulse,
             6 => Self::RampUp,
             7 => Self::Noise,
+            8 => Self::Tone,
             _ => Self::Off,
         }
     }
@@ -57,12 +68,16 @@ impl TestScenario {
             Self::Sine        => "∿ Sinusoida (rotacja)",
             Self::SinglePulse => "▲ Pojedynczy impuls (transient)",
             Self::RampUp      => "/ Klin rosnący",
-            Self::Noise       => "≋ Szum losowy",
+            Self::Noise       => "≋ Szum losowy (seed)",
+            Self::Tone        => "🎵 Ton o zadanym Hz (kolor pasma)",
         }
     }
 
     /// Zwraca symulowany RMS dla każdego z `channels` kanałów, w danej fazie.
-    pub fn generate(self, channels: usize, phase: f32) -> Vec<f32> {
+    /// `seed` różnicuje/odtwarza deterministycznie scenariusze losowe
+    /// (`Noise`) i cykliczne (`SinglePulse`) — ten sam `seed` zawsze da ten
+    /// sam przebieg, więc łatwiej porównywać zmiany w renderowaniu.
+    pub fn generate(self, channels: usize, phase: f32, seed: u32) -> Vec<f32> {
         (0..channels)
             .map(|i| {
                 let t = i as f32 / channels.max(1) as f32;
@@ -75,17 +90,36 @@ impl TestScenario {
                     Self::SinglePulse => {
                         // Krótki, cykliczny impuls na jednym kanale na raz — pokazuje
                         // detekcję transientów (większa/jaśniejsza kropka + pierścień).
-                        let active = ((phase * 0.5) as usize) % channels;
+                        let active = ((phase * 0.5) as usize + seed as usize) % channels;
                         let just_fired = (phase * 8.0).fract() < 0.15;
                         if i == active && just_fired { 1.0 } else { 0.02 }
                     }
                     Self::RampUp      => (phase.fract() * (i as f32 + 1.0) / channels as f32).clamp(0.0, 1.0),
                     Self::Noise       => {
                         let s  = (i as u32).wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let s  = s.wrapping_add(seed.wrapping_mul(2_654_435_761));
                         let s2 = s.wrapping_add((phase * 1000.0) as u32);
                         s2 as f32 / u32::MAX as f32
                     }
+                    // Obsługiwane osobno w `tick_radar_state` (potrzebuje realnych
+                    // próbek, nie samego RMS) — tu tylko niegroźna wartość zapasowa.
+                    Self::Tone        => 0.0,
                 }
+            })
+            .collect()
+    }
+
+    /// Syntetyczna energia pasm dla scenariuszy testowych: nie liczymy
+    /// prawdziwego widma (nie ma prawdziwego sygnału), tylko demonstrujemy
+    /// kolorowanie kropek wg pasma — dominujące pasmo powoli krąży po
+    /// kanałach w czasie, żeby w podglądzie było widać wszystkie 3 kolory.
+    pub fn synthetic_bands(self, channels: usize, phase: f32) -> Vec<BandEnergies> {
+        (0..channels)
+            .map(|i| {
+                let dominant = (i + (phase * 0.4) as usize) % 3;
+                let mut e = [0.05f32; 3];
+                e[dominant] = 0.8;
+                e
             })
             .collect()
     }
@@ -121,6 +155,23 @@ pub struct ChannelDot {
     pub energy: f32,
     /// Czy ta ramka została oznaczona jako nagły skok energii.
     pub transient: bool,
+    /// Dominujące pasmo częstotliwości tej ramki — decyduje o kolorze kropki
+    /// (patrz [`band_color`]). Ustalane raz przy powstaniu kropki, więc kolor
+    /// nie "skacze" w trakcie jej zaniku.
+    pub band: FrequencyBand,
+}
+
+/// Kolor przypisany każdemu pasmu częstotliwości. Na razie na sztywno, ale
+/// celowo wydzielone do jednej funkcji: docelowy konfigurator kolorów (reguła
+/// parametr → kolor, edytowalna w UI) ma tu podmienić tylko to jedno miejsce
+/// — resztą rysowania steruje wyłącznie `dot.band`, więc nic więcej się nie
+/// zmieni.
+fn band_color(band: FrequencyBand) -> (u8, u8, u8) {
+    match band {
+        FrequencyBand::Low => (255, 90, 90),   // czerwony: bas / niskie częstotliwości
+        FrequencyBand::Mid => (0, 220, 220),   // cyjan: średnie (mowa, kroki)
+        FrequencyBand::High => (255, 220, 90), // żółty: wysokie / syczące tony
+    }
 }
 
 /// Stan radaru utrzymywany między klatkami: historia kropek per kanał,
@@ -152,7 +203,11 @@ impl RadarState {
     /// Nowe kropki są dodawane co najwyżej co [`SPAWN_INTERVAL_SECS`],
     /// niezależnie od tego, jak często wywoływana jest ta funkcja — dzięki
     /// temu odświeżanie UI (30-60 FPS) jest niezależne od tempa analizy audio.
-    pub fn update(&mut self, now: f64, channels: usize, channel_rms: &[f32]) {
+    /// `channel_bands` to energia w 3 pasmach (`[low, mid, high]`) per kanał —
+    /// patrz [`crate::sound::spectrum`]. Może być krótsza niż `channels`
+    /// (np. scenariusze testowe, które jej nie liczą); brakujące kanały
+    /// dostają domyślnie pasmo `Mid`.
+    pub fn update(&mut self, now: f64, channels: usize, channel_rms: &[f32], channel_bands: &[BandEnergies]) {
         self.ensure_capacity(channels);
 
         if now - self.last_spawn < SPAWN_INTERVAL_SECS {
@@ -177,7 +232,12 @@ impl RadarState {
                 continue;
             }
 
-            dots.push_back(ChannelDot { spawned_at: now, energy, transient });
+            let band = channel_bands
+                .get(i)
+                .map(|&e| spectrum::dominant_band(e))
+                .unwrap_or(FrequencyBand::Mid);
+
+            dots.push_back(ChannelDot { spawned_at: now, energy, transient, band });
             while dots.len() > MAX_DOTS_PER_CHANNEL {
                 dots.pop_front();
             }
@@ -289,24 +349,54 @@ pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mu
 
             let size = (2.0 + dot.energy * 4.0) * (0.5 + 0.5 * life);
             let alpha = (dot.energy * 180.0 + 50.0) * fg * alpha_frac;
-            let color = Color32::from_rgba_unmultiplied(dot_rgb.0, dot_rgb.1, dot_rgb.2, alpha.clamp(0.0, 255.0) as u8);
+            let pos = Pos2::new(x, y);
 
-            painter.circle_filled(Pos2::new(x, y), size, color);
+            // Kolor koduje "typ" dźwięku wg dominującego pasma częstotliwości
+            // (bas/średnie/wysokie) — patrz [`band_color`]. W trybie wysokiego
+            // kontrastu wyłączamy to i wracamy do jednej barwy, żeby nie
+            // polegać wyłącznie na kolorze (rozróżnienie zostaje przez
+            // kąt/rozmiar/kształt).
+            let rgb = if hc { dot_rgb } else { band_color(dot.band) };
+
+            // Styl kropki zmienia się wraz z jej wiekiem, żeby powolne
+            // wygasanie dźwięku było czytelne nie tylko przez przezroczystość,
+            // ale przez samą formę: świeża kropka ma pełne wypełnienie i
+            // delikatną poświatę, w połowie życia traci poświatę, a tuż przed
+            // zniknięciem "rozpuszcza się" w pusty, kurczący się pierścień.
+            if life > 0.66 {
+                let glow_alpha = (alpha * 0.35).clamp(0.0, 255.0) as u8;
+                let glow_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, glow_alpha);
+                painter.circle_filled(pos, size * 2.0, glow_color);
+                let color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha.clamp(0.0, 255.0) as u8);
+                painter.circle_filled(pos, size, color);
+            } else if life > 0.33 {
+                let color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha.clamp(0.0, 255.0) as u8);
+                painter.circle_filled(pos, size, color);
+            } else {
+                // Mocniejszy kontur niż wypełnienie miałoby przy tej alpha,
+                // żeby cienki pierścień był wciąż widoczny tuż przed zniknięciem.
+                let ring_alpha = (alpha * 1.6).clamp(0.0, 255.0) as u8;
+                let stroke_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, ring_alpha);
+                painter.circle_stroke(pos, size.max(1.5), Stroke::new(1.0, stroke_color));
+            }
 
             // Nagły skok energii: krótki, gasnący pierścień wokół kropki.
             if dot.transient && age < 0.25 {
                 let ring_life = 1.0 - (age / 0.25);
                 let ring_r = size + 3.0 + (0.25 - age) * 40.0;
                 let ring_alpha = (200.0 * ring_life * fg) as u8;
-                let ring_color = Color32::from_rgba_unmultiplied(dot_rgb.0, dot_rgb.1, dot_rgb.2, ring_alpha);
+                let ring_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, ring_alpha);
                 painter.circle_stroke(Pos2::new(x, y), ring_r, Stroke::new(1.5, ring_color));
             }
         }
     }
 
-    // Wskaźnik LFE — osobny, poza tarczą, bez przypisanego kierunku.
+    // Wskaźnik LFE — osobny, poza tarczą, bez przypisanego kierunku. LFE to
+    // z definicji bas, więc używa koloru pasma "low" (poza trybem wysokiego
+    // kontrastu, gdzie i tak wracamy do jednej barwy).
     if layout.contains(&ChannelRole::Lfe) {
-        draw_lfe_indicator(painter, center, r, state.lfe_display, fg, dot_rgb);
+        let lfe_rgb = if hc { dot_rgb } else { band_color(FrequencyBand::Low) };
+        draw_lfe_indicator(painter, center, r, state.lfe_display, fg, lfe_rgb);
     }
 }
 

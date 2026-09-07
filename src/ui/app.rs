@@ -10,16 +10,30 @@
 //! samej klatce co okno główne.
 
 use crate::sound::devices::{self, MonoEar, RadarConfig, SharedAudioAnalysis, SoundDevice};
+use crate::sound::direction;
 use crate::sound::mono_router::{self, MonoRouter};
+use crate::sound::spectrum;
 use crate::ui::radar_egui::{RadarState, TestScenario, draw_radar};
 use eframe::egui;
 use egui::{ViewportBuilder, ViewportCommand, ViewportId};
 
-const OVERLAY_SIZE: f32 = 260.0;
+/// Margines overlay od krawędzi ekranu przy automatycznym pozycjonowaniu wg
+/// `anchor_x`/`anchor_y` (środek zakresu 24-32 px ze specyfikacji).
+const OVERLAY_SCREEN_MARGIN: f32 = 28.0;
+/// Dodatkowe miejsce wokół tarczy radaru w oknie overlay — na wskaźnik LFE
+/// i ewentualne etykiety kierunków, żeby nic się nie ucinało.
+const OVERLAY_PADDING: f32 = 60.0;
 /// Domyślna liczba kanałów używana do podglądu/scenariuszy testowych, zanim
 /// jakikolwiek strumień audio dostarczy prawdziwą liczbę kanałów (7.1 pokazuje
 /// pełny zestaw kierunków, w tym wskaźnik LFE).
 const DEFAULT_TEST_CHANNELS: usize = 8;
+/// Częstotliwość próbkowania używana do generowania scenariusza `Tone` —
+/// nie ma prawdziwego urządzenia audio w tle testu, więc przyjmujemy typową
+/// wartość, przy której progi pasm (200 Hz / 2 kHz) są wiarygodne.
+const TEST_TONE_SAMPLE_RATE: f32 = 48_000.0;
+/// Ile próbek na klatkę generujemy dla scenariusza `Tone` (~10 ms przy 48 kHz
+/// — podobnie jak typowy bufor cpal).
+const TEST_TONE_BUFFER_LEN: usize = 480;
 
 // ── Stan aplikacji ────────────────────────────────────────────────────────────
 
@@ -37,6 +51,15 @@ pub struct HearRadarApp {
     current_channels: usize,
     test_phase: f32,
     test_scenario: TestScenario,
+    /// Ziarno PRNG dla scenariuszy `Noise`/`SinglePulse` — ten sam seed
+    /// zawsze daje ten sam przebieg, więc łatwiej porównywać zmiany w
+    /// renderowaniu zamiast gonić za migoczącym szumem.
+    test_seed: u32,
+    /// Częstotliwość (Hz) prawdziwego tonu testowego (scenariusz `Tone`).
+    test_freq_hz: f32,
+    /// Ciągły czas (s) tonu testowego — inny niż `test_phase`, żeby fala nie
+    /// przeskakiwała przy każdej klatce.
+    test_tone_time: f32,
 
     // Konfiguracja wyglądu radaru.
     radar_config: RadarConfig,
@@ -55,6 +78,16 @@ pub struct HearRadarApp {
 
     // Overlay.
     overlay_open: bool,
+    /// Gdy `true`, overlay jest przezroczysty dla kliknięć/scrolla — myszka i
+    /// klawiatura trafiają wprost do gry pod spodem, tak jak w prawdziwych
+    /// nakładkach HUD (Discord, MSI Afterburner itp.). Wyłącz tymczasowo, żeby
+    /// przeciągnąć radar w inne miejsce.
+    overlay_click_through: bool,
+    /// `true`, gdy pozycję overlay na ekranie trzeba przeliczyć na nowo
+    /// (świeżo otwarty albo zmieniono suwak pozycji/rozmiaru) — ustawiane raz,
+    /// wysyłane jako `ViewportCommand::OuterPosition` przy najbliższej okazji,
+    /// żeby nie nadpisywać w kółko ręcznego przeciągania okna przez użytkownika.
+    overlay_reposition_pending: bool,
 }
 
 impl HearRadarApp {
@@ -88,6 +121,9 @@ impl HearRadarApp {
             radar_state: RadarState::new(),
             current_channels: DEFAULT_TEST_CHANNELS,
             test_phase: 0.0,
+            test_seed: 7,
+            test_freq_hz: 1000.0,
+            test_tone_time: 0.0,
             test_scenario: TestScenario::Off,
             radar_config: RadarConfig::default(),
             devices,
@@ -99,6 +135,8 @@ impl HearRadarApp {
             mono_router: None,
             mono_ear: MonoEar::Off,
             overlay_open: false,
+            overlay_click_through: true,
+            overlay_reposition_pending: false,
         }
     }
 
@@ -123,27 +161,62 @@ impl HearRadarApp {
     /// wybranego scenariusza testowego, albo z żywego strumienia audio —
     /// i pozwala mu narysować/wygasić kropki niezależnie od tempa audio.
     fn tick_radar_state(&mut self, now: f64) {
+        if self.test_scenario == TestScenario::Tone {
+            self.current_channels = DEFAULT_TEST_CHANNELS;
+            self.tick_test_tone(now);
+            return;
+        }
+
         if self.test_scenario != TestScenario::Off {
             self.test_phase += 0.05;
             self.current_channels = DEFAULT_TEST_CHANNELS;
             let rms = self
                 .test_scenario
-                .generate(self.current_channels, self.test_phase);
-            self.radar_state.update(now, self.current_channels, &rms);
+                .generate(self.current_channels, self.test_phase, self.test_seed);
+            let bands = self
+                .test_scenario
+                .synthetic_bands(self.current_channels, self.test_phase);
+            self.radar_state.update(now, self.current_channels, &rms, &bands);
             return;
         }
 
-        let (channel_rms, channel_count) = self
+        let (channel_rms, channel_count, channel_bands) = self
             .analysis
             .lock()
-            .map(|g| (g.channel_rms.clone(), g.channel_count))
+            .map(|g| (g.channel_rms.clone(), g.channel_count, g.channel_bands.clone()))
             .unwrap_or_default();
 
         if channel_count > 0 {
             self.current_channels = channel_count;
         }
         self.radar_state
-            .update(now, self.current_channels, &channel_rms);
+            .update(now, self.current_channels, &channel_rms, &channel_bands);
+    }
+
+    /// Generuje prawdziwą sinusoidę o częstotliwości `test_freq_hz` na
+    /// wszystkich kanałach i puszcza ją przez DOKŁADNIE ten sam potok analizy
+    /// co żywe audio (`analyze_channels` + `spectrum::analyze_channel_bands`)
+    /// — w przeciwieństwie do pozostałych scenariuszy, które podają
+    /// syntetyczny RMS/pasmo wprost. Dzięki temu suwak Hz w panelu testowym
+    /// naprawdę pokazuje, przy jakiej częstotliwości kolor kropki przeskakuje
+    /// między pasmami (progi 200 Hz / 2 kHz).
+    fn tick_test_tone(&mut self, now: f64) {
+        let sr = TEST_TONE_SAMPLE_RATE;
+        let freq = self.test_freq_hz.max(1.0);
+        let mut samples = Vec::with_capacity(TEST_TONE_BUFFER_LEN * self.current_channels);
+
+        for s in 0..TEST_TONE_BUFFER_LEN {
+            let t = self.test_tone_time + s as f32 / sr;
+            let v = (t * std::f32::consts::TAU * freq).sin() * 0.8;
+            for _ in 0..self.current_channels {
+                samples.push(v);
+            }
+        }
+        self.test_tone_time += TEST_TONE_BUFFER_LEN as f32 / sr;
+
+        let stats = direction::analyze_channels(&samples, self.current_channels);
+        let bands = spectrum::analyze_channel_bands(&samples, self.current_channels, sr);
+        self.radar_state.update(now, self.current_channels, &stats.rms, &bands);
     }
 
     fn write_test_scenario(&self, idx: u8) {
@@ -246,8 +319,12 @@ impl HearRadarApp {
                 }
             }
 
-            if ui.button("🎯 Overlay").clicked() {
-                self.overlay_open = true;
+            let overlay_btn_label = if self.overlay_open { "🎯 Ukryj overlay" } else { "🎯 Pokaż overlay" };
+            if ui.button(overlay_btn_label).clicked() {
+                self.overlay_open = !self.overlay_open;
+                if self.overlay_open {
+                    self.overlay_reposition_pending = true;
+                }
             }
         });
 
@@ -377,6 +454,31 @@ impl HearRadarApp {
                 }
             }
         });
+
+        ui.add_space(4.0);
+        ui.add(
+            egui::Slider::new(&mut self.test_seed, 0..=9999)
+                .text("Seed (Szum losowy / Pojedynczy impuls)"),
+        );
+        ui.label("Ten sam seed zawsze daje ten sam przebieg — przydatne do porównywania zmian.");
+
+        if self.test_scenario == TestScenario::Tone {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Slider::new(&mut self.test_freq_hz, 20.0..=20_000.0)
+                    .logarithmic(true)
+                    .suffix(" Hz")
+                    .text("Częstotliwość tonu testowego"),
+            );
+            let band = if self.test_freq_hz < 200.0 {
+                "niskie (bas) — czerwony"
+            } else if self.test_freq_hz < 2000.0 {
+                "średnie (mowa/kroki) — cyjan"
+            } else {
+                "wysokie (syczące) — żółty"
+            };
+            ui.label(format!("Oczekiwane pasmo: {band}"));
+        }
     }
 
     // ── Panel: konfiguracja wyglądu radaru ───────────────────────────────
@@ -390,17 +492,22 @@ impl HearRadarApp {
         });
 
         let mut changed = false;
-        changed |= ui
+        let mut position_changed = false;
+        position_changed |= ui
             .add(egui::Slider::new(&mut self.radar_config.anchor_x, 0.0..=1.0).text("Pozycja X"))
             .changed();
-        changed |= ui
+        position_changed |= ui
             .add(egui::Slider::new(&mut self.radar_config.anchor_y, 0.0..=1.0).text("Pozycja Y"))
             .changed();
-        changed |= ui
+        position_changed |= ui
             .add(
                 egui::Slider::new(&mut self.radar_config.radius, 40.0..=300.0).text("Rozmiar (px)"),
             )
             .changed();
+        if position_changed {
+            self.overlay_reposition_pending = true;
+        }
+        changed |= position_changed;
         changed |= ui
             .add(egui::Slider::new(&mut self.radar_config.bg_alpha, 0.0..=1.0).text("Tło"))
             .changed();
@@ -426,7 +533,18 @@ impl HearRadarApp {
             )
             .changed();
 
-        ui.label("Skrót ⌥/Alt+R pokazuje/ukrywa overlay.");
+        ui.separator();
+        ui.checkbox(
+            &mut self.overlay_click_through,
+            "🖱 Przezroczysty dla kliknięć (nie blokuje gry pod spodem)",
+        );
+        if !self.overlay_click_through {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 180, 60),
+                "⚠ Wyłączone tylko do przeciągnięcia radaru — włącz z powrotem przed grą.",
+            );
+        }
+        ui.label("Skrót ⌥/Alt+R pokazuje/ukrywa overlay (działa, gdy to okno ma fokus).");
 
         if changed {
             self.write_radar_config();
@@ -451,14 +569,44 @@ impl HearRadarApp {
         );
     }
 
+    /// Oblicza pozycję lewego-górnego rogu okna overlay na ekranie z
+    /// `anchor_x`/`anchor_y` (0.0..1.0 = ułamek szerokości/wysokości ekranu)
+    /// i marginesem [`OVERLAY_SCREEN_MARGIN`], tak by suwaki pozycji w
+    /// konfiguracji faktycznie przesuwały radar po całym ekranie, a nie tylko
+    /// po obszarze samego okna. Zwraca `None`, dopóki system nie zdąży
+    /// zgłosić rozmiaru monitora (pierwsza klatka po utworzeniu viewportu).
+    fn overlay_anchored_position(&self, ctx: &egui::Context, overlay_size: f32) -> Option<egui::Pos2> {
+        let monitor_size = ctx.input(|i| i.viewport().monitor_size)?;
+        if monitor_size.x <= 1.0 || monitor_size.y <= 1.0 {
+            return None;
+        }
+        let usable_w = (monitor_size.x - overlay_size - 2.0 * OVERLAY_SCREEN_MARGIN).max(0.0);
+        let usable_h = (monitor_size.y - overlay_size - 2.0 * OVERLAY_SCREEN_MARGIN).max(0.0);
+        let x = OVERLAY_SCREEN_MARGIN + self.radar_config.anchor_x * usable_w;
+        let y = OVERLAY_SCREEN_MARGIN + self.radar_config.anchor_y * usable_h;
+        Some(egui::pos2(x, y))
+    }
+
     // ── Zawartość overlay viewportu ───────────────────────────────────────
     /// Rysuje overlay i zwraca `true`, jeśli użytkownik zażądał jego zamknięcia
-    /// (przycisk „⚙” albo systemowe zamknięcie okna).
+    /// (przycisk „⚙” albo systemowe zamknięcie okna). Overlay jest zawsze
+    /// bezramkowy, przezroczysty i na wierzchu (patrz `ViewportBuilder` w
+    /// `ui()`) — to jedyna "dodatkowa warstwa" i nie ma tam żadnego innego
+    /// okna systemowego niż ta jedna, przezroczysta powierzchnia rysunku.
     fn ui_overlay_contents(&mut self, root_ui: &mut egui::Ui) -> bool {
         let ctx = root_ui.ctx().clone();
         let mut close_requested = false;
         let now = ctx.input(|i| i.time);
         let channels = self.current_channels;
+        let overlay_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
+        let click_through = self.overlay_click_through;
+
+        if self.overlay_reposition_pending {
+            if let Some(pos) = self.overlay_anchored_position(&ctx, overlay_size) {
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+                self.overlay_reposition_pending = false;
+            }
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -475,26 +623,29 @@ impl HearRadarApp {
                     now,
                 );
 
-                // Przeciąganie okna: kliknięcie i przeciągnięcie w dowolnym
-                // miejscu przenosi overlay (zastępuje dawne `desktop.drag()`).
-                let drag_response =
-                    ui.interact(rect, ui.id().with("overlay_drag"), egui::Sense::drag());
-                if drag_response.drag_started() {
-                    ctx.send_viewport_cmd(ViewportCommand::StartDrag);
-                }
+                // W trybie przezroczystym dla kliknięć okno w ogóle nie
+                // odbiera zdarzeń myszy (system kieruje je do gry pod spodem),
+                // więc przeciąganie i przycisk zamknięcia mają sens tylko gdy
+                // click-through jest chwilowo wyłączony do repozycjonowania.
+                if !click_through {
+                    let drag_response =
+                        ui.interact(rect, ui.id().with("overlay_drag"), egui::Sense::drag());
+                    if drag_response.drag_started() {
+                        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                    }
 
-                // Mały przycisk zamknięcia w rogu (odpowiednik "⚙" z Dioxusa).
-                egui::Area::new(ui.id().with("overlay_close_area"))
-                    .fixed_pos(rect.left_top() + egui::vec2(6.0, 6.0))
-                    .show(&ctx, |ui| {
-                        if ui
-                            .small_button("⚙")
-                            .on_hover_text("Zamknij overlay")
-                            .clicked()
-                        {
-                            close_requested = true;
-                        }
-                    });
+                    egui::Area::new(ui.id().with("overlay_close_area"))
+                        .fixed_pos(rect.left_top() + egui::vec2(6.0, 6.0))
+                        .show(&ctx, |ui| {
+                            if ui
+                                .small_button("⚙")
+                                .on_hover_text("Zamknij overlay")
+                                .clicked()
+                            {
+                                close_requested = true;
+                            }
+                        });
+                }
             });
 
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -517,6 +668,9 @@ impl eframe::App for HearRadarApp {
         // odciągał uwagi, gdy nie jest potrzebny.
         if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::R)) {
             self.overlay_open = !self.overlay_open;
+            if self.overlay_open {
+                self.overlay_reposition_pending = true;
+            }
         }
 
         egui::CentralPanel::default().show(root_ui, |ui| {
@@ -544,14 +698,22 @@ impl eframe::App for HearRadarApp {
             // która uruchamiała drugi, osobny event loop w wątku pobocznym.
             // (`show_viewport_deferred` wymaga closure `Fn + Send + Sync`,
             // co uniemożliwia bezpośrednie przechwycenie `&mut self`.)
+            // Rozmiar okna śledzi bieżący promień radaru (suwak "Rozmiar"),
+            // żeby tarcza nigdy się nie ucinała ani nie zostawiała martwego
+            // marginesu. `with_always_on_top` + brak dekoracji + przezroczyste
+            // tło to CAŁA "dodatkowa warstwa" — sam rysunek radaru bezpośrednio
+            // na pulpicie, bez paska tytułu, ramki czy ikony w tle zadań.
+            let overlay_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
             let close_requested = ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("hear_radar_overlay"),
                 ViewportBuilder::default()
                     .with_title("HearRadar — Overlay")
-                    .with_inner_size([OVERLAY_SIZE, OVERLAY_SIZE])
+                    .with_inner_size([overlay_size, overlay_size])
                     .with_decorations(false)
                     .with_transparent(true)
                     .with_always_on_top()
+                    .with_taskbar(false)
+                    .with_mouse_passthrough(self.overlay_click_through)
                     .with_resizable(false),
                 |ui, _class| self.ui_overlay_contents(ui),
             );
@@ -562,6 +724,20 @@ impl eframe::App for HearRadarApp {
         }
 
         ctx.request_repaint();
+    }
+
+    /// eframe domyślnie czyści każdą klatkę na prawie-czarny, prawie-kryjący
+    /// kolor `(12, 12, 12, 180)` (patrz `epi::App::clear_color`) — to ten
+    /// kolor, a nie coś w naszym rysowaniu, sprawiał, że overlay wyglądał na
+    /// czarny mimo `with_transparent(true)`. Główne okno tego nie widać, bo
+    /// `CentralPanel` maluje na nim własne, nieprzezroczyste tło, ale overlay
+    /// korzysta z `Frame::NONE`, więc ten domyślny kolor czyszczenia był
+    /// widoczny wprost. Zwracamy w pełni przezroczysty kolor czyszczenia —
+    /// nie wpływa to na główne okno (nie ma ono flagi `with_transparent`, więc
+    /// system i tak traktuje je jako nieprzezroczyste), ale pozwala overlayowi
+    /// naprawdę prześwitywać do gry pod spodem.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
     }
 }
 

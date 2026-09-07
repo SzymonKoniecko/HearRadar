@@ -10,6 +10,7 @@ fn main() {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Hear Radar")
+            .with_transparent(true)
             .with_inner_size([860.0, 700.0]),
         ..Default::default()
     };
