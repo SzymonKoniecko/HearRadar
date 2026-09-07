@@ -1,3 +1,4 @@
+mod config_store;
 mod sound;
 mod ui;
 

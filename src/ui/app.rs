@@ -9,6 +9,8 @@
 //! głównym, a drugie okno to egui "immediate viewport" renderowany w tej
 //! samej klatce co okno główne.
 
+use crate::config_store;
+use crate::sound::color_profiles;
 use crate::sound::devices::{self, MonoEar, RadarConfig, SharedAudioAnalysis, SoundDevice};
 use crate::sound::direction;
 use crate::sound::mono_router::{self, MonoRouter};
@@ -88,6 +90,11 @@ pub struct HearRadarApp {
     /// wysyłane jako `ViewportCommand::OuterPosition` przy najbliższej okazji,
     /// żeby nie nadpisywać w kółko ręcznego przeciągania okna przez użytkownika.
     overlay_reposition_pending: bool,
+
+    /// Komunikat o wyniku ostatniego zapisu/wczytania konfiguracji z pliku,
+    /// pokazywany pod przyciskami w panelu kolorów (`Ok(..)` na zielono,
+    /// `Err(..)` na czerwono). `None` = nic jeszcze nie robiono w tej sesji.
+    config_status: Option<Result<String, String>>,
 }
 
 impl HearRadarApp {
@@ -114,6 +121,12 @@ impl HearRadarApp {
             .map(|d| d.name.clone())
             .unwrap_or_default();
 
+        // Wczytujemy poprzednio zapisaną konfigurację, jeśli istnieje —
+        // ustawienia radaru (w tym reguły kolorów) przetrwają restart
+        // aplikacji. Brak pliku albo błąd parsowania to normalny przypadek
+        // (pierwsze uruchomienie) — wtedy po prostu zostajemy przy domyślnych.
+        let radar_config = config_store::load().unwrap_or_default();
+
         Self {
             analysis,
             display_angle: 0.0,
@@ -125,7 +138,7 @@ impl HearRadarApp {
             test_freq_hz: 1000.0,
             test_tone_time: 0.0,
             test_scenario: TestScenario::Off,
-            radar_config: RadarConfig::default(),
+            radar_config,
             devices,
             selected_device,
             active_stream: None,
@@ -137,6 +150,7 @@ impl HearRadarApp {
             overlay_open: false,
             overlay_click_through: true,
             overlay_reposition_pending: false,
+            config_status: None,
         }
     }
 
@@ -602,16 +616,21 @@ impl HearRadarApp {
         });
         ui.label("Dowolna liczba reguł: zakres Hz → kolor. Kropka bierze kolor reguły z najsilniejszą energią w danej ramce.");
 
+        ui.add_space(4.0);
+        self.ui_color_profile_picker(ui);
+
+        ui.add_space(4.0);
         let mut changed = false;
         let mut remove_index: Option<usize> = None;
 
         egui::Grid::new("color_rules_grid")
-            .num_columns(4)
+            .num_columns(5)
             .striped(true)
             .show(ui, |ui| {
                 ui.label("Hz min");
                 ui.label("Hz max");
                 ui.label("Kolor");
+                ui.label("Sytuacja (opis)");
                 ui.label("");
                 ui.end_row();
 
@@ -633,6 +652,16 @@ impl HearRadarApp {
                         )
                         .changed();
                     changed |= ui.color_edit_button_srgb(&mut rule.color).changed();
+
+                    let mut label_text = rule.label.clone().unwrap_or_default();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut label_text).desired_width(120.0))
+                        .changed()
+                    {
+                        rule.label = if label_text.is_empty() { None } else { Some(label_text) };
+                        changed = true;
+                    }
+
                     if ui.small_button("🗑").clicked() {
                         remove_index = Some(i);
                     }
@@ -669,6 +698,68 @@ impl HearRadarApp {
 
         if changed {
             self.write_radar_config();
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        self.ui_config_persistence(ui);
+    }
+
+    /// Rozwijana lista gotowych profili kolorów pod konkretne style gier
+    /// competetive (patrz [`color_profiles`]) — wybór od razu nadpisuje
+    /// bieżące reguły, więc traktuj to jako szybki punkt startowy do
+    /// dalszej ręcznej edycji, nie ostateczny wybór.
+    fn ui_color_profile_picker(&mut self, ui: &mut egui::Ui) {
+        ui.label("Profil pod typ gry:");
+        egui::Grid::new("color_profile_grid").num_columns(1).show(ui, |ui| {
+            for profile in color_profiles::built_in_profiles() {
+                ui.horizontal(|ui| {
+                    if ui.button(profile.name).clicked() {
+                        self.radar_config.color_rules = (profile.build)();
+                        self.write_radar_config();
+                    }
+                    ui.weak(profile.description);
+                });
+                ui.end_row();
+            }
+        });
+    }
+
+    /// Zapis/wczytanie konfiguracji radaru (w tym reguł kolorów) do lokalnego
+    /// pliku JSON w katalogu konfiguracyjnym systemu — patrz [`config_store`].
+    fn ui_config_persistence(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("💾 Zapisz do pliku").clicked() {
+                self.config_status = Some(
+                    config_store::save(&self.radar_config)
+                        .map(|path| format!("Zapisano: {}", path.display()))
+                        .map_err(|e| format!("Błąd zapisu: {e}")),
+                );
+            }
+            if ui.button("📂 Wczytaj z pliku").clicked() {
+                match config_store::load() {
+                    Ok(cfg) => {
+                        self.radar_config = cfg;
+                        self.write_radar_config();
+                        self.config_status = Some(Ok("Wczytano konfigurację z pliku.".to_string()));
+                    }
+                    Err(e) => {
+                        self.config_status = Some(Err(format!("Błąd wczytywania: {e}")));
+                    }
+                }
+            }
+        });
+        ui.weak(format!("Plik: {}", config_store::config_file_path().display()));
+
+        if let Some(status) = &self.config_status {
+            match status {
+                Ok(msg) => {
+                    ui.colored_label(egui::Color32::from_rgb(90, 200, 120), msg);
+                }
+                Err(msg) => {
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg);
+                }
+            }
         }
     }
 

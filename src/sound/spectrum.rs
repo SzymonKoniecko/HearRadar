@@ -67,17 +67,26 @@ fn band_energy(channel_samples: &[f32], sample_rate: f32, freq_min: f32, freq_ma
 /// Jedna reguła kolorowania kropki: zakres częstotliwości `[freq_min, freq_max)`
 /// Hz i przypisany jej kolor RGB. Użytkownik może mieć ich dowolnie wiele —
 /// pierwsza dopasowana (a właściwie: energetycznie dominująca) reguła
-/// decyduje o kolorze danej ramki analizy.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// decyduje o kolorze danej ramki analizy. `label` to opcjonalny opis "sytuacji"
+/// (np. "Kroki", "Strzały") pokazywany w UI — czysto informacyjny, nie
+/// wpływa na analizę.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ColorRule {
     pub freq_min: f32,
     pub freq_max: f32,
     pub color: [u8; 3],
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 impl ColorRule {
     pub fn new(freq_min: f32, freq_max: f32, color: [u8; 3]) -> Self {
-        Self { freq_min, freq_max, color }
+        Self { freq_min, freq_max, color, label: None }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
     }
 }
 
@@ -86,9 +95,9 @@ impl ColorRule {
 /// nie zacznie edytować listy w ustawieniach.
 pub fn default_color_rules() -> Vec<ColorRule> {
     vec![
-        ColorRule::new(0.0, LOW_CUTOFF_HZ, [255, 90, 90]),
-        ColorRule::new(LOW_CUTOFF_HZ, HIGH_CUTOFF_HZ, [0, 220, 220]),
-        ColorRule::new(HIGH_CUTOFF_HZ, 20_000.0, [255, 220, 90]),
+        ColorRule::new(0.0, LOW_CUTOFF_HZ, [255, 90, 90]).with_label("Niskie (bas)"),
+        ColorRule::new(LOW_CUTOFF_HZ, HIGH_CUTOFF_HZ, [0, 220, 220]).with_label("Średnie"),
+        ColorRule::new(HIGH_CUTOFF_HZ, 20_000.0, [255, 220, 90]).with_label("Wysokie"),
     ]
 }
 
