@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::sound::direction::{self, analyze_channels};
 use crate::sound::spectrum::{self, ColorRule};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RadarConfig {
     /// Pozycja X środka radaru jako ułamek szerokości okna (0.0 = lewo, 1.0 = prawo).
     pub anchor_x: f32,
