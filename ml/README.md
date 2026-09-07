@@ -41,6 +41,40 @@ mapowanie 521 klas AudioSet na kategorie i kopiują gotowe pliki do
 Po zakończeniu włącz w aplikacji: **Ustawienia radaru → 🧪 Klasyfikacja
 dźwięku (ML, eksperymentalne)**.
 
+### Windows: błąd `ensurepip`/`venv` przy tworzeniu `.venv`
+
+Jeśli `bootstrap.ps1` wywali się na etapie tworzenia `.venv` z długim
+tracebackiem kończącym się gdzieś w `ensurepip`/`subprocess.communicate` —
+to znany problem `python -m venv` na Windows, nie błąd w tym repo. `venv`
+wewnętrznie odpala nowy proces Pythona, żeby zainstalować pip, i ten
+podproces czasem pada w trakcie czytania jego wyjścia — najczęściej przez
+konsolę/locale inne niż UTF-8, rzadziej przez antywirusa blokującego świeżo
+odpalony `python.exe`.
+
+`bootstrap.ps1` **próbuje to obejść automatycznie**: ustawia
+`PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8` (usuwa przyczynę w większości
+przypadków) i — jeśli mimo to `venv` się wywali — tworzy środowisko bez pip
+(`--without-pip`) i doinstalowuje pip osobno (`ensurepip`, a jak i to
+zawiedzie, `get-pip.py` pobrane bezpośrednio z pypa.io).
+
+Jeśli to WCIĄŻ nie pomoże, zrób to ręcznie:
+
+```powershell
+cd ml
+Remove-Item -Recurse -Force .venv  # jeśli częściowo się utworzył
+python -m venv .venv --without-pip
+.\.venv\Scripts\python.exe -m ensurepip --upgrade
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe export_yamnet_onnx.py
+.\.venv\Scripts\python.exe export_mapping.py
+```
+
+...i skopiuj `out\yamnet.onnx` oraz `out\category_mapping.json` do
+`..\assets\ml\`. Jeśli nawet `ensurepip --upgrade` się wywala, sprawdź, czy
+antywirus/Windows Defender nie blokuje uruchamiania `python.exe` z katalogu
+`.venv` (dodaj wyjątek albo tymczasowo wyłącz ochronę w czasie rzeczywistym
+na czas tego jednego polecenia).
+
 ## Co robią poszczególne skrypty
 
 | Plik | Co robi |
