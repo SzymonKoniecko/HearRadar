@@ -1,8 +1,9 @@
 use crate::sound::devices::RadarConfig;
 use crate::sound::direction::{channel_layout, ChannelRole};
+use crate::sound::ml_classifier::ClassificationEvent;
 use crate::sound::spectrum::{self, ColorRule};
 use egui::{Color32, FontId, Painter, Pos2, Stroke, Vec2};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// Kolor używany, gdy nie da się ustalić dominującej reguły (np. lista reguł
 /// jest pusta) — neutralny cyjan, taki sam jak dawny "domyślny" kolor kropek.
@@ -292,7 +293,19 @@ const LABELS: [&str; 4] = ["PRZÓD", "PRAWO", "TYŁ", "LEWO"];
 /// Rysuje minimalistyczny radar audio: tło, okręgi skali, krzyż kierunków,
 /// opcjonalne sektory 7.1, kropki kanałów (z zanikiem w czasie) i osobny
 /// wskaźnik LFE. `now` to bieżący czas w sekundach (do liczenia zaniku).
-pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mut RadarState, channels: usize, now: f64) {
+/// `classification` to opcjonalny wynik klasyfikacji ML (eksperymentalne,
+/// patrz [`crate::sound::ml_classifier`]) — rysowany tylko gdy
+/// `cfg.ml_enabled`, jako osobna, stylistycznie odróżniona "odznaka".
+#[allow(clippy::too_many_arguments)]
+pub fn draw_radar(
+    painter: &Painter,
+    center: Pos2,
+    cfg: &RadarConfig,
+    state: &mut RadarState,
+    channels: usize,
+    now: f64,
+    classification: Option<&ClassificationEvent>,
+) {
     state.prune(now, cfg.decay_secs);
 
     let r = cfg.radius;
@@ -428,6 +441,53 @@ pub fn draw_radar(painter: &Painter, center: Pos2, cfg: &RadarConfig, state: &mu
         let lfe_rgb = if hc { dot_rgb } else { state.lfe_color_rgb };
         draw_lfe_indicator(painter, center, r, state.lfe_display, fg, lfe_rgb);
     }
+
+    if cfg.ml_enabled {
+        if let Some(event) = classification {
+            draw_classification_badge(painter, center, r, event, &cfg.category_colors, fg);
+        }
+    }
+}
+
+/// Ile sekund "odznaka" klasyfikacji zostaje widoczna, gasnąc — krócej niż
+/// zwykłe kropki (patrz `cfg.decay_secs`), bo to zdarzeniowa, rzadsza
+/// informacja (jeden wynik na ~0.5 s), nie ciągły strumień.
+const CLASSIFICATION_BADGE_DECAY_SECS: f32 = 1.8;
+
+/// Rysuje "odznakę" ostatniej klasyfikacji ML: nazwę kategorii + pewność
+/// (%) nad tarczą, i — jeśli znany jest kierunek — gasnący pierścień w tamtą
+/// stronę. Celowo stylistycznie inne niż zwykłe kropki (tekst, rzadszy rytm),
+/// żeby nie sugerować tej samej pewności co ciągła analiza
+/// pasmowa: to osobna, eksperymentalna warstwa, która może się mylić.
+fn draw_classification_badge(
+    painter: &Painter,
+    center: Pos2,
+    r: f32,
+    event: &ClassificationEvent,
+    category_colors: &HashMap<String, [u8; 3]>,
+    fg: f32,
+) {
+    let age = event.spawned_at.elapsed().as_secs_f32();
+    if age > CLASSIFICATION_BADGE_DECAY_SECS {
+        return;
+    }
+    let life = (1.0 - age / CLASSIFICATION_BADGE_DECAY_SECS).clamp(0.0, 1.0);
+    let alpha = (life.powf(1.5) * 255.0 * fg) as u8;
+
+    let rgb = category_colors.get(&event.category).copied().unwrap_or([255, 255, 255]);
+    let color = Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], alpha);
+
+    if let Some(angle_deg) = event.angle {
+        let angle = angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
+        let pos = center + Vec2::new(angle.cos(), angle.sin()) * r * 0.85;
+        let ring_r = 10.0 + (1.0 - life) * 20.0;
+        painter.circle_stroke(pos, ring_r, Stroke::new(2.0, color));
+    }
+
+    let font = FontId::proportional(13.0);
+    let text_pos = center - Vec2::new(0.0, r + 26.0);
+    let label = format!("🧪 {} ({:.0}%)", event.category, event.confidence * 100.0);
+    painter.text(text_pos, egui::Align2::CENTER_CENTER, label, font, color);
 }
 
 fn draw_lfe_indicator(painter: &Painter, center: Pos2, r: f32, level: f32, fg: f32, rgb: (u8, u8, u8)) {

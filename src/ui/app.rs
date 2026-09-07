@@ -10,9 +10,11 @@
 //! samej klatce co okno główne.
 
 use crate::config_store;
+use crate::python_bridge::{self, PythonEnvInfo};
 use crate::sound::color_profiles;
 use crate::sound::devices::{self, MonoEar, RadarConfig, SharedAudioAnalysis, SoundDevice};
 use crate::sound::direction;
+use crate::sound::ml_classifier::{self, ClassificationEvent, MlClassifierHandle, SoundClassifier};
 use crate::sound::mono_router::{self, MonoRouter};
 use crate::sound::spectrum;
 use crate::ui::radar_egui::{RadarState, TestScenario, draw_radar};
@@ -95,6 +97,26 @@ pub struct HearRadarApp {
     /// pokazywany pod przyciskami w panelu kolorów (`Ok(..)` na zielono,
     /// `Err(..)` na czerwono). `None` = nic jeszcze nie robiono w tej sesji.
     config_status: Option<Result<String, String>>,
+
+    // Klasyfikacja dźwięku (ML, eksperymentalne) — patrz `sound::ml_classifier`.
+    /// `Some`, gdy wątek klasyfikatora działa. Trzymany tylko po to, żeby go
+    /// zatrzymać przy `Drop` — samego uchwytu poza tym nie odpytujemy.
+    ml_classifier: Option<MlClassifierHandle>,
+    /// Wynik próby uruchomienia/zatrzymania klasyfikatora, pokazywany w UI
+    /// obok checkboxa (np. "Brak plików modelu — uruchom ./ml/bootstrap.sh").
+    ml_status: Option<Result<(), String>>,
+    /// Ostatni wynik klasyfikacji odczytany ze współdzielonej analizy —
+    /// odświeżany raz na klatkę w `tick_radar_state`, żeby podgląd i overlay
+    /// rysowały ten sam, spójny stan bez dwóch osobnych blokad muteksa.
+    latest_classification: Option<ClassificationEvent>,
+
+    /// Wynik ostatniego testu "środowisko Pythona" (patrz `ui_python_info_test`)
+    /// — `None`, dopóki użytkownik nie kliknie przycisku sprawdzenia.
+    python_info: Option<Result<PythonEnvInfo, String>>,
+    /// Wynik klasyfikacji TEGO SAMEGO testowego tonu (patrz
+    /// `python_bridge::generate_test_waveform`), ale policzony przez Rust
+    /// (`ort`), nie Python — do porównania obu implementacji w UI.
+    rust_test_result: Option<Result<(String, f32), String>>,
 }
 
 impl HearRadarApp {
@@ -127,7 +149,9 @@ impl HearRadarApp {
         // (pierwsze uruchomienie) — wtedy po prostu zostajemy przy domyślnych.
         let radar_config = config_store::load().unwrap_or_default();
 
-        Self {
+        let ml_enabled = radar_config.ml_enabled;
+
+        let mut app = Self {
             analysis,
             display_angle: 0.0,
             display_intensity: 0.0,
@@ -151,7 +175,21 @@ impl HearRadarApp {
             overlay_click_through: true,
             overlay_reposition_pending: false,
             config_status: None,
+            ml_classifier: None,
+            ml_status: None,
+            latest_classification: None,
+            python_info: None,
+            rust_test_result: None,
+        };
+
+        // Jeśli wczytana konfiguracja miała już włączoną klasyfikację ML,
+        // spróbuj ją uruchomić od razu — błąd (np. brak wyeksportowanego
+        // modelu) tylko ląduje w `ml_status`, nie blokuje reszty aplikacji.
+        if ml_enabled {
+            app.sync_ml_classifier();
         }
+
+        app
     }
 
     /// Odczytuje `angle`/`intensity` ze współdzielonej analizy i wygładza je
@@ -175,6 +213,15 @@ impl HearRadarApp {
     /// wybranego scenariusza testowego, albo z żywego strumienia audio —
     /// i pozwala mu narysować/wygasić kropki niezależnie od tempa audio.
     fn tick_radar_state(&mut self, now: f64) {
+        // Niezależne od scenariusza testowego — klasyfikator ML (jeśli
+        // działa) analizuje prawdziwe audio niezależnie od tego, co radar
+        // pasmowy akurat pokazuje w podglądzie/overlay.
+        self.latest_classification = self
+            .analysis
+            .lock()
+            .ok()
+            .and_then(|g| g.latest_classification.clone());
+
         if self.test_scenario == TestScenario::Tone {
             self.current_channels = DEFAULT_TEST_CHANNELS;
             self.tick_test_tone(now);
@@ -268,6 +315,34 @@ impl HearRadarApp {
     fn write_radar_config(&self) {
         if let Ok(mut lock) = self.analysis.lock() {
             lock.radar_config = self.radar_config.clone();
+        }
+    }
+
+    /// Uruchamia albo zatrzymuje wątek klasyfikatora ML, żeby jego stan
+    /// odpowiadał `self.radar_config.ml_enabled`. Wywołaj po każdej zmianie
+    /// tego pola (checkbox w UI) i raz przy starcie, jeśli wczytana z pliku
+    /// konfiguracja miała je już ustawione na `true`.
+    fn sync_ml_classifier(&mut self) {
+        if self.radar_config.ml_enabled {
+            if self.ml_classifier.is_none() {
+                match ml_classifier::start_ml_classifier_thread(self.analysis.clone()) {
+                    Ok(handle) => {
+                        self.ml_classifier = Some(handle);
+                        self.ml_status = Some(Ok(()));
+                    }
+                    Err(e) => {
+                        self.ml_status = Some(Err(e.to_string()));
+                        // Nie ma sensu trzymać włączonego przełącznika, skoro
+                        // wątek się nie uruchomił — użytkownik widziałby
+                        // checkbox "włączony", ale bez żadnego efektu.
+                        self.radar_config.ml_enabled = false;
+                        self.write_radar_config();
+                    }
+                }
+            }
+        } else if self.ml_classifier.take().is_some() {
+            // `Drop` na `MlClassifierHandle` sygnalizuje wątkowi zatrzymanie.
+            self.latest_classification = None;
         }
     }
 
@@ -529,6 +604,133 @@ impl HearRadarApp {
                 }
             });
         }
+
+        ui.separator();
+        self.ui_python_info_test(ui);
+    }
+
+    /// Test radaru, który — zamiast generować próbki wewnątrz Rusta jak
+    /// pozostałe scenariusze — odpytuje `ml/info.py` (osobny proces Pythona,
+    /// patrz [`python_bridge`]) o stan środowiska ML: czy TensorFlow/
+    /// onnxruntime są zainstalowane i czy model jest wyeksportowany.
+    /// Przydatne do zdiagnozowania, dlaczego klasyfikacja ML (wyżej) nie
+    /// startuje, bez wychodzenia do terminala.
+    fn ui_python_info_test(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Test: środowisko Pythona (ML)");
+        ui.label(format!(
+            "Uruchamia ml/info.py (sprawdza instalację i pliki modelu) ORAZ faktycznie klasyfikuje \
+             ten sam testowy ton ({:.0} Hz) po stronie Pythona (onnxruntime) i po stronie Rusta (ort) \
+             — jeśli obie strony dają tę samą kategorię, cały łańcuch modelu/mapowania działa spójnie.",
+            python_bridge::TEST_FREQ_HZ
+        ));
+
+        if ui.button("🐍 Sprawdź środowisko Pythona i porównaj klasyfikację").clicked() {
+            self.python_info = Some(python_bridge::fetch_python_env_info().map_err(|e| e.to_string()));
+            self.rust_test_result = Some(self.run_rust_test_classification());
+        }
+
+        match &self.python_info {
+            None => {}
+            Some(Err(msg)) => {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg);
+            }
+            Some(Ok(info)) => {
+                egui::Grid::new("python_info_grid").num_columns(2).show(ui, |ui| {
+                    ui.label("Python:");
+                    ui.label(&info.python_version);
+                    ui.end_row();
+
+                    ui.label("TensorFlow:");
+                    ui.label(match (&info.tensorflow_installed, &info.tensorflow_version) {
+                        (true, Some(v)) => format!("✅ {v}"),
+                        _ => "❌ brak (potrzebny tylko do eksportu modelu)".to_string(),
+                    });
+                    ui.end_row();
+
+                    ui.label("onnxruntime:");
+                    ui.label(match (&info.onnxruntime_installed, &info.onnxruntime_version) {
+                        (true, Some(v)) => format!("✅ {v}"),
+                        _ => "❌ brak".to_string(),
+                    });
+                    ui.end_row();
+
+                    ui.label("Model (yamnet.onnx):");
+                    ui.label(match (&info.model_exists, &info.model_size_mb) {
+                        (true, Some(mb)) => format!("✅ {mb:.1} MB"),
+                        _ => "❌ brak — uruchom ./ml/bootstrap.sh".to_string(),
+                    });
+                    ui.end_row();
+
+                    ui.label("Mapowanie kategorii:");
+                    ui.label(match (&info.mapping_exists, &info.category_count) {
+                        (true, Some(n)) => format!("✅ {n} kategorii"),
+                        _ => "❌ brak".to_string(),
+                    });
+                    ui.end_row();
+                });
+
+                ui.add_space(6.0);
+                ui.strong(format!("Wynik klasyfikacji testowego tonu ({:.0} Hz):", python_bridge::TEST_FREQ_HZ));
+                egui::Grid::new("python_vs_rust_grid").num_columns(2).show(ui, |ui| {
+                    ui.label("Python (onnxruntime):");
+                    match (&info.test_category, &info.test_confidence, &info.test_error) {
+                        (Some(cat), Some(conf), _) => {
+                            ui.label(format!("{cat} ({:.1}%)", conf * 100.0));
+                        }
+                        (_, _, Some(err)) => {
+                            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                        }
+                        _ => {
+                            ui.weak("— (onnxruntime/model niedostępne)");
+                        }
+                    }
+                    ui.end_row();
+
+                    ui.label("Rust (ort):");
+                    match &self.rust_test_result {
+                        Some(Ok((cat, conf))) => {
+                            ui.label(format!("{cat} ({:.1}%)", conf * 100.0));
+                        }
+                        Some(Err(err)) => {
+                            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                        }
+                        None => {
+                            ui.weak("—");
+                        }
+                    }
+                    ui.end_row();
+                });
+
+                if let (Some(py_cat), Some(Ok((rust_cat, _)))) = (&info.test_category, &self.rust_test_result) {
+                    if py_cat == rust_cat {
+                        ui.colored_label(egui::Color32::from_rgb(90, 200, 120), "✅ Python i Rust zgadzają się co do kategorii.");
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 180, 60),
+                            format!("⚠ Rozbieżność: Python = \"{py_cat}\", Rust = \"{rust_cat}\"."),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ładuje świeży `SoundClassifier` i klasyfikuje ten sam testowy ton, co
+    /// `ml/info.py` (patrz `python_bridge::generate_test_waveform`) — do
+    /// porównania z wynikiem Pythona w `ui_python_info_test`. Ładowanie
+    /// modelu tylko na potrzeby tego testu jest celowe: to niezależna od
+    /// `self.ml_classifier`/wątku w tle ścieżka, więc test faktycznie
+    /// sprawdza, że `ort` w Rust poprawnie wczytuje i uruchamia PLIK modelu,
+    /// a nie tylko że działający już wątek klasyfikatora coś zwraca.
+    fn run_rust_test_classification(&self) -> Result<(String, f32), String> {
+        let mut classifier = SoundClassifier::load(&SoundClassifier::default_model_dir()).map_err(|e| e.to_string())?;
+        let waveform = python_bridge::generate_test_waveform();
+        let results = classifier.classify(&waveform).map_err(|e| e.to_string())?;
+        results
+            .into_iter()
+            .next()
+            .map(|r| (r.category, r.confidence))
+            .ok_or_else(|| "model nie zwrócił żadnego wyniku".to_string())
     }
 
     // ── Panel: konfiguracja wyglądu radaru ───────────────────────────────
@@ -763,6 +965,58 @@ impl HearRadarApp {
         }
     }
 
+    // ── Panel: klasyfikacja dźwięku (ML, eksperymentalne) ─────────────────
+    /// Włącznik i konfiguracja kolorów kategorii dla klasyfikatora ML z
+    /// `sound::ml_classifier`. Wyraźnie oznaczone jako eksperymentalne i
+    /// domyślnie wyłączone — błędna klasyfikacja w narzędziu dostępności
+    /// szkodzi bardziej niż jej brak (patrz `ml/README.md`).
+    fn ui_ml_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🧪 Klasyfikacja dźwięku (ML, eksperymentalne)");
+        ui.label(
+            "Rozpoznaje ogólny \"typ\" dźwięku (kroki, strzały, mowa...) modelem YAMNet, \
+             niezależnie od kolorowania wg częstotliwości powyżej. To dodatkowa, wolniejsza \
+             (ok. 2x/s) i orientacyjna wskazówka — może się mylić, nie zastępuje słuchu.",
+        );
+
+        if ui
+            .checkbox(&mut self.radar_config.ml_enabled, "Włącz klasyfikację ML")
+            .changed()
+        {
+            self.write_radar_config();
+            self.sync_ml_classifier();
+        }
+
+        match &self.ml_status {
+            Some(Ok(())) => {
+                ui.colored_label(egui::Color32::from_rgb(90, 200, 120), "● Klasyfikator działa.");
+            }
+            Some(Err(msg)) => {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg);
+            }
+            None => {}
+        }
+
+        if !self.radar_config.ml_enabled {
+            return;
+        }
+
+        ui.add_space(4.0);
+        ui.label("Kolor odznaki per kategoria:");
+        let mut keys: Vec<String> = self.radar_config.category_colors.keys().cloned().collect();
+        keys.sort();
+        egui::Grid::new("ml_category_colors_grid").num_columns(2).show(ui, |ui| {
+            for key in keys {
+                ui.label(&key);
+                if let Some(color) = self.radar_config.category_colors.get_mut(&key) {
+                    if ui.color_edit_button_srgb(color).changed() {
+                        self.write_radar_config();
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    }
+
     // ── Panel: podgląd radaru (mały obszar rysowania w głównym oknie) ────
     fn ui_radar_preview(&mut self, ui: &mut egui::Ui) {
         ui.heading("Podgląd radaru");
@@ -778,6 +1032,7 @@ impl HearRadarApp {
             &mut self.radar_state,
             self.current_channels,
             now,
+            self.latest_classification.as_ref(),
         );
     }
 
@@ -833,6 +1088,7 @@ impl HearRadarApp {
                     &mut self.radar_state,
                     channels,
                     now,
+                    self.latest_classification.as_ref(),
                 );
 
                 // W trybie przezroczystym dla kliknięć okno w ogóle nie
@@ -898,6 +1154,8 @@ impl eframe::App for HearRadarApp {
                     self.ui_config_panel(&mut cols[0]);
                     cols[0].separator();
                     self.ui_color_rules_panel(&mut cols[0]);
+                    cols[0].separator();
+                    self.ui_ml_panel(&mut cols[0]);
 
                     self.ui_radar_preview(&mut cols[1]);
                 });

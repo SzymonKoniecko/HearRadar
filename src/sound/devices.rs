@@ -3,11 +3,18 @@ use cpal::{
     SampleFormat, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sound::direction::{self, analyze_channels};
+use crate::sound::ml_classifier::{self, ClassificationEvent};
 use crate::sound::spectrum::{self, ColorRule};
+
+/// Ile sekund surowego, multi-channel audio trzymamy w
+/// `AudioAnalysis::raw_audio_buffer` dla klasyfikatora ML — wystarczy trochę
+/// więcej niż jego okno analizy (`ml_classifier::WINDOW_SECS`).
+const RAW_AUDIO_BUFFER_SECS: f32 = 1.5;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RadarConfig {
@@ -32,6 +39,18 @@ pub struct RadarConfig {
     /// może mieć ich dowolnie wiele (dodawać/usuwać/edytować w ustawieniach),
     /// zamiast sztywnych 3 pasm. Patrz [`crate::sound::spectrum::ColorRule`].
     pub color_rules: Vec<ColorRule>,
+    /// Włącza EKSPERYMENTALNĄ klasyfikację dźwięku (ML, patrz
+    /// [`crate::sound::ml_classifier`]) — domyślnie wyłączona: błędna
+    /// klasyfikacja w narzędziu dostępności szkodzi bardziej niż jej brak,
+    /// a dodatkowo kosztuje CPU (osobny wątek + inferencja ONNX ~2x/s).
+    #[serde(default)]
+    pub ml_enabled: bool,
+    /// Kolor przypisany każdej kategorii z `category_mapping.json`
+    /// (patrz `ml/class_mapping.py`) — używany do rysowania "odznaki"
+    /// klasyfikacji na radarze. `#[serde(default)]`, żeby stare pliki
+    /// `config/radar_config.json` (sprzed tej funkcji) nadal się wczytywały.
+    #[serde(default = "ml_classifier::default_category_colors")]
+    pub category_colors: std::collections::HashMap<String, [u8; 3]>,
 }
 
 impl Default for RadarConfig {
@@ -46,6 +65,8 @@ impl Default for RadarConfig {
             high_contrast: false,
             decay_secs: 2.5,
             color_rules: spectrum::default_color_rules(),
+            ml_enabled: false,
+            category_colors: ml_classifier::default_category_colors(),
         }
     }
 }
@@ -102,6 +123,22 @@ pub struct AudioAnalysis {
     pub radar_config: RadarConfig,
     /// Wybór ucha do mono routingu. Ustawiany przez UI, czytany przez mono_router.
     pub mono_ear: MonoEar,
+
+    /// Surowe, przeplecione próbki multi-channel przy natywnej częstotliwości
+    /// próbkowania urządzenia — ostatnie [`RAW_AUDIO_BUFFER_SECS`] sekund.
+    /// Zasilane przez `update_analysis` TYLKO gdy `radar_config.ml_enabled`
+    /// (zero kosztu, gdy funkcja wyłączona), czytane przez wątek klasyfikatora
+    /// ML (patrz [`crate::sound::ml_classifier::start_ml_classifier_thread`]).
+    pub raw_audio_buffer: VecDeque<f32>,
+    /// Liczba kanałów odpowiadająca `raw_audio_buffer` (do jego prawidłowego
+    /// zdemultipleksowania) — bufor jest czyszczony, gdy się zmieni.
+    pub raw_audio_channels: usize,
+    /// Częstotliwość próbkowania odpowiadająca `raw_audio_buffer`.
+    pub raw_audio_sample_rate: u32,
+    /// Wynik ostatniej klasyfikacji ML (eksperymentalne) — `None`, dopóki
+    /// klasyfikator nie jest włączony/uruchomiony albo nie zdążył jeszcze
+    /// nic wykryć.
+    pub latest_classification: Option<ClassificationEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -421,6 +458,22 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         lock.channel_rms = stats.rms;
         lock.channel_count = channels;
         lock.channel_rule_energies = rule_energies;
+
+        // Bufor surowego audio dla klasyfikatora ML — tylko gdy funkcja jest
+        // włączona (zero kosztu, gdy wyłączona, zgodnie z założeniem, że to
+        // eksperymentalna, opcjonalna warstwa).
+        if lock.radar_config.ml_enabled {
+            if lock.raw_audio_channels != channels || lock.raw_audio_sample_rate != sample_rate as u32 {
+                lock.raw_audio_buffer.clear();
+                lock.raw_audio_channels = channels;
+                lock.raw_audio_sample_rate = sample_rate as u32;
+            }
+            let max_len = ((sample_rate * RAW_AUDIO_BUFFER_SECS) as usize) * channels.max(1);
+            lock.raw_audio_buffer.extend(samples.iter().copied());
+            while lock.raw_audio_buffer.len() > max_len {
+                lock.raw_audio_buffer.pop_front();
+            }
+        }
     }
 }
 

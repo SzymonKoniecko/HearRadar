@@ -1,4 +1,5 @@
 mod config_store;
+mod python_bridge;
 mod sound;
 mod ui;
 

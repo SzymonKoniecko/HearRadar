@@ -1,0 +1,9 @@
+# Zależności do JEDNORAZOWEGO eksportu modelu (offline) — nie są potrzebne
+# do uruchomienia samej aplikacji Rust, tylko do wygenerowania plików
+# w assets/ml/ (patrz ml/bootstrap.sh i ml/README.md).
+tensorflow>=2.13,<2.17
+tensorflow-hub>=0.14
+tf2onnx>=1.16
+onnx>=1.15
+onnxruntime>=1.17
+numpy<2
