@@ -19,112 +19,118 @@
     --color-shadow-app: rgba(0, 0, 0, 0.6);
     --color-shadow-button: rgba(236, 72, 153, 0.3);
     --color-shadow-button-second: rgba(236, 72, 153, 0.5);
-    --color-shadow-button-third: rgba(0, 0, 0, 0.4);
     --color-error-bg: #450a0a;
     --color-error-border: #991b1b;
     --color-error-text: #fca5a5;
     --color-button-primary: var(--color-button);
     --color-button-primary-hover: var(--color-hover);
-    --color-button-secondary-bg: var(--color-surface-sections);
-    --color-button-secondary-border: var(--color-grid);
-    --color-button-secondary-hover-bg: var(--color-surface-contrast);
-    --color-button-third-bg: var(--color-accent-orange);
-    --color-button-third-hover-bg: #d97706;
     --color-button-fourth-bg: var(--color-accent-blue);
     --color-button-fourth-hover-bg: #2563eb;
     --color-button-text: #ffffff;
-    --color-button-disabled: rgba(255, 255, 255, 0.2);
-    --default-border: #2d3446;
-    --default-hover: rgba(255, 255, 255, 0.03);
 }
 
-/* Base reset & layout */
-* {
+/* Base reset */
+*, *::before, *::after {
     box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html, body {
+    width: 100%;
+    height: 100%;
 }
 
 body {
-    margin: 0;
-    padding: 2rem 1.5rem;
-    min-height: 100vh;
     display: flex;
-    justify-content: center;
-    align-items: flex-start;
     background-color: var(--color-bg);
     color: var(--color-text-main);
     font-family: "Inter", "Segoe UI", Helvetica, Arial, sans-serif;
-    font-size: 14px;
+    font-size: clamp(12px, 1.2vw, 15px);
     line-height: 1.5;
+    overflow: hidden;
 }
 
-/* App container */
+/* App container — fills the entire window */
 #app {
     display: flex;
     flex-direction: column;
     width: 100%;
-    max-width: 860px;
+    height: 100%;
     background-color: var(--color-surface);
-    border: 1px solid var(--color-border);
-    border-radius: 16px;
-    box-shadow: 0 12px 40px var(--color-shadow-app);
-    padding: 2rem 2.5rem;
-    transition: background-color 0.3s ease;
+    padding: 2vh 2.5vw;
+    overflow: hidden;
 }
 
-/* Header layout */
+/* Header */
 #header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding-bottom: 1.25rem;
-    margin-bottom: 1.75rem;
+    padding-bottom: 1.5vh;
+    margin-bottom: 1.5vh;
     border-bottom: 1px solid var(--color-border);
+    flex-shrink: 0;
 }
 
 #header h1 {
-    margin: 0;
-    font-size: 1.75rem;
+    font-size: clamp(1rem, 2vw, 1.75rem);
     font-weight: 700;
     letter-spacing: -0.02em;
     color: var(--color-text-main);
 }
 
-/* Main body */
-.body {
-    display: flex;
-    flex-direction: column;
-    gap: 1.5rem;
-    width: 100%;
-}
-
 /* Typography */
 h1, h2, h3, h4, h5 {
     color: var(--color-text-main);
-    margin: 0 0 0.5rem 0;
+    margin: 0 0 0.4em 0;
 }
 
 p {
-    margin: 0.5rem 0;
     line-height: 1.6;
     color: var(--color-text-secondary);
+}
+
+/* Two-column body grid — left takes remaining space, right is 28% */
+.body-grid {
+    display: grid;
+    grid-template-columns: 1fr 28%;
+    gap: 2vw;
+    align-items: start;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.body-left {
+    overflow-y: auto;
+    height: 100%;
+}
+
+.body-right {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    height: 100%;
 }
 
 /* Device selector container */
 .device-container {
     display: flex;
     flex-direction: column;
-    gap: 1.25rem;
+    gap: 1.25vh;
     width: 100%;
 }
 
 .device-selector {
     display: flex;
     align-items: center;
-    gap: 1rem;
+    flex-wrap: wrap;
+    gap: 0.75vw;
     background-color: var(--color-surface-sections);
     border: 1px solid var(--color-border);
     border-radius: 10px;
-    padding: 0.85rem 1.25rem;
+    padding: 1vh 1.25vw;
 }
 
 .device-selector label {
@@ -136,12 +142,12 @@ p {
 #device-select {
     flex: 1;
     min-width: 0;
-    padding: 0.6rem 1rem;
+    padding: 0.5vh 0.75vw;
     background-color: var(--color-surface-contrast);
     border: 1px solid var(--color-border);
     color: var(--color-text-main);
     border-radius: 6px;
-    font-size: 0.95rem;
+    font-size: inherit;
     outline: none;
     cursor: pointer;
     transition: border-color 0.2s ease;
@@ -151,18 +157,18 @@ p {
     border-color: var(--color-pastel-green);
 }
 
-/* Button styles */
+/* Buttons */
 button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 0.5rem;
+    gap: 0.4em;
     background-color: var(--color-button-primary);
     color: var(--color-button-text);
     border: none;
     border-radius: 6px;
-    padding: 0.6rem 1.1rem;
-    font-size: 0.9rem;
+    padding: 0.5vh 1vw;
+    font-size: inherit;
     font-weight: 600;
     cursor: pointer;
     white-space: nowrap;
@@ -213,6 +219,19 @@ button:active {
     box-shadow: 0 4px 12px rgba(229, 115, 115, 0.35);
 }
 
+.launch-overlay-button {
+    background: linear-gradient(135deg, #00ff9d, #00b36b);
+    color: #050a08;
+    font-weight: 700;
+    border: none;
+    box-shadow: 0 4px 14px rgba(0, 255, 157, 0.35);
+}
+
+.launch-overlay-button:hover {
+    background: linear-gradient(135deg, #33ffb0, #00cc7a);
+    box-shadow: 0 6px 18px rgba(0, 255, 157, 0.5);
+    transform: translateY(-1px);
+}
 
 /* Device details card */
 .device-full {
@@ -221,36 +240,31 @@ button:active {
     background-color: var(--color-surface-sections);
     border: 1px solid var(--color-border);
     border-radius: 12px;
-    padding: 1.5rem;
+    padding: 1.5vh 1.25vw;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+    gap: 0.4vh;
 }
 
 .device-full h4 {
-    margin-top: 1.25rem;
-    margin-bottom: 0.75rem;
+    margin-top: 1vh;
     color: var(--color-pastel-green);
-    font-size: 1rem;
     font-weight: 600;
 }
 
-/* Supported configurations list */
 article {
     margin: 0;
     padding: 0;
 }
 
 ul {
-    margin: 0;
-    padding: 0;
     list-style: none;
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: 0.4vh;
 }
 
 ul li {
-    margin: 0;
-    padding: 0.65rem 1rem 0.65rem 2rem;
+    padding: 0.5vh 1vw 0.5vh 1.75vw;
     color: var(--color-text-third);
     position: relative;
     background-color: var(--color-surface-contrast);
@@ -259,13 +273,13 @@ ul li {
     border-left: 3px solid var(--color-accent-green);
     transition: all 0.2s ease;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 0.85rem;
+    font-size: 0.85em;
 }
 
 ul li:before {
     content: "▸";
     position: absolute;
-    left: 0.85rem;
+    left: 0.6vw;
     color: var(--color-accent-green);
     font-weight: bold;
 }
@@ -281,19 +295,425 @@ ul li:hover {
 .error-container,
 .validation-error-container {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
-    gap: 1rem;
+    gap: 1vw;
     background-color: var(--color-error-bg);
     border: 1px solid var(--color-error-border);
     color: var(--color-error-text);
-    padding: 0.85rem 1.25rem;
+    padding: 1vh 1.25vw;
     border-radius: 8px;
     box-shadow: 0 2px 8px rgba(229, 115, 115, 0.2);
 }
 
 .error-text {
-    margin: 0;
     color: var(--color-error-text);
     font-weight: 500;
+}
+
+/* Preview card (right column) — radar fills available height */
+.preview-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    background-color: var(--color-surface-sections);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 1.5vh 1vw;
+    height: 100%;
+}
+
+.preview-card h4 {
+    margin: 0 0 1vh 0;
+    color: var(--color-pastel-green);
+    font-size: 0.95em;
+    flex-shrink: 0;
+}
+
+/* Radar wrapper — grows to fill available space, keeps square aspect */
+.radar-preview-wrapper,
+.radar-overlay-wrapper {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    flex: 1;
+    width: 100%;
+    user-select: none;
+}
+
+.radar-preview-wrapper svg,
+.radar-overlay-wrapper svg {
+    width: min(100%, 100%);
+    height: auto;
+    max-width: 100%;
+    max-height: 100%;
+    aspect-ratio: 1;
+}
+
+.radar-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+    height: 100%;
+    justify-content: center;
+}
+
+/* Overlay mode — transparent, fills window */
+#app.overlay-mode {
+    background-color: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+
+body:has(#app.overlay-mode) {
+    background-color: transparent !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    overflow: hidden !important;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* Radar dock button (overlay back button) */
+.radar-dock-btn {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border-radius: 50%;
+    background-color: var(--color-surface-contrast);
+    color: var(--color-text-main);
+    border: 1px solid var(--color-border);
+    font-size: 12px;
+    cursor: pointer;
+    z-index: 10;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
+}
+
+.radar-dock-btn:hover {
+    background-color: var(--color-button);
+    color: #ffffff;
+}
+
+/* ── Panel testowy radaru ────────────────────────────────────────────────── */
+
+.radar-test-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75vh;
+    background-color: var(--color-surface-sections);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 1.5vh 1.25vw;
+    margin-top: 1.5vh;
+}
+
+.radar-test-panel h4 {
+    color: var(--color-pastel-green);
+    font-size: 0.9em;
+    margin: 0 0 0.2em 0;
+}
+
+.radar-test-hint {
+    font-size: 0.82em;
+    color: var(--color-text-secondary);
+    margin: 0 0 0.5vh 0;
+    line-height: 1.4;
+}
+
+.radar-test-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 0.5vh 0.5vw;
+}
+
+.radar-test-btn {
+    background-color: var(--color-surface-contrast);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    padding: 0.45vh 0.6vw;
+    font-size: 0.82em;
+    font-weight: 500;
+    cursor: pointer;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    box-shadow: none;
+    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.radar-test-btn:hover {
+    background-color: var(--color-pastel-darkgreen);
+    border-color: var(--color-pastel-green);
+    color: var(--color-pastel-green);
+    box-shadow: 0 0 6px rgba(0, 255, 157, 0.2);
+    transform: none;
+}
+
+.radar-test-btn--active {
+    background-color: var(--color-pastel-darkgreen);
+    border-color: var(--color-pastel-green);
+    color: var(--color-pastel-green);
+    box-shadow: 0 0 8px rgba(0, 255, 157, 0.3);
+    font-weight: 700;
+}
+
+.radar-test-btn--active:hover {
+    background-color: #007a52;
+}
+
+/* ── Panel konfiguracji radaru ───────────────────────────────────────────── */
+
+.radar-config-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6vh;
+    background-color: var(--color-surface-sections);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 1.25vh 1.25vw;
+    margin-top: 1.5vh;
+}
+
+.radar-config-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.5vh;
+}
+
+.radar-config-header h4 {
+    color: var(--color-pastel-green);
+    font-size: 0.9em;
+    margin: 0;
+}
+
+.radar-config-reset {
+    background-color: transparent;
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-border);
+    border-radius: 5px;
+    padding: 0.2vh 0.5vw;
+    font-size: 0.78em;
+    font-weight: 500;
+    cursor: pointer;
+    box-shadow: none;
+    transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.radar-config-reset:hover {
+    color: var(--color-pastel-green);
+    border-color: var(--color-pastel-green);
+    background-color: transparent;
+    box-shadow: none;
+    transform: none;
+}
+
+.radar-config-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75vw;
+}
+
+.radar-config-label {
+    flex: 0 0 72px;
+    font-size: 0.8em;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+}
+
+.radar-config-control {
+    display: flex;
+    align-items: center;
+    flex: 1;
+    gap: 0.5vw;
+}
+
+.radar-config-val {
+    flex: 0 0 44px;
+    font-size: 0.78em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    color: var(--color-pastel-green);
+    text-align: right;
+}
+
+/* Slider styling */
+.radar-slider {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--color-surface-contrast);
+    outline: none;
+    cursor: pointer;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+}
+
+.radar-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--color-pastel-green);
+    cursor: pointer;
+    box-shadow: 0 0 6px rgba(0, 255, 157, 0.4);
+    transition: box-shadow 0.15s ease, transform 0.1s ease;
+}
+
+.radar-slider::-webkit-slider-thumb:hover {
+    box-shadow: 0 0 10px rgba(0, 255, 157, 0.7);
+    transform: scale(1.15);
+}
+
+.radar-slider::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--color-grid);
+}
+
+/* ── Mono Router Panel ───────────────────────────────────────────────────── */
+
+.mono-router-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6vh;
+    background-color: var(--color-surface-sections);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 1.25vh 1.25vw;
+    margin-top: 1.5vh;
+}
+
+.mono-router-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75vw;
+    margin-bottom: 0.2vh;
+}
+
+.mono-router-title {
+    font-size: 0.9em;
+    font-weight: 700;
+    color: var(--color-pastel-green);
+}
+
+.mono-router-badge {
+    font-size: 0.72em;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--color-text-secondary);
+    padding: 0.15vh 0.4vw;
+    border: 1px solid var(--color-border);
+    border-radius: 4px;
+    background: transparent;
+}
+
+.mono-router-badge--active {
+    color: var(--color-pastel-green);
+    border-color: var(--color-pastel-green);
+    background: rgba(0, 255, 157, 0.06);
+    box-shadow: 0 0 6px rgba(0, 255, 157, 0.2);
+}
+
+.mono-router-hint {
+    font-size: 0.8em;
+    color: var(--color-text-secondary);
+    margin: 0 0 0.4vh 0;
+    line-height: 1.4;
+}
+
+.mono-router-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75vw;
+}
+
+.mono-router-label {
+    flex: 0 0 60px;
+    font-size: 0.8em;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+}
+
+.mono-router-select {
+    flex: 1;
+    min-width: 0;
+    padding: 0.4vh 0.6vw;
+    background-color: var(--color-surface-contrast);
+    border: 1px solid var(--color-border);
+    color: var(--color-text-main);
+    border-radius: 6px;
+    font-size: 0.82em;
+    outline: none;
+    cursor: pointer;
+    transition: border-color 0.2s ease;
+}
+
+.mono-router-select:focus {
+    border-color: var(--color-pastel-green);
+}
+
+/* Przyciski wyboru ucha */
+.mono-ear-group {
+    display: flex;
+    gap: 0.4vw;
+    flex-wrap: wrap;
+}
+
+.mono-ear-btn {
+    background-color: var(--color-surface-contrast);
+    color: var(--color-text-secondary);
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    padding: 0.35vh 0.55vw;
+    font-size: 0.8em;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+    box-shadow: none;
+    transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.mono-ear-btn:hover {
+    background-color: var(--color-pastel-darkgreen);
+    border-color: var(--color-pastel-green);
+    color: var(--color-pastel-green);
+    transform: none;
+    box-shadow: none;
+}
+
+.mono-ear-btn--active {
+    background-color: var(--color-pastel-darkgreen);
+    border-color: var(--color-pastel-green);
+    color: var(--color-pastel-green);
+    font-weight: 700;
+    box-shadow: 0 0 8px rgba(0, 255, 157, 0.25);
+}
+
+.mono-ear-btn--active:hover {
+    background-color: #007a52;
+}
+
+/* Przycisk toggle routera — pełna szerokość */
+.mono-router-toggle {
+    width: 100%;
+    justify-content: center;
+    font-size: 0.88em;
 }

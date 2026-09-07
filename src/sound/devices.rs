@@ -3,6 +3,131 @@ use cpal::{
     SampleFormat, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::sound::direction::{self, analyze_channels};
+use crate::sound::spectrum::{self, ColorRule};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RadarConfig {
+    /// Pozycja X środka radaru jako ułamek szerokości okna (0.0 = lewo, 1.0 = prawo).
+    pub anchor_x: f32,
+    /// Pozycja Y środka radaru jako ułamek wysokości okna (0.0 = góra, 1.0 = dół).
+    pub anchor_y: f32,
+    /// Promień radaru w pikselach (50 .. 300).
+    pub radius: f32,
+    /// Przezroczystość tła radaru (0.0 = pełna przezroczystość, 1.0 = pełne krycie).
+    pub bg_alpha: f32,
+    /// Ogólny mnożnik przezroczystości linii i kropek (0.0 .. 1.0).
+    pub fg_alpha: f32,
+    /// Tryb z etykietami (PRZÓD/TYŁ/LEWO/PRAWO + legenda) zamiast minimalnego.
+    pub show_labels: bool,
+    /// Tryb wysokiego kontrastu — paleta monochromatyczna zamiast kolorowej.
+    pub high_contrast: bool,
+    /// Czas zanikania pojedynczej kropki w sekundach (1.0 .. 3.0) — efekt
+    /// "echa" ma być widoczny co najmniej 2-3 s, nie tylko przez ułamek sekundy.
+    pub decay_secs: f32,
+    /// Konfigurowalne reguły "zakres częstotliwości → kolor" — użytkownik
+    /// może mieć ich dowolnie wiele (dodawać/usuwać/edytować w ustawieniach),
+    /// zamiast sztywnych 3 pasm. Patrz [`crate::sound::spectrum::ColorRule`].
+    pub color_rules: Vec<ColorRule>,
+}
+
+impl Default for RadarConfig {
+    fn default() -> Self {
+        Self {
+            anchor_x: 1.0,
+            anchor_y: 1.0,
+            radius:   125.0,
+            bg_alpha: 0.82,
+            fg_alpha: 1.0,
+            show_labels: false,
+            high_contrast: false,
+            decay_secs: 2.5,
+            color_rules: spectrum::default_color_rules(),
+        }
+    }
+}
+
+/// Wybór ucha do odtwarzania mono.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MonoEar {
+    /// Mono routing wyłączony — brak strumienia wyjściowego.
+    #[default]
+    Off,
+    /// Mono sygnał odtwarzany tylko na lewym kanale.
+    Left,
+    /// Mono sygnał odtwarzany tylko na prawym kanale.
+    Right,
+    /// Mono sygnał odtwarzany na obu kanałach.
+    Both,
+}
+
+impl MonoEar {
+    pub const ALL: &'static [Self] = &[Self::Off, Self::Left, Self::Right, Self::Both];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off   => "Off",
+            Self::Left  => "← Lewe ucho",
+            Self::Right => "→ Prawe ucho",
+            Self::Both  => "↔ Oba",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AudioAnalysis {
+    pub angle: f32,          // -180° .. 0° (przód) .. +180°
+    pub intensity: f32,      // 0.0 .. 1.0
+    pub peak_l: f32,
+    pub peak_r: f32,
+    /// Poziom RMS każdego kanału z ostatniej ramki analizy (patrz
+    /// [`crate::sound::direction::analyze_channels`]) — jedna wartość na
+    /// kanał, w kolejności zgodnej z układem głośnikowym danego strumienia.
+    pub channel_rms: Vec<f32>,
+    /// Liczba kanałów aktywnego strumienia (2, 6, 8, ...), decyduje o
+    /// interpretacji `channel_rms` przez [`crate::sound::direction::channel_layout`].
+    pub channel_count: usize,
+    /// Energia w każdej regule kolorowania (`radar_config.color_rules`) dla
+    /// każdego kanału z ostatniej ramki — `channel_rule_energies[kanał][reguła]`.
+    /// Patrz [`crate::sound::spectrum`]. Używane do kolorowania kropek radaru
+    /// wg "typu" dźwięku, niezależnie od kierunku (kąta) kanału.
+    pub channel_rule_energies: Vec<Vec<f32>>,
+    /// Indeks scenariusza testowego: 0 = live audio, 1..N = kolejne testy.
+    /// Ustawiany przez UI Dioxus, odczytywany przez egui.
+    pub test_scenario: u8,
+    /// Konfiguracja wyglądu i pozycji radaru egui.
+    pub radar_config: RadarConfig,
+    /// Wybór ucha do mono routingu. Ustawiany przez UI, czytany przez mono_router.
+    pub mono_ear: MonoEar,
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedAudioAnalysis(pub Arc<Mutex<AudioAnalysis>>);
+
+impl PartialEq for SharedAudioAnalysis {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Default for SharedAudioAnalysis {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(AudioAnalysis::default())))
+    }
+}
+
+impl SharedAudioAnalysis {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, AudioAnalysis>> {
+        self.0.lock()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SoundDevice {
@@ -32,80 +157,156 @@ impl SoundDevice {
     }
 }
 
+/// Na macOS zwraca urządzenia wejściowe (np. BlackHole) zamiast wyjściowych —
+/// cpal na CoreAudio nie obsługuje loopback na urządzeniach wyjściowych.
+/// Na Windows/Linux zwraca urządzenia wyjściowe (WASAPI loopback działa natywnie).
 pub fn fetch_output_devices() -> Result<Vec<SoundDevice>> {
     let host = cpal::default_host();
 
-    let default_device: Option<String> = host
-        .default_output_device()
-        .and_then(|device| device.name().ok());
+    #[cfg(target_os = "macos")]
+    {
+        let default_name = host
+            .default_input_device()
+            .and_then(|d| d.name().ok());
 
-    let mut devices: Vec<SoundDevice> = Vec::new();
+        let mut devices = Vec::new();
+        for (index, device) in host.input_devices()?.enumerate() {
+            let Ok(name) = device.name() else { continue };
+            let is_default = default_name.as_deref() == Some(&name);
 
-    for (index, device) in host.output_devices()?.enumerate() {
-        let Ok(device_name) = device.name() else {
-            continue;
-        };
-
-        let is_default = default_device.as_deref() == Some(device_name.as_str());
-
-        let mut device_configs: Vec<DeviceConfig> = Vec::new();
-
-        match device.supported_output_configs() {
-            Ok(supported_configs) => {
-                for config in supported_configs {
-                    device_configs.push(DeviceConfig {
-                        channels: config.channels(),
-                        min_sample_rate: config.min_sample_rate().0,
-                        max_sample_rate: config.max_sample_rate().0,
-                        sample_format: config.sample_format(),
-                        buffer_size: *config.buffer_size(),
+            let mut configs = Vec::new();
+            if let Ok(supported) = device.supported_input_configs() {
+                for c in supported {
+                    configs.push(DeviceConfig {
+                        channels: c.channels(),
+                        min_sample_rate: c.min_sample_rate().0,
+                        max_sample_rate: c.max_sample_rate().0,
+                        sample_format: c.sample_format(),
+                        buffer_size: *c.buffer_size(),
                     });
                 }
             }
 
-            Err(error) => {
-                eprintln!(
-                    "Could not read supported output configurations for \
-                    '{device_name}': {error}"
-                );
+            devices.push(SoundDevice {
+                id: index,
+                name,
+                is_input: true,
+                is_default,
+                configs,
+            });
+        }
+        return Ok(devices);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let default_name = host
+            .default_output_device()
+            .and_then(|d| d.name().ok());
+
+        let mut devices = Vec::new();
+        for (index, device) in host.output_devices()?.enumerate() {
+            let Ok(name) = device.name() else { continue };
+            let is_default = default_name.as_deref() == Some(&name);
+
+            let mut configs = Vec::new();
+            if let Ok(supported) = device.supported_output_configs() {
+                for c in supported {
+                    configs.push(DeviceConfig {
+                        channels: c.channels(),
+                        min_sample_rate: c.min_sample_rate().0,
+                        max_sample_rate: c.max_sample_rate().0,
+                        sample_format: c.sample_format(),
+                        buffer_size: *c.buffer_size(),
+                    });
+                }
+            }
+
+            devices.push(SoundDevice {
+                id: index,
+                name,
+                is_input: false,
+                is_default,
+                configs,
+            });
+        }
+        return Ok(devices);
+    }
+}
+
+/// Zwraca fizyczne urządzenia wyjściowe (słuchawki, głośniki) na wszystkich platformach.
+/// Używane do wyboru urządzenia docelowego dla mono routera.
+pub fn fetch_physical_output_devices() -> Result<Vec<SoundDevice>> {
+    let host = cpal::default_host();
+    let default_name = host.default_output_device().and_then(|d| d.name().ok());
+
+    let mut devices = Vec::new();
+    for (index, device) in host.output_devices()?.enumerate() {
+        let Ok(name) = device.name() else { continue };
+        let is_default = default_name.as_deref() == Some(&name);
+
+        let mut configs = Vec::new();
+        if let Ok(supported) = device.supported_output_configs() {
+            for c in supported {
+                configs.push(DeviceConfig {
+                    channels: c.channels(),
+                    min_sample_rate: c.min_sample_rate().0,
+                    max_sample_rate: c.max_sample_rate().0,
+                    sample_format: c.sample_format(),
+                    buffer_size: *c.buffer_size(),
+                });
             }
         }
 
         devices.push(SoundDevice {
             id: index,
-            name: device_name,
+            name,
             is_input: false,
             is_default,
-            configs: device_configs,
+            configs,
         });
     }
-
     Ok(devices)
 }
 
-pub fn fetch_audio_from_device(target_device_name: &str) -> Result<cpal::Stream> {
+pub fn fetch_audio_from_device(
+    target_device_name: &str,
+    analysis: SharedAudioAnalysis,
+) -> Result<cpal::Stream> {
     let host = cpal::default_host();
 
-    // 1. Szukamy najpierw w urządzeniach wyjściowych (dla natywnego WASAPI loopback na Windows)
-    let (target_device, is_output) = if let Some(dev) = host
-        .output_devices()?
-        .find(|d| d.name().map(|n| n == target_device_name).unwrap_or(false))
-    {
-        (dev, true)
-    } else if let Some(dev) = host
-        .input_devices()?
-        .find(|d| d.name().map(|n| n == target_device_name).unwrap_or(false))
-    {
-        (dev, false)
-    } else {
-        return Err(anyhow::anyhow!(
-            "Nie znaleziono urządzenia o nazwie: {}",
-            target_device_name
-        ));
+    // Na macOS szukamy w urządzeniach wejściowych (BlackHole itp.)
+    // Na Windows szukamy najpierw w wyjściowych (WASAPI loopback), potem wejściowych
+    #[cfg(target_os = "macos")]
+    let (target_device, is_output) = {
+        if let Some(dev) = host
+            .input_devices()?
+            .find(|d| d.name().map(|n| n == target_device_name).unwrap_or(false))
+        {
+            (dev, false)
+        } else {
+            anyhow::bail!("Device not found: {}", target_device_name);
+        }
     };
 
-    // 2. Dla urządzeń wyjściowych (loopback) pobieramy default_output_config (format miksera systemowego)
-    let target_default_config = if is_output {
+    #[cfg(not(target_os = "macos"))]
+    let (target_device, is_output) = {
+        if let Some(dev) = host
+            .output_devices()?
+            .find(|d| d.name().map(|n| n == target_device_name).unwrap_or(false))
+        {
+            (dev, true)
+        } else if let Some(dev) = host
+            .input_devices()?
+            .find(|d| d.name().map(|n| n == target_device_name).unwrap_or(false))
+        {
+            (dev, false)
+        } else {
+            anyhow::bail!("Device not found: {}", target_device_name);
+        }
+    };
+
+    let default_config = if is_output {
         target_device
             .default_output_config()
             .or_else(|_| target_device.default_input_config())?
@@ -115,65 +316,112 @@ pub fn fetch_audio_from_device(target_device_name: &str) -> Result<cpal::Stream>
             .or_else(|_| target_device.default_output_config())?
     };
 
-    let config: StreamConfig = target_default_config.clone().into();
-    let err_fn = |err| eprintln!("Błąd strumienia: {}", err);
+    let config: StreamConfig = default_config.clone().into();
+    let channels = config.channels as usize;
+    let sample_rate = config.sample_rate.0 as f32;
+    let err_fn = |e| eprintln!("Stream error: {e}");
 
     println!(
-        "Stream start: {} ({}) [{:?}, {} Hz, {} kanały]",
+        "[audio] stream start: device={:?} format={:?} rate={}Hz channels={}",
         target_device_name,
-        if is_output { "WASAPI Loopback" } else { "Input" },
-        target_default_config.sample_format(),
+        default_config.sample_format(),
         config.sample_rate.0,
-        config.channels
+        channels
     );
 
-    let stream = match target_default_config.sample_format() {
-        SampleFormat::F32 => target_device.build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let peak = data.iter().copied().fold(0.0f32, |acc, x| acc.max(x.abs()));
-                println!("Pobrano {} próbek | Peak: {:.4}", data.len(), peak);
-            },
-            err_fn,
-            None,
-        )?,
-        SampleFormat::I16 => target_device.build_input_stream(
-            &config,
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                let peak = data.iter().copied().fold(0i16, |acc, x| acc.max(x.abs()));
-                println!(
-                    "Pobrano {} próbek | Peak: {:.4}",
-                    data.len(),
-                    peak as f32 / i16::MAX as f32
-                );
-            },
-            err_fn,
-            None,
-        )?,
-        SampleFormat::U16 => target_device.build_input_stream(
-            &config,
-            move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                let peak = data.iter().copied().fold(0u16, |acc, x| acc.max(x));
-                println!(
-                    "Pobrano {} próbek | Peak: {:.4}",
-                    data.len(),
-                    peak as f32 / u16::MAX as f32
-                );
-            },
-            err_fn,
-            None,
-        )?,
-        sample_format => {
-            return Err(anyhow::anyhow!(
-                "Niewspierany format próbek: {}",
-                sample_format
-            ));
-        }
-    };
+    let call_counter = Arc::new(AtomicU64::new(0));
 
+    let stream = match default_config.sample_format() {
+        SampleFormat::F32 => {
+            let a = analysis.clone();
+            let counter = call_counter.clone();
+            target_device.build_input_stream(
+                &config,
+                move |data: &[f32], _| {
+                    let n = counter.fetch_add(1, Ordering::Relaxed);
+                    if n % 200 == 0 {
+                        let peak = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                        println!("[audio] cb #{n} samples={} peak={peak:.4}", data.len());
+                    }
+                    update_analysis(data, channels, sample_rate, &a);
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::I16 => {
+            let a = analysis.clone();
+            let counter = call_counter.clone();
+            target_device.build_input_stream(
+                &config,
+                move |data: &[i16], _| {
+                    let n = counter.fetch_add(1, Ordering::Relaxed);
+                    let f: Vec<f32> = data.iter().map(|&s| direction::i16_to_f32(s)).collect();
+                    if n % 200 == 0 {
+                        let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                        println!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
+                    }
+                    update_analysis(&f, channels, sample_rate, &a);
+                },
+                err_fn,
+                None,
+            )?
+        }
+        SampleFormat::U16 => {
+            let a = analysis.clone();
+            let counter = call_counter.clone();
+            target_device.build_input_stream(
+                &config,
+                move |data: &[u16], _| {
+                    let n = counter.fetch_add(1, Ordering::Relaxed);
+                    let f: Vec<f32> = data.iter().map(|&s| direction::u16_to_f32(s)).collect();
+                    if n % 200 == 0 {
+                        let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                        println!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
+                    }
+                    update_analysis(&f, channels, sample_rate, &a);
+                },
+                err_fn,
+                None,
+            )?
+        }
+        fmt => anyhow::bail!("Unsupported sample format: {fmt}"),
+    };
 
     stream.play()?;
     Ok(stream)
+}
+
+fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis: &SharedAudioAnalysis) {
+    let stats = analyze_channels(samples, channels);
+    let (angle, intensity) = direction::compute_direction(&stats.rms);
+
+    // Reguły kolorowania mogą się zmienić w dowolnym momencie z panelu
+    // ustawień (UI), więc czytamy je świeżo przy każdej ramce zamiast
+    // zakładać stały, sztywny zestaw pasm.
+    let rules = analysis
+        .lock()
+        .map(|g| g.radar_config.color_rules.clone())
+        .unwrap_or_else(|_| spectrum::default_color_rules());
+    let rule_energies = spectrum::analyze_channel_rule_energies(samples, channels, sample_rate, &rules);
+
+    let labels = ["L", "R", "C", "LFE", "RL", "RR", "SL", "SR"];
+    let ch_str: Vec<String> = stats.rms.iter().enumerate().map(|(i, rms)| {
+        let label = labels.get(i).copied().unwrap_or("?");
+        let pct = (rms.clamp(0.0, 1.0) * 100.0).round() as u32;
+        format!("{label}:{pct}")
+    }).collect();
+    println!("[ch] {} | angle={:.1}° intensity={:.2}", ch_str.join(" "), angle, intensity);
+    println!("[analysis] angle={angle:.1}° intensity={intensity:.4} rms={:?}", &stats.rms);
+    if let Ok(mut lock) = analysis.lock() {
+        lock.angle = angle;
+        lock.intensity = intensity;
+        lock.peak_l = stats.peak.first().copied().unwrap_or(0.0);
+        lock.peak_r = stats.peak.get(1).copied().unwrap_or(0.0);
+        lock.channel_rms = stats.rms;
+        lock.channel_count = channels;
+        lock.channel_rule_energies = rule_energies;
+    }
 }
 
 #[cfg(test)]
@@ -181,24 +429,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_device_direction() {
-        let device_in = SoundDevice {
+    fn test_device_helpers() {
+        let dev = SoundDevice {
             id: 0,
-            name: "Mic".into(),
+            name: "Test".into(),
             is_input: true,
             is_default: false,
             configs: vec![],
         };
-        assert_eq!(device_in.get_device_direction(), "Input");
-
-        let device_out = SoundDevice {
-            id: 1,
-            name: "Speakers".into(),
-            is_input: false,
-            is_default: true,
-            configs: vec![],
-        };
-        assert_eq!(device_out.get_device_direction(), "Output");
-        assert_eq!(device_out.get_default_status(), "Yes");
+        assert_eq!(dev.get_device_direction(), "Input");
+        assert_eq!(dev.get_default_status(), "No");
     }
 }

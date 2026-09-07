@@ -1,4 +1,4 @@
 pub mod app;
-pub mod components;
+pub mod radar_egui;
 
-pub use app::App;
+pub use app::HearRadarApp;
