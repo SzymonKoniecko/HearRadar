@@ -570,6 +570,21 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
     }).collect();
     crate::dlog!("[ch] {} | onsets={}", ch_str.join(" "), direction_events.len());
     crate::dlog!("[analysis] rms={:?}", &stats.rms);
+    // Pozycja (kąt na tarczy) i intensywność każdego wskaźnika kierunku —
+    // dokładnie to, co dostaje `RadarState::update` i zamienia na osobny,
+    // gasnący marker na radarze (patrz `ui::radar_egui::DirectionMarker`).
+    // Logowane tylko gdy coś faktycznie wykryto, żeby nie zalewać pliku
+    // pustymi liniami przy każdej ramce ciszy.
+    for event in &direction_events {
+        crate::dlog!(
+            "[onset] angle={:.1}° intensity={:.2} color=rgb({},{},{})",
+            event.angle_deg,
+            event.intensity,
+            event.color_rgb.0,
+            event.color_rgb.1,
+            event.color_rgb.2
+        );
+    }
     if let Ok(mut lock) = analysis.lock() {
         lock.peak_l = stats.peak.first().copied().unwrap_or(0.0);
         lock.peak_r = stats.peak.get(1).copied().unwrap_or(0.0);
