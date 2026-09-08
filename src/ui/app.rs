@@ -174,11 +174,12 @@ impl HearRadarApp {
     /// żywego audio) — dzięki temu panel testowy demonstruje te same,
     /// niezależne wskaźniki na radarze co prawdziwy dźwięk.
     fn detect_test_direction_events(&mut self, rms: &[f32], rule_energies: &[Vec<f32>]) -> Vec<devices::DirectionEvent> {
-        direction::detect_onsets(rms, &mut self.test_onset_ema)
+        let sensitivity = self.radar_config.radar_sensitivity;
+        direction::detect_onsets(rms, &mut self.test_onset_ema, sensitivity)
             .into_iter()
             .map(|onset| devices::DirectionEvent {
                 angle_deg: onset.angle_deg,
-                intensity: (onset.energy * direction::INTENSITY_SCALE).clamp(0.0, 1.0),
+                intensity: (onset.energy * sensitivity).clamp(0.0, 1.0),
                 color_rgb: spectrum::resolve_color(
                     &self.radar_config.color_rules,
                     rule_energies.get(onset.channel_index).map(Vec::as_slice).unwrap_or(&[]),
