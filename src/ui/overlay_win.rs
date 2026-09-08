@@ -97,6 +97,20 @@ struct SkiaCanvas<'a> {
     pixmap: RefCell<PixmapMut<'a>>,
 }
 
+/// `tiny-skia` routes any stroke with `width <= 1.0` (under an identity
+/// transform) through its anti-aliased "hairline" scanline filler
+/// (`treat_as_hairline` in `painter.rs`) instead of the normal stroke-to-fill
+/// path. That filler has a fixed-point edge case (`scan/hairline_aa.rs`)
+/// where an axis-aligned line landing on certain pixel-boundary fractions
+/// computes a degenerate zero-width inner span and hits
+/// `debug_assert!(false)` — crashing debug builds outright. `draw_radar`
+/// draws mostly sub-1px, often perfectly axis-aligned strokes (the cross,
+/// thin rings), so this was reliably reachable. Nudging just above the
+/// hairline threshold keeps every stroke on the ordinary, bug-free path.
+fn hairline_safe_width(width: f32) -> f32 {
+    width.max(1.05)
+}
+
 fn skia_paint(color: Color32) -> Paint<'static> {
     let mut paint = Paint::default();
     paint.set_color_rgba8(color.b(), color.g(), color.r(), color.a());
@@ -126,7 +140,7 @@ impl RadarCanvas for SkiaCanvas<'_> {
         pb.push_circle(center.x, center.y, radius);
         let Some(path) = pb.finish() else { return };
         let paint = skia_paint(stroke.color);
-        let sk_stroke = tiny_skia::Stroke { width: stroke.width, ..Default::default() };
+        let sk_stroke = tiny_skia::Stroke { width: hairline_safe_width(stroke.width), ..Default::default() };
         self.pixmap
             .borrow_mut()
             .stroke_path(&path, &paint, &sk_stroke, Transform::identity(), None);
@@ -141,7 +155,7 @@ impl RadarCanvas for SkiaCanvas<'_> {
         pb.line_to(points[1].x, points[1].y);
         let Some(path) = pb.finish() else { return };
         let paint = skia_paint(stroke.color);
-        let sk_stroke = tiny_skia::Stroke { width: stroke.width, ..Default::default() };
+        let sk_stroke = tiny_skia::Stroke { width: hairline_safe_width(stroke.width), ..Default::default() };
         self.pixmap
             .borrow_mut()
             .stroke_path(&path, &paint, &sk_stroke, Transform::identity(), None);
