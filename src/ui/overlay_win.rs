@@ -319,8 +319,6 @@ impl WinOverlay {
         state: &mut RadarState,
         channels: usize,
         now: f64,
-        combined_angle_deg: f32,
-        combined_intensity: f32,
         click_through: bool,
     ) {
         let size = overlay_size.round() as i32;
@@ -350,8 +348,6 @@ impl WinOverlay {
             state,
             channels,
             now,
-            combined_angle_deg,
-            combined_intensity,
         );
 
         let (x, y) = Self::position_from_anchor(overlay_size, cfg.anchor_x, cfg.anchor_y, screen_margin);

@@ -134,6 +134,23 @@ pub fn analyze_channel_rule_energies(
         .collect()
 }
 
+/// Kolor używany, gdy nie da się ustalić dominującej reguły (np. lista reguł
+/// jest pusta) — neutralny cyjan, taki sam jak dawny "domyślny" kolor kropek.
+pub const FALLBACK_DOT_RGB: (u8, u8, u8) = (0, 220, 220);
+
+/// Wybiera kolor energetycznie dominującej reguły dla danego kanału. `energies`
+/// to lista energii w tej samej kolejności co `rules` (patrz
+/// [`analyze_channel_rule_energies`]); gdy jest krótsza/pusta albo `rules`
+/// jest puste, zwraca [`FALLBACK_DOT_RGB`]. Publiczna (nie tylko dla UI),
+/// żeby warstwa audio (`sound::devices`, przy budowaniu zdarzeń kierunku)
+/// mogła kolorować zdarzenia bez zależności od `ui::radar_egui`.
+pub fn resolve_color(rules: &[ColorRule], energies: &[f32]) -> (u8, u8, u8) {
+    dominant_rule_index(energies)
+        .and_then(|i| rules.get(i))
+        .map(|r| (r.color[0], r.color[1], r.color[2]))
+        .unwrap_or(FALLBACK_DOT_RGB)
+}
+
 /// Indeks energetycznie dominującej reguły (albo `None`, gdy lista pusta).
 pub fn dominant_rule_index(energies: &[f32]) -> Option<usize> {
     energies

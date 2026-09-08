@@ -205,6 +205,134 @@ fn wrap_angle_deg(angle: f32) -> f32 {
     ((angle + 180.0).rem_euclid(360.0)) - 180.0
 }
 
+// ── Detekcja niezależnych zdarzeń dźwiękowych (onsetów) ────────────────────
+//
+// W przeciwieństwie do [`compute_direction`] (JEDEN, sumaryczny wektor dla
+// całej ramki — dwa przeciwstawne źródła o podobnej energii potrafią się
+// wzajemnie znieść: `sum_x≈0, sum_y≈0`), poniższe funkcje wykrywają KAŻDY
+// nagły skok energii na KAŻDYM kanale osobno, więc silnik z lewej i wybuch z
+// prawej dają dwa niezależne zdarzenia zamiast jednego mylącego/zanikającego
+// wskaźnika "z przodu".
+
+/// Próg mnożnikowy nagłego skoku energii nad średnią kroczącą kanału, przy
+/// którym zgłaszamy nowy onset (analogicznie do `TRANSIENT_RATIO` używanego
+/// przy kropkach kanałów w `ui::radar_egui`, ale to osobna, niezależna stała —
+/// onsety karmią osobny mechanizm wizualny).
+pub const TRANSIENT_RATIO: f32 = 2.5;
+
+/// Poniżej tego poziomu RMS w ogóle nie rozważamy zgłoszenia onsetu — szum
+/// tła nie powinien generować wskaźników kierunku.
+const ONSET_MIN_ENERGY: f32 = 0.02;
+
+/// Współczynnik wygładzania średniej kroczącej energii per kanał (mniejszy =
+/// wolniejsza, stabilniejsza średnia).
+const ONSET_EMA_FACTOR: f32 = 0.1;
+
+/// Maksymalna odległość kątowa (stopnie) sąsiedniego kanału, którego energia
+/// wpływa na [`onset_angle_deg`] danego kanału. Kanały leżące PO PRZECIWNEJ
+/// stronie tarczy (`> 90°`) nigdy nie powinny przeciągać kąta na swoją stronę
+/// — stąd próg dokładnie w połowie okręgu.
+const NEIGHBOR_MAX_ANGLE_DIFF_DEG: f32 = 90.0;
+
+/// Pojedyncze, niezależne zdarzenie dźwiękowe wykryte na jednym kanale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChannelOnset {
+    /// Indeks kanału (w `channel_rms`/`channel_layout`), na którym wykryto onset.
+    pub channel_index: usize,
+    /// Poziom RMS kanału w chwili wykrycia (0.0..=1.0).
+    pub energy: f32,
+    /// Płynny kąt onsetu w stopniach (patrz [`onset_angle_deg`]) — w
+    /// przeciwieństwie do sztywnej pozycji głośnika, uwzględnia energię
+    /// kątowych sąsiadów.
+    pub angle_deg: f32,
+}
+
+/// Wykrywa nagłe skoki energii (onsety) na każdym kanale osobno, porównując
+/// bieżący RMS ze średnią kroczącą tego kanału (stan przekazywany z zewnątrz
+/// w `ema_state`, żeby funkcja zostawała czystą/testowalną bez żywego audio —
+/// wywołujący jest odpowiedzialny za trzymanie tego samego `Vec` między
+/// kolejnymi wywołaniami). Kanały bez kierunku (LFE) są pomijane.
+///
+/// `ema_state` jest automatycznie dopasowywany do rozmiaru `channel_rms`,
+/// jeśli liczba kanałów strumienia się zmieni (np. przełączenie urządzenia).
+pub fn detect_onsets(channel_rms: &[f32], ema_state: &mut Vec<f32>) -> Vec<ChannelOnset> {
+    if ema_state.len() != channel_rms.len() {
+        *ema_state = vec![0.0; channel_rms.len()];
+    }
+
+    let layout = channel_layout(channel_rms.len());
+    let mut onsets = Vec::new();
+
+    for (i, &level) in channel_rms.iter().enumerate() {
+        let level = level.max(0.0);
+        let has_direction = layout
+            .get(i)
+            .and_then(|role| role.radar_angle_degrees())
+            .is_some();
+
+        if !has_direction {
+            ema_state[i] = ema_state[i] * (1.0 - ONSET_EMA_FACTOR) + level * ONSET_EMA_FACTOR;
+            continue;
+        }
+
+        let prev_ema = ema_state[i];
+        let is_onset = level > ONSET_MIN_ENERGY && level > prev_ema * TRANSIENT_RATIO + 0.02;
+        ema_state[i] = prev_ema * (1.0 - ONSET_EMA_FACTOR) + level * ONSET_EMA_FACTOR;
+
+        if is_onset {
+            onsets.push(ChannelOnset {
+                channel_index: i,
+                energy: level,
+                angle_deg: onset_angle_deg(channel_rms, i),
+            });
+        }
+    }
+
+    onsets
+}
+
+/// Płynny kąt onsetu wykrytego na `channel_index`: średnia ważona energią
+/// własnego kąta kanału i kątów jego kątowych sąsiadów (odległość kątowa
+/// `<= `[`NEIGHBOR_MAX_ANGLE_DIFF_DEG`]`°`, NIE sąsiedztwo w tablicy
+/// `channel_layout` — w układzie 2.0 jedynym sąsiadem indeksowym L jest R,
+/// czyli kanał dokładnie naprzeciwko, więc głośny R przeciągałby kąt L na
+/// swoją stronę, gdyby liczyć po indeksie). Dzięki temu głośny, sąsiedni
+/// kanał płynnie przesuwa kąt w swoją stronę, ale kanał po przeciwnej stronie
+/// tarczy nigdy nie wpływa na wynik.
+pub fn onset_angle_deg(channel_rms: &[f32], channel_index: usize) -> f32 {
+    let layout = channel_layout(channel_rms.len());
+    let Some(own_role) = layout.get(channel_index).copied() else {
+        return 0.0;
+    };
+    let Some(own_angle) = own_role.radar_angle_degrees() else {
+        return 0.0;
+    };
+
+    let mut sum_x = 0.0f32;
+    let mut sum_y = 0.0f32;
+    let mut total_energy = 0.0f32;
+
+    for (i, role) in layout.iter().enumerate() {
+        let Some(angle_deg) = role.radar_angle_degrees() else {
+            continue;
+        };
+        if i != channel_index && wrap_angle_deg(angle_deg - own_angle).abs() > NEIGHBOR_MAX_ANGLE_DIFF_DEG {
+            continue;
+        }
+        let energy = channel_rms.get(i).copied().unwrap_or(0.0).max(0.0);
+        let rad = angle_deg.to_radians();
+        sum_x += energy * rad.sin();
+        sum_y += energy * rad.cos();
+        total_energy += energy;
+    }
+
+    if total_energy < f32::EPSILON {
+        return own_angle;
+    }
+
+    sum_x.atan2(sum_y).to_degrees()
+}
+
 /// Zwraca poglądową nazwę układu kanałów, np. "2.0", "5.1", "7.1".
 /// Dla nietypowej liczby kanałów zwraca np. "4ch".
 pub fn layout_name(channels: usize) -> String {
@@ -628,5 +756,93 @@ mod tests {
         // RMS teoretycznie nie powinno przekraczać 1.0, ale funkcja ma być odporna.
         let formatted = format_channel_levels(&[1.5, -0.2]);
         assert_eq!(formatted, "2.0: [L:100, R:0]");
+    }
+
+    // ---------- detect_onsets / onset_angle_deg ----------
+
+    #[test]
+    fn opposite_channels_with_similar_energy_yield_two_separate_onsets_not_one_cancelled() {
+        // Dokładnie scenariusz "silnik z lewej + wybuch z prawej": SL (-90°) i
+        // SR (90°) leżą dokładnie naprzeciw siebie i mają podobną energię, więc
+        // compute_direction dałby prawie zerowy wektor sumaryczny. detect_onsets
+        // powinien zamiast tego zgłosić DWA niezależne zdarzenia, każde na
+        // swoim kanale. [FL, FR, C, LFE, RL, RR, SL, SR]
+        let mut ema = vec![0.0; 8];
+        let onsets = detect_onsets(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.3], &mut ema);
+        let left = onsets.iter().find(|o| o.channel_index == 6).unwrap();
+        let right = onsets.iter().find(|o| o.channel_index == 7).unwrap();
+        assert_close(left.angle_deg, -90.0, "onset lewego kanału (SL)");
+        assert_close(right.angle_deg, 90.0, "onset prawego kanału (SR)");
+    }
+
+    #[test]
+    fn detect_onsets_ignores_steady_energy_without_a_sudden_jump() {
+        let mut ema = vec![0.0, 0.0];
+        // Kilka ramek o stałym poziomie — po "rozgrzaniu" średniej kroczącej
+        // dalsze ramki o tym samym poziomie nie powinny być onsetami.
+        for _ in 0..50 {
+            detect_onsets(&[0.2, 0.2], &mut ema);
+        }
+        let onsets = detect_onsets(&[0.2, 0.2], &mut ema);
+        assert!(onsets.is_empty(), "stały poziom nie powinien generować onsetów");
+    }
+
+    #[test]
+    fn detect_onsets_silence_yields_nothing() {
+        let mut ema = vec![0.0, 0.0];
+        assert!(detect_onsets(&[0.0, 0.0], &mut ema).is_empty());
+    }
+
+    #[test]
+    fn detect_onsets_skips_lfe_channel() {
+        // [FL, FR, C, LFE, RL, RR]
+        let mut ema = vec![0.0; 6];
+        let onsets = detect_onsets(&[0.0, 0.0, 0.0, 0.5, 0.0, 0.0], &mut ema);
+        assert!(
+            onsets.iter().all(|o| o.channel_index != 3),
+            "LFE nie niesie kierunku, nie powinien generować onsetu"
+        );
+    }
+
+    #[test]
+    fn detect_onsets_resizes_ema_state_for_new_channel_count() {
+        let mut ema = vec![0.0, 0.0];
+        let _ = detect_onsets(&[0.1, 0.1], &mut ema);
+        assert_eq!(ema.len(), 2);
+        // Zmiana urządzenia -> inna liczba kanałów; nie powinno panikować.
+        let _ = detect_onsets(&[0.0; 6], &mut ema);
+        assert_eq!(ema.len(), 6);
+    }
+
+    #[test]
+    fn onset_angle_deg_pure_channel_matches_its_own_fixed_angle() {
+        // [FL, FR, C, LFE, RL, RR, SL, SR] -> SL=index6 (-90°)
+        let angle = onset_angle_deg(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0], 6);
+        assert_close(angle, -90.0, "onset tylko na SL -> kąt SL");
+    }
+
+    #[test]
+    fn onset_angle_deg_interpolates_smoothly_towards_a_louder_neighbor() {
+        // [FL, FR, C, LFE, RL, RR, SL, SR] -> SR=index7 (90°), RR=index5 (135°)
+        let angle_quiet_neighbor = onset_angle_deg(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.0, 0.3], 7);
+        let angle_loud_neighbor = onset_angle_deg(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.3], 7);
+
+        assert!(
+            angle_quiet_neighbor > 90.0 && angle_quiet_neighbor < angle_loud_neighbor,
+            "cichy sąsiad powinien dać kąt bliżej 90°: {angle_quiet_neighbor}"
+        );
+        assert!(
+            angle_loud_neighbor < 135.0,
+            "kąt nie powinien przekroczyć kąta sąsiada (135°): {angle_loud_neighbor}"
+        );
+    }
+
+    #[test]
+    fn onset_angle_deg_never_pulled_by_the_opposite_side_of_the_dial() {
+        // [FL, FR, C, LFE, RL, RR, SL, SR] -> SL=index6 (-90°), SR=index7 (90°),
+        // dokładnie naprzeciw siebie (180° różnicy). Nawet bardzo głośny SR
+        // nie powinien przesunąć kąta onsetu na SL.
+        let angle = onset_angle_deg(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.9], 6);
+        assert_close(angle, -90.0, "SL nie powinien być ciągnięty przez przeciwległy SR");
     }
 }

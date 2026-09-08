@@ -43,14 +43,14 @@ const TEST_TONE_BUFFER_LEN: usize = 480;
 pub struct HearRadarApp {
     analysis: SharedAudioAnalysis,
 
-    // Wygładzony kąt/intensywność do rysowania (interpolacja klatka-po-klatce,
-    // odpowiednik dawnej pętli `use_future` w Dioxusie).
-    display_angle: f32,
-    display_intensity: f32,
-
-    // Stan radaru (historia kropek per kanał, zanik w czasie) — używany
-    // zarówno w overlay, jak i w podglądzie.
+    // Stan radaru (historia kropek per kanał, zanik w czasie, aktywne
+    // wskaźniki kierunku) — używany zarówno w overlay, jak i w podglądzie.
     radar_state: RadarState,
+    /// Stan średniej kroczącej per kanał dla `direction::detect_onsets` w
+    /// scenariuszach testowych (patrz [`Self::tick_radar_state`]) — osobny od
+    /// analogicznego stanu w warstwie audio (`SharedAudioAnalysis`), bo dane
+    /// testowe nigdy nie przechodzą przez tamten strumień.
+    test_onset_ema: Vec<f32>,
     current_channels: usize,
     test_phase: f32,
     test_scenario: TestScenario,
@@ -140,9 +140,8 @@ impl HearRadarApp {
 
         Self {
             analysis,
-            display_angle: 0.0,
-            display_intensity: 0.0,
             radar_state: RadarState::new(),
+            test_onset_ema: Vec::new(),
             current_channels: DEFAULT_TEST_CHANNELS,
             test_phase: 0.0,
             test_seed: 7,
@@ -166,23 +165,24 @@ impl HearRadarApp {
         }
     }
 
-    /// Wygładza kąt/intensywność sumarycznego kierunku (kombinacja
-    /// wektorowa wszystkich kanałów, patrz [`direction::compute_direction`])
-    /// klatka po klatce — szybki atak, płynne opadanie intensywności. Wołane
-    /// z [`Self::tick_radar_state`] z RMS-em odpowiednim dla aktualnego trybu
-    /// (żywe audio albo scenariusz testowy), żeby wskaźnik kierunku na
-    /// radarze zgadzał się z tym, co akurat rysują kropki per-kanał.
-    fn smooth_display_direction(&mut self, target_angle: f32, target_intensity: f32) {
-        // `direction::smooth_angle_deg` idzie NAJKRÓTSZĄ drogą po okręgu —
-        // zwykłe liniowe `a*0.75 + b*0.25` na surowych stopniach kręciłoby
-        // wskaźnik przez przód przy przejściu np. z tyłu-lewo do tyłu-prawo,
-        // zamiast wprost przez tył (patrz doc-komentarz tej funkcji).
-        self.display_angle = direction::smooth_angle_deg(self.display_angle, target_angle, 0.25);
-        self.display_intensity = if target_intensity > self.display_intensity {
-            target_intensity
-        } else {
-            self.display_intensity * 0.88
-        };
+    /// Wykrywa niezależne zdarzenia kierunku (onsety, patrz
+    /// [`direction::detect_onsets`]) w syntetycznym RMS-ie scenariusza
+    /// testowego, kolorując każde wg energetycznie dominującej reguły
+    /// (analogicznie do [`crate::sound::devices::update_analysis`], ale bez
+    /// żywego audio) — dzięki temu panel testowy demonstruje te same,
+    /// niezależne wskaźniki na radarze co prawdziwy dźwięk.
+    fn detect_test_direction_events(&mut self, rms: &[f32], rule_energies: &[Vec<f32>]) -> Vec<devices::DirectionEvent> {
+        direction::detect_onsets(rms, &mut self.test_onset_ema)
+            .into_iter()
+            .map(|onset| devices::DirectionEvent {
+                angle_deg: onset.angle_deg,
+                intensity: (onset.energy * direction::INTENSITY_SCALE).clamp(0.0, 1.0),
+                color_rgb: spectrum::resolve_color(
+                    &self.radar_config.color_rules,
+                    rule_energies.get(onset.channel_index).map(Vec::as_slice).unwrap_or(&[]),
+                ),
+            })
+            .collect()
     }
 
     /// Zasila [`RadarState`] bieżącą ramką poziomów RMS per kanał — albo z
@@ -205,8 +205,7 @@ impl HearRadarApp {
             let energies = self
                 .test_scenario
                 .synthetic_rule_energies(self.current_channels, self.test_phase, rule_count);
-            let (combined_angle, combined_intensity) = direction::compute_direction(&rms);
-            self.smooth_display_direction(combined_angle, combined_intensity);
+            let direction_events = self.detect_test_direction_events(&rms, &energies);
             self.radar_state.update(
                 now,
                 self.current_channels,
@@ -215,21 +214,27 @@ impl HearRadarApp {
                 &self.radar_config.color_rules,
                 self.radar_config.decay_secs,
                 self.radar_config.radar_sensitivity,
+                &direction_events,
             );
             return;
         }
 
-        let (channel_rms, channel_count, channel_rule_energies) = self
+        let (channel_rms, channel_count, channel_rule_energies, direction_events) = self
             .analysis
             .lock()
-            .map(|g| (g.channel_rms.clone(), g.channel_count, g.channel_rule_energies.clone()))
+            .map(|g| {
+                (
+                    g.channel_rms.clone(),
+                    g.channel_count,
+                    g.channel_rule_energies.clone(),
+                    g.active_direction_events.clone(),
+                )
+            })
             .unwrap_or_default();
 
         if channel_count > 0 {
             self.current_channels = channel_count;
         }
-        let (combined_angle, combined_intensity) = direction::compute_direction(&channel_rms);
-        self.smooth_display_direction(combined_angle, combined_intensity);
         self.radar_state.update(
             now,
             self.current_channels,
@@ -238,6 +243,7 @@ impl HearRadarApp {
             &self.radar_config.color_rules,
             self.radar_config.decay_secs,
             self.radar_config.radar_sensitivity,
+            &direction_events,
         );
     }
 
@@ -269,8 +275,7 @@ impl HearRadarApp {
             sr,
             &self.radar_config.color_rules,
         );
-        let (combined_angle, combined_intensity) = direction::compute_direction(&stats.rms);
-        self.smooth_display_direction(combined_angle, combined_intensity);
+        let direction_events = self.detect_test_direction_events(&stats.rms, &energies);
         self.radar_state.update(
             now,
             self.current_channels,
@@ -279,6 +284,7 @@ impl HearRadarApp {
             &self.radar_config.color_rules,
             self.radar_config.decay_secs,
             self.radar_config.radar_sensitivity,
+            &direction_events,
         );
     }
 
@@ -839,8 +845,6 @@ impl HearRadarApp {
             &mut self.radar_state,
             self.current_channels,
             now,
-            self.display_angle,
-            self.display_intensity,
         );
     }
 
@@ -888,8 +892,6 @@ impl HearRadarApp {
                 &mut self.radar_state,
                 self.current_channels,
                 now,
-                self.display_angle,
-                self.display_intensity,
                 self.radar_config.overlay_click_through,
             );
         }
@@ -930,8 +932,6 @@ impl HearRadarApp {
                     &mut self.radar_state,
                     channels,
                     now,
-                    self.display_angle,
-                    self.display_intensity,
                 );
 
                 // W trybie przezroczystym dla kliknięć okno w ogóle nie

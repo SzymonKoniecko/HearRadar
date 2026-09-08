@@ -1,6 +1,6 @@
-use crate::sound::devices::RadarConfig;
+use crate::sound::devices::{DirectionEvent, RadarConfig};
 use crate::sound::direction::{channel_layout, ChannelRole};
-use crate::sound::spectrum::{self, ColorRule};
+use crate::sound::spectrum::{resolve_color, ColorRule};
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 use std::collections::VecDeque;
 
@@ -48,21 +48,6 @@ impl RadarCanvas for Painter {
     }
 }
 
-/// Kolor używany, gdy nie da się ustalić dominującej reguły (np. lista reguł
-/// jest pusta) — neutralny cyjan, taki sam jak dawny "domyślny" kolor kropek.
-const FALLBACK_DOT_RGB: (u8, u8, u8) = (0, 220, 220);
-
-/// Wybiera kolor energetycznie dominującej reguły dla danego kanału. `energies`
-/// to lista energii w tej samej kolejności co `rules` (patrz
-/// [`spectrum::analyze_channel_rule_energies`]); gdy jest krótsza/pusta albo
-/// `rules` jest puste, zwraca [`FALLBACK_DOT_RGB`].
-fn resolve_color(rules: &[ColorRule], energies: &[f32]) -> (u8, u8, u8) {
-    spectrum::dominant_rule_index(energies)
-        .and_then(|i| rules.get(i))
-        .map(|r| (r.color[0], r.color[1], r.color[2]))
-        .unwrap_or(FALLBACK_DOT_RGB)
-}
-
 // ── Scenariusze testowe ───────────────────────────────────────────────────────
 //
 // Scenariusze generują syntetyczny poziom RMS (0.0..=1.0) na kanał, dokładnie
@@ -81,6 +66,14 @@ pub enum TestScenario {
     SinglePulse = 5,
     RampUp      = 6,
     Noise       = 7,
+    /// Dwa DOKŁADNIE przeciwstawne kanały (SL/SR, 180° od siebie), pulsujące
+    /// RÓWNOCZEŚNIE z podobną energią — dokładny przypadek, w którym dawny,
+    /// pojedynczy sumaryczny wskaźnik kierunku (suma wektorowa wszystkich
+    /// kanałów, patrz `direction::compute_direction`) dawał `sum≈0` i mylącą,
+    /// zanikającą strzałkę "z przodu", mimo że oba źródła realnie grają
+    /// (np. silnik z lewej + wybuch z prawej). Powinien pokazać DWA osobne,
+    /// niezależne wskaźniki kierunku naraz — po jednym na stronę.
+    OpposingSources = 8,
     /// Prawdziwa sinusoida o zadanej częstotliwości (Hz), puszczona przez
     /// TEN SAM potok analizy co żywe audio (`analyze_channels` +
     /// `spectrum::analyze_channel_bands`) — w przeciwieństwie do pozostałych
@@ -88,7 +81,7 @@ pub enum TestScenario {
     /// weryfikacji progów kolorowania pasm (200 Hz / 2 kHz) na żywo: przesuń
     /// suwak Hz i patrz, kiedy kropka zmienia kolor. Obsługiwane osobno w
     /// `HearRadarApp::tick_radar_state`, nie przez [`Self::generate`].
-    Tone        = 8,
+    Tone        = 9,
 }
 
 impl TestScenario {
@@ -101,6 +94,7 @@ impl TestScenario {
         Self::SinglePulse,
         Self::RampUp,
         Self::Noise,
+        Self::OpposingSources,
         Self::Tone,
     ];
 
@@ -113,7 +107,8 @@ impl TestScenario {
             5 => Self::SinglePulse,
             6 => Self::RampUp,
             7 => Self::Noise,
-            8 => Self::Tone,
+            8 => Self::OpposingSources,
+            9 => Self::Tone,
             _ => Self::Off,
         }
     }
@@ -128,6 +123,7 @@ impl TestScenario {
             Self::SinglePulse => "▲ Pojedynczy impuls (transient)",
             Self::RampUp      => "/ Klin rosnący",
             Self::Noise       => "≋ Szum losowy (seed)",
+            Self::OpposingSources => "⇄ Dwa przeciwstawne źródła naraz",
             Self::Tone        => "🎵 Ton o zadanym Hz (kolor pasma)",
         }
     }
@@ -159,6 +155,16 @@ impl TestScenario {
                         let s  = s.wrapping_add(seed.wrapping_mul(2_654_435_761));
                         let s2 = s.wrapping_add((phase * 1000.0) as u32);
                         s2 as f32 / u32::MAX as f32
+                    }
+                    Self::OpposingSources => {
+                        // SL i SR leżą dokładnie naprzeciw siebie (-90°/90°) —
+                        // pulsują RAZEM, żeby oba wywołały onset w tej samej
+                        // ramce (patrz doc-komentarz wariantu). Poza burstem
+                        // cichy szum tła, żeby EMA zdążyła opaść między pulsami.
+                        let role = channel_layout(channels).get(i).copied();
+                        let is_pair = matches!(role, Some(ChannelRole::SideLeft) | Some(ChannelRole::SideRight));
+                        let just_fired = (phase * 4.0).fract() < 0.15;
+                        if is_pair && just_fired { 0.8 } else { 0.02 }
                     }
                     // Obsługiwane osobno w `tick_radar_state` (potrzebuje realnych
                     // próbek, nie samego RMS) — tu tylko niegroźna wartość zapasowa.
@@ -227,8 +233,36 @@ pub struct ChannelDot {
     pub color_rgb: (u8, u8, u8),
 }
 
+/// Czas życia pojedynczego wskaźnika kierunku (onsetu) na tarczy — niezależny
+/// od `decay_secs` (który dotyczy kropek kanałów): onsety mają być krótkim,
+/// wyraźnym "błyskiem" pokazującym POJEDYNCZE zdarzenie, nie długo zanikającym
+/// echem.
+const DIRECTION_MARKER_LIFETIME_SECS: f64 = 1.0;
+
+/// Bezpiecznik pamięci — nie funkcjonalny limit widoczności (ten wynika z
+/// naturalnego zaniku po [`DIRECTION_MARKER_LIFETIME_SECS`]), tylko górna
+/// granica na wypadek nierealistycznie szybkiego strumienia zdarzeń.
+const MAX_DIRECTION_MARKERS: usize = 64;
+
+/// Pojedynczy, niezależny wskaźnik kierunku źródła dźwięku — jeden na każde
+/// wykryte zdarzenie (onset, patrz [`crate::sound::direction::detect_onsets`]),
+/// z WŁASNYM płynnym kątem i kolorem. W przeciwieństwie do dawnego,
+/// pojedynczego "beacona" (suma wektorowa wszystkich kanałów naraz), wiele
+/// jednoczesnych źródeł dostaje więc wiele niezależnych wskaźników zamiast
+/// jednego mylącego/znoszącego się wektora.
+#[derive(Clone, Copy, Debug)]
+pub struct DirectionMarker {
+    /// Czas powstania wskaźnika (sekundy, `egui::InputState::time`) — nadany
+    /// TU, w warstwie UI (ma dostęp do `now`), nie w warstwie audio.
+    pub spawned_at: f64,
+    pub angle_deg: f32,
+    pub intensity: f32,
+    pub color_rgb: (u8, u8, u8),
+}
+
 /// Stan radaru utrzymywany między klatkami: historia kropek per kanał,
-/// wygładzona energia (do detekcji transientów) i osobny wskaźnik LFE.
+/// wygładzona energia (do detekcji transientów), osobny wskaźnik LFE i
+/// aktywne wskaźniki kierunku (onsety).
 #[derive(Default)]
 pub struct RadarState {
     dots: Vec<VecDeque<ChannelDot>>,
@@ -239,6 +273,7 @@ pub struct RadarState {
     /// Kolor wskaźnika LFE wg jego własnej dominującej reguły (LFE to kanał
     /// audio jak każdy inny, więc też przechodzi przez `resolve_color`).
     pub lfe_color_rgb: (u8, u8, u8),
+    direction_markers: VecDeque<DirectionMarker>,
 }
 
 impl RadarState {
@@ -277,8 +312,21 @@ impl RadarState {
         rules: &[ColorRule],
         decay_secs: f32,
         sensitivity: f32,
+        direction_events: &[DirectionEvent],
     ) {
         self.ensure_capacity(channels);
+
+        for event in direction_events {
+            self.direction_markers.push_back(DirectionMarker {
+                spawned_at: now,
+                angle_deg: event.angle_deg,
+                intensity: event.intensity,
+                color_rgb: event.color_rgb,
+            });
+            while self.direction_markers.len() > MAX_DIRECTION_MARKERS {
+                self.direction_markers.pop_front();
+            }
+        }
 
         if now - self.last_spawn < SPAWN_INTERVAL_SECS {
             return;
@@ -329,6 +377,9 @@ impl RadarState {
                 dots.pop_front();
             }
         }
+        while matches!(self.direction_markers.front(), Some(m) if now - m.spawned_at > DIRECTION_MARKER_LIFETIME_SECS) {
+            self.direction_markers.pop_front();
+        }
     }
 }
 
@@ -337,14 +388,10 @@ impl RadarState {
 const LABELS: [&str; 4] = ["PRZÓD", "PRAWO", "TYŁ", "LEWO"];
 
 /// Rysuje minimalistyczny radar audio: tło, okręgi skali, krzyż kierunków,
-/// opcjonalne sektory 7.1, kropki kanałów (z zanikiem w czasie) i osobny
-/// wskaźnik LFE. `now` to bieżący czas w sekundach (do liczenia zaniku).
-/// `combined_angle_deg`/`combined_intensity` to sumaryczny kierunek dźwięku
-/// (kombinacja wektorowa wszystkich kanałów naraz, patrz
-/// [`crate::sound::direction::compute_direction`]) — w przeciwieństwie do
-/// kropek per-kanał poniżej (każda przy stałej pozycji swojego głośnika),
-/// ten JEDEN wskaźnik pokazuje, skąd dźwięk brzmi percepcyjnie: dla
-/// identycznego sygnału na L i R wypada na środku tarczy, nie po bokach.
+/// opcjonalne sektory 7.1, kropki kanałów (z zanikiem w czasie), osobny
+/// wskaźnik LFE i niezależne wskaźniki kierunku (jeden na każde wykryte
+/// zdarzenie dźwiękowe — onset, patrz [`DirectionMarker`]). `now` to bieżący
+/// czas w sekundach (do liczenia zaniku).
 pub fn draw_radar<C: RadarCanvas>(
     canvas: &C,
     center: Pos2,
@@ -352,8 +399,6 @@ pub fn draw_radar<C: RadarCanvas>(
     state: &mut RadarState,
     channels: usize,
     now: f64,
-    combined_angle_deg: f32,
-    combined_intensity: f32,
 ) {
     state.prune(now, cfg.decay_secs);
 
@@ -491,30 +536,32 @@ pub fn draw_radar<C: RadarCanvas>(
         draw_lfe_indicator(canvas, center, r, state.lfe_display, fg, lfe_rgb);
     }
 
-    // Percepcyjny kierunek źródła dźwięku — GŁÓWNA, dominująca informacja na
-    // radarze (rysowana na końcu, więc zawsze na wierzchu). Kropki per-kanał
-    // powyżej pokazują "który głośnik gra"; ta latarnia (strzałka + poświata,
-    // ciepły kolor odróżniony od reszty palety) pokazuje "skąd to brzmi" —
-    // percepcyjną kombinację wektorową wszystkich kanałów naraz (patrz
-    // [`crate::sound::direction::compute_direction`]), więc np. identyczny
-    // sygnał na L i R ląduje na środku, a nie po bokach jak kropki.
-    // Odrębny KSZTAŁT (nie kolejna kropka) + próg jasności/rozmiaru, który
-    // nigdy nie schodzi poniżej wyraźnie widocznego poziomu, żeby działała
-    // też w trybie wysokiego kontrastu, gdzie kolor sam w sobie nie
-    // wystarczy do odróżnienia. Pomijamy tylko przy faktycznej ciszy.
-    if combined_intensity > 0.02 {
-        let beacon_rgb = if hc { (255, 255, 255) } else { (255, 195, 40) };
-        let angle = combined_angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
+    // Niezależne wskaźniki kierunku — jeden na każde wykryte zdarzenie
+    // dźwiękowe (onset), rysowane na końcu, więc zawsze na wierzchu. Kropki
+    // per-kanał powyżej pokazują "który głośnik gra"; ta latarnia (strzałka +
+    // poświata, ciepły kolor odróżniony od reszty palety) pokazuje "skąd
+    // konkretnie zabrzmiało" — w przeciwieństwie do dawnego, pojedynczego
+    // sumarycznego wektora, dwa jednoczesne, przeciwstawne źródła dostają
+    // TERAZ dwa niezależne wskaźniki zamiast się wzajemnie znosić. Każdy
+    // wskaźnik gaśnie krótko i niezależnie od pozostałych.
+    for marker in &state.direction_markers {
+        let age = (now - marker.spawned_at) as f32;
+        if age < 0.0 || age > DIRECTION_MARKER_LIFETIME_SECS as f32 {
+            continue;
+        }
+        let life = 1.0 - (age / DIRECTION_MARKER_LIFETIME_SECS as f32).clamp(0.0, 1.0);
+        let alpha_frac = life.powf(1.6);
+
+        let beacon_rgb = if hc { (255, 255, 255) } else { marker.color_rgb };
+        let angle = marker.angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
         let dir = Vec2::new(angle.cos(), angle.sin());
         let perp = Vec2::new(-dir.y, dir.x);
-        let intensity = combined_intensity.clamp(0.0, 1.0);
+        let intensity = marker.intensity.clamp(0.0, 1.0);
 
         let marker_r = (intensity * r).clamp(10.0, r);
         let pos = center + dir * marker_r;
 
-        // Alpha nigdy nie schodzi poniżej ~40% — to ma być pierwsza rzecz,
-        // jaką widać na radarze, nie coś, co trzeba wypatrywać.
-        let alpha = ((intensity * 0.6 + 0.4) * 255.0 * fg).clamp(0.0, 255.0) as u8;
+        let alpha = ((intensity * 0.6 + 0.4) * 255.0 * fg * alpha_frac).clamp(0.0, 255.0) as u8;
         let beacon_color =
             Color32::from_rgba_unmultiplied(beacon_rgb.0, beacon_rgb.1, beacon_rgb.2, alpha);
         let glow_alpha = ((alpha as f32) * 0.3) as u8;

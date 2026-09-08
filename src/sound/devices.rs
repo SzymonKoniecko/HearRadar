@@ -113,10 +113,24 @@ impl MonoEar {
     }
 }
 
+/// Pojedyncze, niezależne zdarzenie dźwiękowe (onset) wykryte na jednym
+/// kanale w ostatniej ramce analizy — patrz [`crate::sound::direction::detect_onsets`].
+/// W przeciwieństwie do dawnego, sumarycznego `angle`/`intensity` powyżej
+/// (jeden wektor dla całej ramki, który dwa przeciwstawne źródła o podobnej
+/// energii potrafi wzajemnie znieść), tu każde zdarzenie niesie WŁASNY,
+/// płynny kąt i WŁASNY kolor. Nie niesie znacznika czasu — `spawned_at`
+/// nadaje dopiero `ui::radar_egui::RadarState::update`, która ma dostęp do
+/// zegara klatki UI (`egui::InputState::time`), spójnego z resztą wskaźników
+/// na radarze; wątek audio nie powinien stemplować czasu na własną rękę.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DirectionEvent {
+    pub angle_deg: f32,
+    pub intensity: f32,
+    pub color_rgb: (u8, u8, u8),
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioAnalysis {
-    pub angle: f32,          // -180° .. 0° (przód) .. +180°
-    pub intensity: f32,      // 0.0 .. 1.0
     pub peak_l: f32,
     pub peak_r: f32,
     /// Poziom RMS każdego kanału z ostatniej ramki analizy (patrz
@@ -131,6 +145,10 @@ pub struct AudioAnalysis {
     /// Patrz [`crate::sound::spectrum`]. Używane do kolorowania kropek radaru
     /// wg "typu" dźwięku, niezależnie od kierunku (kąta) kanału.
     pub channel_rule_energies: Vec<Vec<f32>>,
+    /// Niezależne zdarzenia kierunku (onsety) wykryte w ostatniej ramce —
+    /// patrz [`DirectionEvent`]. Zasila `RadarState::update`, które zamienia
+    /// każde w osobny, gasnący wskaźnik na radarze.
+    pub active_direction_events: Vec<DirectionEvent>,
     /// Indeks scenariusza testowego: 0 = live audio, 1..N = kolejne testy.
     /// Ustawiany przez UI Dioxus, odczytywany przez egui.
     pub test_scenario: u8,
@@ -161,6 +179,11 @@ pub struct SharedAudioAnalysis {
     /// powodził i routing w ogóle nie startował (błąd widoczny tylko w
     /// konsoli, niewidoczny w UI).
     mono_ring: Arc<Mutex<VecDeque<f32>>>,
+    /// Stan średniej kroczącej per kanał dla [`crate::sound::direction::detect_onsets`],
+    /// który musi przetrwać między kolejnymi wywołaniami `update_analysis`
+    /// (jeden callback cpal na ramkę) — stąd trzymany tu, obok `mono_ring`,
+    /// zamiast jako zmienna lokalna.
+    onset_ema: Arc<Mutex<Vec<f32>>>,
 }
 
 impl PartialEq for SharedAudioAnalysis {
@@ -174,6 +197,7 @@ impl Default for SharedAudioAnalysis {
         Self {
             inner: Arc::new(Mutex::new(AudioAnalysis::default())),
             mono_ring: Arc::new(Mutex::new(VecDeque::with_capacity(MONO_RING_CAPACITY))),
+            onset_ema: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -483,7 +507,6 @@ pub fn fetch_audio_from_device(
 
 fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis: &SharedAudioAnalysis) {
     let stats = analyze_channels(samples, channels);
-    let (angle, intensity) = direction::compute_direction(&stats.rms);
 
     // Reguły kolorowania mogą się zmienić w dowolnym momencie z panelu
     // ustawień (UI), więc czytamy je świeżo przy każdej ramce zamiast
@@ -494,22 +517,40 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         .unwrap_or_else(|_| spectrum::default_color_rules());
     let rule_energies = spectrum::analyze_channel_rule_energies(samples, channels, sample_rate, &rules);
 
+    // Niezależne zdarzenia kierunku: KAŻDY nagły skok energii na KAŻDYM
+    // kanale osobno, zamiast jednego sumarycznego wektora, który przy dwóch
+    // przeciwstawnych źródłach o podobnej energii potrafi się wyzerować
+    // (patrz doc-komentarz `direction::detect_onsets`).
+    let direction_events: Vec<DirectionEvent> = {
+        let mut ema_guard = analysis.onset_ema.lock().unwrap_or_else(|e| e.into_inner());
+        direction::detect_onsets(&stats.rms, &mut ema_guard)
+            .into_iter()
+            .map(|onset| DirectionEvent {
+                angle_deg: onset.angle_deg,
+                intensity: (onset.energy * direction::INTENSITY_SCALE).clamp(0.0, 1.0),
+                color_rgb: spectrum::resolve_color(
+                    &rules,
+                    rule_energies.get(onset.channel_index).map(Vec::as_slice).unwrap_or(&[]),
+                ),
+            })
+            .collect()
+    };
+
     let labels = ["L", "R", "C", "LFE", "RL", "RR", "SL", "SR"];
     let ch_str: Vec<String> = stats.rms.iter().enumerate().map(|(i, rms)| {
         let label = labels.get(i).copied().unwrap_or("?");
         let pct = (rms.clamp(0.0, 1.0) * 100.0).round() as u32;
         format!("{label}:{pct}")
     }).collect();
-    println!("[ch] {} | angle={:.1}° intensity={:.2}", ch_str.join(" "), angle, intensity);
-    println!("[analysis] angle={angle:.1}° intensity={intensity:.4} rms={:?}", &stats.rms);
+    println!("[ch] {} | onsets={}", ch_str.join(" "), direction_events.len());
+    println!("[analysis] rms={:?}", &stats.rms);
     if let Ok(mut lock) = analysis.lock() {
-        lock.angle = angle;
-        lock.intensity = intensity;
         lock.peak_l = stats.peak.first().copied().unwrap_or(0.0);
         lock.peak_r = stats.peak.get(1).copied().unwrap_or(0.0);
         lock.channel_rms = stats.rms;
         lock.channel_count = channels;
         lock.channel_rule_energies = rule_energies;
+        lock.active_direction_events = direction_events;
     }
 
     // Miks do mono na sam koniec — dopiero tu, dla ewentualnego odtwarzania
