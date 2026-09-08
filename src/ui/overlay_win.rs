@@ -162,6 +162,22 @@ impl RadarCanvas for SkiaCanvas<'_> {
             .fill_rect(sk_rect, &paint, Transform::identity(), None);
     }
 
+    fn triangle_filled(&self, points: [Pos2; 3], color: Color32) {
+        if color.a() == 0 {
+            return;
+        }
+        let mut pb = PathBuilder::new();
+        pb.move_to(points[0].x, points[0].y);
+        pb.line_to(points[1].x, points[1].y);
+        pb.line_to(points[2].x, points[2].y);
+        pb.close();
+        let Some(path) = pb.finish() else { return };
+        let paint = skia_paint(color);
+        self.pixmap
+            .borrow_mut()
+            .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+
     fn text(&self, _pos: Pos2, _anchor: Align2, _text: &str, _font: FontId, _color: Color32) {
         // tiny-skia nie ma silnika tekstu — etykiety kierunków (opcjonalne,
         // `RadarConfig::show_labels`) są tu po prostu pomijane. Prototype:
@@ -303,8 +319,6 @@ impl WinOverlay {
         state: &mut RadarState,
         channels: usize,
         now: f64,
-        combined_angle_deg: f32,
-        combined_intensity: f32,
         click_through: bool,
     ) {
         let size = overlay_size.round() as i32;
@@ -334,8 +348,6 @@ impl WinOverlay {
             state,
             channels,
             now,
-            combined_angle_deg,
-            combined_intensity,
         );
 
         let (x, y) = Self::position_from_anchor(overlay_size, cfg.anchor_x, cfg.anchor_y, screen_margin);

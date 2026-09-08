@@ -63,8 +63,8 @@ fn build_output_stream(
             move |out: &mut [f32], _| {
                 let frames = out.len() / out_channels.max(1);
                 let mono = analysis.read_mono(frames);
-                let ear = analysis.lock().map(|g| g.mono_ear).unwrap_or(MonoEar::Off);
-                fill_output_f32(out, &mono, out_channels, ear);
+                let (ear, gain) = read_ear_and_gain(&analysis);
+                fill_output_f32(out, &mono, out_channels, ear, gain);
             },
             err_fn,
             None,
@@ -74,10 +74,10 @@ fn build_output_stream(
             move |out: &mut [i16], _| {
                 let frames = out.len() / out_channels.max(1);
                 let mono = analysis.read_mono(frames);
-                let ear = analysis.lock().map(|g| g.mono_ear).unwrap_or(MonoEar::Off);
+                let (ear, gain) = read_ear_and_gain(&analysis);
                 // Konwersja f32 → i16
                 let mut tmp = vec![0.0f32; out.len()];
-                fill_output_f32(&mut tmp, &mono, out_channels, ear);
+                fill_output_f32(&mut tmp, &mono, out_channels, ear, gain);
                 for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
                     *dst = (src * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                 }
@@ -90,9 +90,9 @@ fn build_output_stream(
             move |out: &mut [u16], _| {
                 let frames = out.len() / out_channels.max(1);
                 let mono = analysis.read_mono(frames);
-                let ear = analysis.lock().map(|g| g.mono_ear).unwrap_or(MonoEar::Off);
+                let (ear, gain) = read_ear_and_gain(&analysis);
                 let mut tmp = vec![0.0f32; out.len()];
-                fill_output_f32(&mut tmp, &mono, out_channels, ear);
+                fill_output_f32(&mut tmp, &mono, out_channels, ear, gain);
                 for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
                     // f32 (-1..1) → u16 (0..65535), środek = 32768
                     *dst = ((src * 0.5 + 0.5) * u16::MAX as f32)
@@ -108,16 +108,35 @@ fn build_output_stream(
     Ok(stream)
 }
 
+/// Konwertuje decybele na liniowy mnożnik amplitudy (0 dB = 1.0×, +6 dB ≈
+/// 2×, -6 dB ≈ 0.5×) — standardowy wzór `10^(dB/20)`.
+fn db_to_linear(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+/// Czyta `mono_ear` i `radar_config.mono_boost_db` jednym lockiem i od razu
+/// zamienia dB na mnożnik — wołane raz na każdą ramkę callbacku wyjściowego.
+fn read_ear_and_gain(analysis: &SharedAudioAnalysis) -> (MonoEar, f32) {
+    let (ear, boost_db) = analysis
+        .lock()
+        .map(|g| (g.mono_ear, g.radar_config.mono_boost_db))
+        .unwrap_or((MonoEar::Off, 0.0));
+    (ear, db_to_linear(boost_db))
+}
+
 // ── Wypełnianie bufora wyjściowego ───────────────────────────────────────────
 
-/// Zapisuje `mono` do bufora wyjściowego interleaved.
+/// Zapisuje `mono` do bufora wyjściowego interleaved, ze wzmocnieniem `gain`
+/// (mnożnik liniowy, patrz [`db_to_linear`]) — dociśnięte do `-1.0..=1.0`,
+/// żeby duży boost dawał głośniej, a nie zawinięcie/trzaski przy konwersji
+/// do i16/u16 niżej w łańcuchu.
 /// Kanały poza `out_channels` są zerowane.
 /// `ear` decyduje który kanał stereo dostaje sygnał mono.
 #[inline]
-fn fill_output_f32(out: &mut [f32], mono: &[f32], out_channels: usize, ear: MonoEar) {
+fn fill_output_f32(out: &mut [f32], mono: &[f32], out_channels: usize, ear: MonoEar, gain: f32) {
     let ch = out_channels.max(1);
     for (frame_idx, frame) in out.chunks_exact_mut(ch).enumerate() {
-        let sample = mono.get(frame_idx).copied().unwrap_or(0.0);
+        let sample = (mono.get(frame_idx).copied().unwrap_or(0.0) * gain).clamp(-1.0, 1.0);
         for s in frame.iter_mut() {
             *s = 0.0;
         }
