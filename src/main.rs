@@ -7,9 +7,12 @@ use sound::devices::SharedAudioAnalysis;
 use ui::HearRadarApp;
 
 fn main() {
-    // Dubluje logi diagnostyczne (patrz `dlog!` w `sound::devices`/`mono_router`)
-    // do pliku `config/debug.log`, obok konsoli — patrz `debug_log::init`.
-    debug_log::init();
+    // Zapis do pliku wyłączony (patrz `debug_log::init`) — narósł do dziesiątek
+    // tysięcy linii w kilka minut i nie był już potrzebny. `dlog!` w
+    // `sound::devices`/`mono_router` bez wywołania `init()` samoistnie cichnie
+    // do samego `println!` na konsolę (patrz `debug_log::log_line`) — odkomentuj
+    // poniższe wywołanie, żeby wrócić do dublowania logów do `config/debug.log`.
+    // debug_log::init();
 
     let analysis = SharedAudioAnalysis::new();
 

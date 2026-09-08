@@ -12,8 +12,8 @@
 //! wątku, więc nie potrzebujemy tu własnej pętli `PeekMessage`.
 
 use crate::sound::devices::RadarConfig;
-use crate::ui::radar_egui::{draw_radar, RadarCanvas, RadarState};
-use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke};
+use crate::ui::radar_egui::{draw_edge_glow_indicators, draw_radar, RadarCanvas, RadarState};
+use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use std::cell::RefCell;
 use std::sync::Once;
 use tiny_skia::{FillRule, Paint, PathBuilder, PixmapMut, Transform};
@@ -223,7 +223,12 @@ pub struct WinOverlay {
     mem_dc: HDC,
     bitmap: HBITMAP,
     pixels: *mut u8,
-    size: i32,
+    /// Bufor DIB był dawniej zawsze kwadratowy (tarcza + margines), ale
+    /// `edge_glow_enabled` (patrz `RadarConfig::edge_glow_enabled`) potrzebuje
+    /// okna pokrywającego CAŁY monitor — rzadko kwadratowy — więc szerokość i
+    /// wysokość są teraz niezależne (patrz `resize`).
+    width: i32,
+    height: i32,
     visible: bool,
     click_through: bool,
 }
@@ -263,26 +268,28 @@ impl WinOverlay {
             mem_dc,
             bitmap: HBITMAP::default(),
             pixels: std::ptr::null_mut(),
-            size: 0,
+            width: 0,
+            height: 0,
             visible: false,
             click_through: true,
         };
-        overlay.resize(1)?;
+        overlay.resize(1, 1)?;
         Ok(overlay)
     }
 
-    fn resize(&mut self, size: i32) -> windows::core::Result<()> {
-        let size = size.max(1);
-        if size == self.size && !self.bitmap.is_invalid() {
+    fn resize(&mut self, width: i32, height: i32) -> windows::core::Result<()> {
+        let width = width.max(1);
+        let height = height.max(1);
+        if width == self.width && height == self.height && !self.bitmap.is_invalid() {
             return Ok(());
         }
 
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = size;
+        bmi.bmiHeader.biWidth = width;
         // Ujemna wysokość = bitmapa "top-down" (wiersz 0 na górze), tak jak
         // `tiny_skia::Pixmap` oczekuje przy pisaniu po bajtach.
-        bmi.bmiHeader.biHeight = -size;
+        bmi.bmiHeader.biHeight = -height;
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB.0;
@@ -303,8 +310,22 @@ impl WinOverlay {
 
         self.bitmap = bitmap;
         self.pixels = pixels as *mut u8;
-        self.size = size;
+        self.width = width;
+        self.height = height;
         Ok(())
+    }
+
+    /// Rozmiar głównego monitora w pikselach — potrzebny, żeby okno mogło
+    /// pokryć CAŁY ekran w trybie `edge_glow_enabled` (patrz
+    /// `render_and_present`), analogicznie do `monitor_size` z
+    /// `egui::ViewportInfo` na ścieżce nie-Windowsowej.
+    fn screen_size() -> (i32, i32) {
+        unsafe {
+            (
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+            )
+        }
     }
 
     pub fn set_click_through(&mut self, click_through: bool) {
@@ -337,12 +358,32 @@ impl WinOverlay {
         (x.round() as i32, y.round() as i32)
     }
 
-    /// Rysuje jedną klatkę radaru i wysyła ją na pulpit. Wołane co klatkę
-    /// `eframe` (patrz `HearRadarApp::tick_native_overlay`), analogicznie do
-    /// `ui_overlay_contents` w ścieżce nie-Windowsowej.
+    /// Środek tarczy WEWNĄTRZ okna o rozmiarze `width`x`height`, wg
+    /// `anchor_x`/`anchor_y` — dokładny odpowiednik `HearRadarApp::dial_center_in`
+    /// ze ścieżki nie-Windowsowej, potrzebny gdy okno pokrywa cały ekran
+    /// (`edge_glow_enabled`) i tarcza musi "pływać" w jego wnętrzu, zamiast
+    /// całe okno było przesuwane przez system w róg.
+    fn dial_center_in(width: i32, height: i32, dial_size: f32, anchor_x: f32, anchor_y: f32, margin: f32) -> Pos2 {
+        let usable_w = (width as f32 - dial_size - 2.0 * margin).max(0.0);
+        let usable_h = (height as f32 - dial_size - 2.0 * margin).max(0.0);
+        let x = margin + anchor_x * usable_w + dial_size / 2.0;
+        let y = margin + anchor_y * usable_h + dial_size / 2.0;
+        Pos2::new(x, y)
+    }
+
+    /// Rysuje jedną klatkę radaru (i, przy `edge_glow_enabled`, poświaty na
+    /// krawędzi ekranu — patrz `radar_egui::draw_edge_glow_indicators`) i
+    /// wysyła ją na pulpit. Wołane co klatkę `eframe` (patrz
+    /// `HearRadarApp::tick_native_overlay`), analogicznie do
+    /// `ui_overlay_contents` w ścieżce nie-Windowsowej. `dial_size` to
+    /// średnica samej tarczy + margines (`radius * 2 + OVERLAY_PADDING`) —
+    /// przy wyłączonym `edge_glow_enabled` to też rozmiar CAŁEGO okna (jak
+    /// dawniej); przy włączonym okno rozciąga się na cały monitor, a
+    /// `dial_size` służy tylko do wyliczenia, gdzie w jego wnętrzu wypada
+    /// środek tarczy.
     pub fn render_and_present(
         &mut self,
-        overlay_size: f32,
+        dial_size: f32,
         screen_margin: f32,
         cfg: &RadarConfig,
         state: &mut RadarState,
@@ -350,26 +391,41 @@ impl WinOverlay {
         now: f64,
         click_through: bool,
     ) {
-        let size = overlay_size.round() as i32;
-        if self.resize(size).is_err() {
+        let (width, height, x, y, center) = if cfg.edge_glow_enabled {
+            let (screen_w, screen_h) = Self::screen_size();
+            let center = Self::dial_center_in(
+                screen_w,
+                screen_h,
+                dial_size,
+                cfg.anchor_x,
+                cfg.anchor_y,
+                screen_margin,
+            );
+            (screen_w, screen_h, 0, 0, center)
+        } else {
+            let size = dial_size.round() as i32;
+            let (x, y) = Self::position_from_anchor(dial_size, cfg.anchor_x, cfg.anchor_y, screen_margin);
+            (size, size, x, y, Pos2::new(size as f32 / 2.0, size as f32 / 2.0))
+        };
+
+        if self.resize(width, height).is_err() {
             return;
         }
 
         self.set_click_through(click_through);
 
-        let len = (self.size as usize) * (self.size as usize) * 4;
+        let len = (self.width as usize) * (self.height as usize) * 4;
         // Bezpieczne: `self.pixels` wskazuje na bufor DIB o dokładnie takiej
         // długości, żywy tak długo jak `self.bitmap` (odtwarzany w `resize`
         // razem z tym wskaźnikiem).
         let bytes = unsafe { std::slice::from_raw_parts_mut(self.pixels, len) };
-        let Some(mut pixmap) = PixmapMut::from_bytes(bytes, self.size as u32, self.size as u32)
+        let Some(mut pixmap) = PixmapMut::from_bytes(bytes, self.width as u32, self.height as u32)
         else {
             return;
         };
         pixmap.fill(tiny_skia::Color::TRANSPARENT);
 
         let canvas = SkiaCanvas { pixmap: RefCell::new(pixmap) };
-        let center = Pos2::new(self.size as f32 / 2.0, self.size as f32 / 2.0);
         draw_radar(
             &canvas,
             center,
@@ -378,8 +434,10 @@ impl WinOverlay {
             channels,
             now,
         );
-
-        let (x, y) = Self::position_from_anchor(overlay_size, cfg.anchor_x, cfg.anchor_y, screen_margin);
+        if cfg.edge_glow_enabled {
+            let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(self.width as f32, self.height as f32));
+            draw_edge_glow_indicators(&canvas, screen_rect, state, now, cfg);
+        }
 
         unsafe {
             let _ = SetWindowPos(
@@ -387,8 +445,8 @@ impl WinOverlay {
                 None,
                 x,
                 y,
-                self.size,
-                self.size,
+                self.width,
+                self.height,
                 SWP_NOACTIVATE | SWP_NOZORDER,
             );
         }
@@ -402,7 +460,7 @@ impl WinOverlay {
 
         let src_pos = windows::Win32::Foundation::POINT { x: 0, y: 0 };
         let dst_pos = windows::Win32::Foundation::POINT { x, y };
-        let win_size = windows::Win32::Foundation::SIZE { cx: self.size, cy: self.size };
+        let win_size = windows::Win32::Foundation::SIZE { cx: self.width, cy: self.height };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
