@@ -646,6 +646,12 @@ impl HearRadarApp {
             .changed();
         changed |= ui
             .checkbox(
+                &mut self.radar_config.show_channel_dots,
+                "Kropki kanałów (ślad energii głośników w czasie)",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
                 &mut self.radar_config.show_labels,
                 "Etykiety kierunków (PRZÓD/TYŁ/LEWO/PRAWO)",
             )

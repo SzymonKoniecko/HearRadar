@@ -467,66 +467,71 @@ pub fn draw_radar<C: RadarCanvas>(
         }
     }
 
-    // Kropki kanałów.
+    // Kropki kanałów — opcjonalne (patrz `RadarConfig::show_channel_dots`);
+    // niezależne wskaźniki kierunku (markery, dalej w tej funkcji) rysują się
+    // zawsze, bez względu na ten przełącznik. `layout` jest potrzebny także
+    // niżej (wskaźnik LFE), więc żyje poza blokiem `if`.
     let layout = channel_layout(channels);
-    for (i, dots) in state.dots.iter().enumerate() {
-        let Some(role) = layout.get(i).copied() else { continue };
-        let Some(angle_deg) = role.radar_angle_degrees() else { continue }; // LFE ma osobny wskaźnik
-        let angle = angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
+    if cfg.show_channel_dots {
+        for (i, dots) in state.dots.iter().enumerate() {
+            let Some(role) = layout.get(i).copied() else { continue };
+            let Some(angle_deg) = role.radar_angle_degrees() else { continue }; // LFE ma osobny wskaźnik
+            let angle = angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
 
-        for dot in dots {
-            let age = (now - dot.spawned_at) as f32;
-            if age < 0.0 || age > cfg.decay_secs {
-                continue;
-            }
-            let life = 1.0 - (age / cfg.decay_secs).clamp(0.0, 1.0);
-            // Zanik przyspiesza pod koniec życia kropki (nie liniowo).
-            let alpha_frac = life.powf(1.6);
+            for dot in dots {
+                let age = (now - dot.spawned_at) as f32;
+                if age < 0.0 || age > cfg.decay_secs {
+                    continue;
+                }
+                let life = 1.0 - (age / cfg.decay_secs).clamp(0.0, 1.0);
+                // Zanik przyspiesza pod koniec życia kropki (nie liniowo).
+                let alpha_frac = life.powf(1.6);
 
-            let dot_r = (dot.energy * r).max(6.0).min(r);
-            let x = center.x + dot_r * angle.cos();
-            let y = center.y + dot_r * angle.sin();
+                let dot_r = (dot.energy * r).max(6.0).min(r);
+                let x = center.x + dot_r * angle.cos();
+                let y = center.y + dot_r * angle.sin();
 
-            let size = (2.0 + dot.energy * 4.0) * (0.5 + 0.5 * life);
-            let alpha = (dot.energy * 180.0 + 50.0) * fg * alpha_frac;
-            let pos = Pos2::new(x, y);
+                let size = (2.0 + dot.energy * 4.0) * (0.5 + 0.5 * life);
+                let alpha = (dot.energy * 180.0 + 50.0) * fg * alpha_frac;
+                let pos = Pos2::new(x, y);
 
-            // Kolor koduje "typ" dźwięku wg reguł użytkownika (patrz
-            // `resolve_color`, ustalone raz przy powstaniu kropki). W trybie
-            // wysokiego kontrastu wyłączamy to i wracamy do jednej barwy, żeby
-            // nie polegać wyłącznie na kolorze (rozróżnienie zostaje przez
-            // kąt/rozmiar/kształt).
-            let rgb = if hc { dot_rgb } else { dot.color_rgb };
+                // Kolor koduje "typ" dźwięku wg reguł użytkownika (patrz
+                // `resolve_color`, ustalone raz przy powstaniu kropki). W trybie
+                // wysokiego kontrastu wyłączamy to i wracamy do jednej barwy, żeby
+                // nie polegać wyłącznie na kolorze (rozróżnienie zostaje przez
+                // kąt/rozmiar/kształt).
+                let rgb = if hc { dot_rgb } else { dot.color_rgb };
 
-            // Styl kropki zmienia się wraz z jej wiekiem, żeby powolne
-            // wygasanie dźwięku było czytelne nie tylko przez przezroczystość,
-            // ale przez samą formę: świeża kropka ma pełne wypełnienie i
-            // delikatną poświatę, w połowie życia traci poświatę, a tuż przed
-            // zniknięciem "rozpuszcza się" w pusty, kurczący się pierścień.
-            if life > 0.66 {
-                let glow_alpha = (alpha * 0.35).clamp(0.0, 255.0) as u8;
-                let glow_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, glow_alpha);
-                canvas.circle_filled(pos, size * 2.0, glow_color);
-                let color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha.clamp(0.0, 255.0) as u8);
-                canvas.circle_filled(pos, size, color);
-            } else if life > 0.33 {
-                let color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha.clamp(0.0, 255.0) as u8);
-                canvas.circle_filled(pos, size, color);
-            } else {
-                // Mocniejszy kontur niż wypełnienie miałoby przy tej alpha,
-                // żeby cienki pierścień był wciąż widoczny tuż przed zniknięciem.
-                let ring_alpha = (alpha * 1.6).clamp(0.0, 255.0) as u8;
-                let stroke_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, ring_alpha);
-                canvas.circle_stroke(pos, size.max(1.5), Stroke::new(1.0 * lt, stroke_color));
-            }
+                // Styl kropki zmienia się wraz z jej wiekiem, żeby powolne
+                // wygasanie dźwięku było czytelne nie tylko przez przezroczystość,
+                // ale przez samą formę: świeża kropka ma pełne wypełnienie i
+                // delikatną poświatę, w połowie życia traci poświatę, a tuż przed
+                // zniknięciem "rozpuszcza się" w pusty, kurczący się pierścień.
+                if life > 0.66 {
+                    let glow_alpha = (alpha * 0.35).clamp(0.0, 255.0) as u8;
+                    let glow_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, glow_alpha);
+                    canvas.circle_filled(pos, size * 2.0, glow_color);
+                    let color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha.clamp(0.0, 255.0) as u8);
+                    canvas.circle_filled(pos, size, color);
+                } else if life > 0.33 {
+                    let color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha.clamp(0.0, 255.0) as u8);
+                    canvas.circle_filled(pos, size, color);
+                } else {
+                    // Mocniejszy kontur niż wypełnienie miałoby przy tej alpha,
+                    // żeby cienki pierścień był wciąż widoczny tuż przed zniknięciem.
+                    let ring_alpha = (alpha * 1.6).clamp(0.0, 255.0) as u8;
+                    let stroke_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, ring_alpha);
+                    canvas.circle_stroke(pos, size.max(1.5), Stroke::new(1.0 * lt, stroke_color));
+                }
 
-            // Nagły skok energii: krótki, gasnący pierścień wokół kropki.
-            if dot.transient && age < 0.25 {
-                let ring_life = 1.0 - (age / 0.25);
-                let ring_r = size + 3.0 + (0.25 - age) * 40.0;
-                let ring_alpha = (200.0 * ring_life * fg) as u8;
-                let ring_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, ring_alpha);
-                canvas.circle_stroke(Pos2::new(x, y), ring_r, Stroke::new(1.5 * lt, ring_color));
+                // Nagły skok energii: krótki, gasnący pierścień wokół kropki.
+                if dot.transient && age < 0.25 {
+                    let ring_life = 1.0 - (age / 0.25);
+                    let ring_r = size + 3.0 + (0.25 - age) * 40.0;
+                    let ring_alpha = (200.0 * ring_life * fg) as u8;
+                    let ring_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, ring_alpha);
+                    canvas.circle_stroke(Pos2::new(x, y), ring_r, Stroke::new(1.5 * lt, ring_color));
+                }
             }
         }
     }

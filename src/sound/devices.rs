@@ -77,9 +77,21 @@ pub struct RadarConfig {
     /// pola) nie wyzerowało linii do niewidocznych.
     #[serde(default = "default_line_thickness")]
     pub line_thickness: f32,
+    /// Rysowanie kropek kanałów (ślad energii każdego głośnika, z zanikiem
+    /// w czasie) — NIEZALEŻNE od niezależnych wskaźników kierunku (onsety,
+    /// patrz `ui::radar_egui::DirectionMarker`), które rysują się zawsze.
+    /// Wyłączenie zostawia samą tarczę + markery, bez "szumu" tła kropek.
+    /// `#[serde(default = ...)]` na `true`, żeby wczytanie starszego pliku
+    /// konfiguracji (sprzed tego pola) zachowało dotychczasowy wygląd.
+    #[serde(default = "default_show_channel_dots")]
+    pub show_channel_dots: bool,
 }
 
 fn default_overlay_click_through() -> bool {
+    true
+}
+
+fn default_show_channel_dots() -> bool {
     true
 }
 
@@ -108,6 +120,7 @@ impl Default for RadarConfig {
             radar_sensitivity: default_radar_sensitivity(),
             edge_glow_enabled: false,
             line_thickness: default_line_thickness(),
+            show_channel_dots: default_show_channel_dots(),
         }
     }
 }
