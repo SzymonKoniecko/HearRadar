@@ -16,6 +16,8 @@ use crate::sound::direction;
 use crate::sound::mono_router::{self, MonoRouter};
 use crate::sound::spectrum;
 use crate::ui::radar_egui::{RadarState, TestScenario, draw_radar};
+#[cfg(not(windows))]
+use crate::ui::radar_egui::draw_edge_glow_indicators;
 use eframe::egui;
 #[cfg(not(windows))]
 use egui::{ViewportBuilder, ViewportCommand, ViewportId};
@@ -636,6 +638,12 @@ impl HearRadarApp {
             )
             .changed();
         changed |= ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.line_thickness, 0.3..=3.0)
+                    .text("Grubość linii"),
+            )
+            .changed();
+        changed |= ui
             .checkbox(
                 &mut self.radar_config.show_labels,
                 "Etykiety kierunków (PRZÓD/TYŁ/LEWO/PRAWO)",
@@ -647,6 +655,18 @@ impl HearRadarApp {
                 "Wysoki kontrast (monochromatyczny)",
             )
             .changed();
+        let edge_glow_changed = ui
+            .checkbox(
+                &mut self.radar_config.edge_glow_enabled,
+                "🖥 Poświata na krawędzi ekranu (drugi tryb wizualizacji, obok tarczy)",
+            )
+            .changed();
+        if edge_glow_changed {
+            // Zmienia rozmiar/pozycję OKNA overlay (mały kwadrat <-> cały
+            // ekran, patrz `overlay_window_geometry`), nie tylko jego treść.
+            self.overlay_reposition_pending = true;
+        }
+        changed |= edge_glow_changed;
 
         ui.separator();
         changed |= ui
@@ -867,6 +887,41 @@ impl HearRadarApp {
         Some(egui::pos2(x, y))
     }
 
+    /// Docelowa pozycja/rozmiar OKNA overlay, w dwóch trybach: normalnie mały
+    /// kwadrat dokładnie wokół tarczy, pozycjonowany w rogu wg
+    /// [`Self::overlay_anchored_position`]; przy `edge_glow_enabled` (patrz
+    /// [`RadarConfig::edge_glow_enabled`]) — cały ekran, zawsze od `(0, 0)`,
+    /// żeby `ui_overlay_contents` mogło rysować poświaty na PRAWDZIWEJ
+    /// krawędzi monitora, a nie krawędzi małego okienka. `None`, dopóki
+    /// system nie zdąży zgłosić rozmiaru monitora.
+    #[cfg(not(windows))]
+    fn overlay_window_geometry(&self, ctx: &egui::Context, dial_size: f32) -> Option<(egui::Pos2, egui::Vec2)> {
+        if self.radar_config.edge_glow_enabled {
+            let monitor_size = ctx.input(|i| i.viewport().monitor_size)?;
+            if monitor_size.x <= 1.0 || monitor_size.y <= 1.0 {
+                return None;
+            }
+            Some((egui::Pos2::ZERO, monitor_size))
+        } else {
+            let pos = self.overlay_anchored_position(ctx, dial_size)?;
+            Some((pos, egui::vec2(dial_size, dial_size)))
+        }
+    }
+
+    /// Środek tarczy radaru WEWNĄTRZ `rect` (lokalne współrzędne okna
+    /// overlay), wg `anchor_x`/`anchor_y` — używane tylko gdy okno pokrywa
+    /// cały ekran (`edge_glow_enabled`), bo wtedy to tarcza musi "pływać" w
+    /// obrębie okna, zamiast całe okno być przesuwane przez system w róg
+    /// (patrz [`Self::overlay_anchored_position`] dla trybu przeciwnego).
+    #[cfg(not(windows))]
+    fn dial_center_in(&self, rect: egui::Rect, dial_size: f32) -> egui::Pos2 {
+        let usable_w = (rect.width() - dial_size - 2.0 * OVERLAY_SCREEN_MARGIN).max(0.0);
+        let usable_h = (rect.height() - dial_size - 2.0 * OVERLAY_SCREEN_MARGIN).max(0.0);
+        let x = rect.left() + OVERLAY_SCREEN_MARGIN + self.radar_config.anchor_x * usable_w + dial_size / 2.0;
+        let y = rect.top() + OVERLAY_SCREEN_MARGIN + self.radar_config.anchor_y * usable_h + dial_size / 2.0;
+        egui::pos2(x, y)
+    }
+
     /// Ścieżka Windows: renderuje jedną klatkę natywnego okna warstwowego
     /// zamiast viewportu `eframe` (patrz pole `win_overlay` i moduł
     /// `ui::overlay_win`). Tworzy okno leniwie przy pierwszym wywołaniu.
@@ -909,11 +964,13 @@ impl HearRadarApp {
         let mut close_requested = false;
         let now = ctx.input(|i| i.time);
         let channels = self.current_channels;
-        let overlay_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
+        let dial_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
         let click_through = self.radar_config.overlay_click_through;
+        let edge_glow = self.radar_config.edge_glow_enabled;
 
         if self.overlay_reposition_pending {
-            if let Some(pos) = self.overlay_anchored_position(&ctx, overlay_size) {
+            if let Some((pos, size)) = self.overlay_window_geometry(&ctx, dial_size) {
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
                 ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
                 self.overlay_reposition_pending = false;
             }
@@ -923,7 +980,16 @@ impl HearRadarApp {
             .frame(egui::Frame::NONE)
             .show(root_ui, |ui| {
                 let rect = ui.max_rect();
-                let center = rect.center();
+                // Normalnie okno JEST dokładnie tarczą, więc jej środek to po
+                // prostu środek okna. Przy `edge_glow` okno pokrywa cały
+                // ekran, więc tarcza musi "pływać" wewnątrz niego wg anchora
+                // (patrz [`Self::dial_center_in`]) zamiast całe okno było
+                // przesuwane przez system.
+                let center = if edge_glow {
+                    self.dial_center_in(rect, dial_size)
+                } else {
+                    rect.center()
+                };
                 let painter = ui.painter();
                 draw_radar(
                     painter,
@@ -933,20 +999,28 @@ impl HearRadarApp {
                     channels,
                     now,
                 );
+                if edge_glow {
+                    draw_edge_glow_indicators(painter, rect, &self.radar_state, now, &self.radar_config);
+                }
 
                 // W trybie przezroczystym dla kliknięć okno w ogóle nie
                 // odbiera zdarzeń myszy (system kieruje je do gry pod spodem),
                 // więc przeciąganie i przycisk zamknięcia mają sens tylko gdy
                 // click-through jest chwilowo wyłączony do repozycjonowania.
                 if !click_through {
-                    let drag_response =
-                        ui.interact(rect, ui.id().with("overlay_drag"), egui::Sense::drag());
-                    if drag_response.drag_started() {
+                    let dial_rect = egui::Rect::from_center_size(center, egui::vec2(dial_size, dial_size));
+                    // Przy `edge_glow` okno pokrywa cały ekran, więc
+                    // przeciąganie CAŁEGO OKNA nie ma sensu (nie ma dokąd je
+                    // przesunąć — ma zawsze pokrywać cały monitor); pozycję
+                    // tarczy reguluje się wtedy wyłącznie suwakami Pozycja X/Y.
+                    let sense = if edge_glow { egui::Sense::click() } else { egui::Sense::drag() };
+                    let drag_response = ui.interact(dial_rect, ui.id().with("overlay_drag"), sense);
+                    if !edge_glow && drag_response.drag_started() {
                         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                     }
 
                     egui::Area::new(ui.id().with("overlay_close_area"))
-                        .fixed_pos(rect.left_top() + egui::vec2(6.0, 6.0))
+                        .fixed_pos(dial_rect.left_top() + egui::vec2(6.0, 6.0))
                         .show(&ctx, |ui| {
                             if ui
                                 .small_button("⚙")
@@ -1034,12 +1108,27 @@ impl eframe::App for HearRadarApp {
             // warstwowym (`ui::overlay_win`, patrz gałąź `#[cfg(windows)]`
             // wyżej) — `eframe`'owa przezroczystość okna jest tam
             // niewiarygodna (czarne tło z `glow`, białe z `wgpu`).
-            let overlay_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
+            //
+            // Gdy `edge_glow_enabled`, okno musi rozciągnąć się na CAŁY ekran
+            // zamiast małego kwadratu wokół tarczy — inaczej "krawędź ekranu"
+            // (patrz `radar_egui::draw_edge_glow_indicators`) byłaby tylko
+            // krawędzią tego małego kwadratu, nie prawdziwym brzegiem
+            // monitora. Rozmiar startowy liczymy tak samo jak docelowy w
+            // `overlay_window_geometry` — `overlay_reposition_pending`
+            // (ustawiane też przy każdej zmianie tej flagi w ustawieniach)
+            // i tak zaraz doda dokładną pozycję/rozmiar przez komendy viewportu.
+            let dial_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
+            let initial_size = if self.radar_config.edge_glow_enabled {
+                ctx.input(|i| i.viewport().monitor_size)
+                    .unwrap_or(egui::vec2(dial_size, dial_size))
+            } else {
+                egui::vec2(dial_size, dial_size)
+            };
             let close_requested = ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("hear_radar_overlay"),
                 ViewportBuilder::default()
                     .with_title("HearRadar — Overlay")
-                    .with_inner_size([overlay_size, overlay_size])
+                    .with_inner_size(initial_size)
                     .with_decorations(false)
                     .with_transparent(true)
                     .with_always_on_top()

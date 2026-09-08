@@ -405,6 +405,9 @@ pub fn draw_radar<C: RadarCanvas>(
     let r = cfg.radius;
     let fg = cfg.fg_alpha;
     let hc = cfg.high_contrast;
+    // Mnożnik grubości WSZYSTKICH linii poniżej (okręgi, krzyż, sektory,
+    // obrysy) — `1.0` odtwarza dawne, sztywne szerokości.
+    let lt = cfg.line_thickness.max(0.0);
 
     // Paleta: kolorowa (domyślna, zielono-cyjanowa) albo monochromatyczna
     // (wysoki kontrast) — rozróżnienie kropek zawsze przez kąt/rozmiar/jasność,
@@ -427,19 +430,19 @@ pub fn draw_radar<C: RadarCanvas>(
     // fizyczna odległość.
     for frac in [1.0f32, 0.66, 0.33] {
         let color = if frac == 1.0 { with_alpha(c_ring, fg) } else { with_alpha(c_inner, fg) };
-        let width = if frac == 1.0 { 1.5 } else { 0.8 };
+        let width = (if frac == 1.0 { 1.5 } else { 0.8 }) * lt;
         canvas.circle_stroke(center, r * frac, Stroke::new(width, color));
     }
 
     // Krzyż kierunków.
-    let cross = Stroke::new(0.8, with_alpha(c_cross, fg));
+    let cross = Stroke::new(0.8 * lt, with_alpha(c_cross, fg));
     canvas.line_segment([center - Vec2::new(0.0, r), center + Vec2::new(0.0, r)], cross);
     canvas.line_segment([center - Vec2::new(r, 0.0), center + Vec2::new(r, 0.0)], cross);
 
     // Bardzo delikatne linie sektorów co 45° — tylko w układzie 7.1, gdzie
     // każdy z 8 kierunków ma osobny kanał.
     if channels == 8 {
-        let sector = Stroke::new(0.5, with_alpha(c_cross, fg * 0.4));
+        let sector = Stroke::new(0.5 * lt, with_alpha(c_cross, fg * 0.4));
         for k in 0..8 {
             let a = (k as f32) * std::f32::consts::FRAC_PI_4 - std::f32::consts::FRAC_PI_2;
             let p = center + Vec2::new(a.cos(), a.sin()) * r;
@@ -514,7 +517,7 @@ pub fn draw_radar<C: RadarCanvas>(
                 // żeby cienki pierścień był wciąż widoczny tuż przed zniknięciem.
                 let ring_alpha = (alpha * 1.6).clamp(0.0, 255.0) as u8;
                 let stroke_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, ring_alpha);
-                canvas.circle_stroke(pos, size.max(1.5), Stroke::new(1.0, stroke_color));
+                canvas.circle_stroke(pos, size.max(1.5), Stroke::new(1.0 * lt, stroke_color));
             }
 
             // Nagły skok energii: krótki, gasnący pierścień wokół kropki.
@@ -523,7 +526,7 @@ pub fn draw_radar<C: RadarCanvas>(
                 let ring_r = size + 3.0 + (0.25 - age) * 40.0;
                 let ring_alpha = (200.0 * ring_life * fg) as u8;
                 let ring_color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, ring_alpha);
-                canvas.circle_stroke(Pos2::new(x, y), ring_r, Stroke::new(1.5, ring_color));
+                canvas.circle_stroke(Pos2::new(x, y), ring_r, Stroke::new(1.5 * lt, ring_color));
             }
         }
     }
@@ -575,10 +578,10 @@ pub fn draw_radar<C: RadarCanvas>(
         let left = base_center + perp * head_w * 0.5;
         let right = base_center - perp * head_w * 0.5;
 
-        canvas.line_segment([center, base_center], Stroke::new(2.2, beacon_color));
+        canvas.line_segment([center, base_center], Stroke::new(2.2 * lt, beacon_color));
         canvas.circle_filled(pos, head_w * 1.1, glow_color);
         canvas.triangle_filled([tip, left, right], beacon_color);
-        canvas.circle_stroke(pos, head_w * 1.1, Stroke::new(1.0, beacon_color));
+        canvas.circle_stroke(pos, head_w * 1.1, Stroke::new(1.0 * lt, beacon_color));
     }
 }
 
@@ -592,4 +595,127 @@ fn draw_lfe_indicator<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, level: f
     let fill_w = w * level.clamp(0.0, 1.0);
     let fill = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, (220.0 * fg) as u8);
     canvas.rect_filled(egui::Rect::from_min_size(top_left, Vec2::new(fill_w, h)), 2.0, fill);
+}
+
+// ── Drugi tryb wizualizacji: poświaty na krawędzi ekranu ──────────────────────
+//
+// Peryferyjna podpowiedź kierunku w stylu "screen edge indicator" ze
+// strzelanek (np. wskaźnik obrażeń) — OBOK tarczy radaru, nie zamiast niej.
+// W przeciwieństwie do wskaźników na tarczy (przypięte do promienia wokół
+// `center`, widoczne tylko gdy patrzy się wprost na mały radar w rogu), ta
+// poświata pojawia się na faktycznej krawędzi całego ekranu, więc jest
+// czytelna kątem oka niezależnie od tego, gdzie akurat skupiony jest wzrok.
+// Wymaga overlay rozciągniętego na cały ekran (patrz `RadarConfig::edge_glow_enabled`
+// i `HearRadarApp::ui_overlay_contents`) — bez tego `screen_rect` byłby tylko
+// małym kwadratem wokół tarczy, a "krawędź ekranu" nie miałaby sensu.
+
+/// Jak daleko w głąb ekranu sięga najszersza (najbardziej zewnętrzna) warstwa
+/// poświaty.
+const EDGE_GLOW_MAX_DEPTH: f32 = 160.0;
+/// Jak długi (wzdłuż krawędzi) jest najszerszy pas poświaty.
+const EDGE_GLOW_MAX_SPAN: f32 = 320.0;
+/// Kolejne warstwy poświaty od najbardziej zewnętrznej (największa, najbardziej
+/// przezroczysta — efekt miękkiego gasnięcia w głąb ekranu) do najbardziej
+/// wewnętrznej (najmniejsza, najintensywniejsza, tuż przy samej krawędzi).
+/// `(ułamek rozmiaru, ułamek alfy)`.
+const EDGE_GLOW_LAYERS: [(f32, f32); 4] = [(1.0, 0.10), (0.7, 0.22), (0.45, 0.4), (0.22, 0.7)];
+
+/// Zwraca kierunek jednostkowy na ekranie dla danego kąta (konwencja jak w
+/// [`draw_radar`]: `0°` = góra ekranu/przód, kąty rosną zgodnie ze wskazówkami
+/// zegara).
+fn screen_direction(angle_deg: f32) -> Vec2 {
+    let angle = angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
+    Vec2::new(angle.cos(), angle.sin())
+}
+
+/// Znajduje punkt na obwodzie `screen_rect`, w którym promień wystrzelony ze
+/// środka ekranu w kierunku `dir` przecina krawędź — klasyczna metoda
+/// przecięcia promień/prostokąt (porównanie parametrów `t` dla obu par
+/// krawędzi, mniejszy wygrywa). Zwraca też, czy trafioną krawędzią jest
+/// lewa/prawa (pionowa) czy góra/dół (pozioma) — to decyduje o orientacji
+/// narysowanego pasa poświaty.
+fn edge_intersection(screen_rect: Rect, dir: Vec2) -> (Pos2, bool) {
+    let half = screen_rect.size() * 0.5;
+    let t_x = if dir.x.abs() > 1e-4 { half.x / dir.x.abs() } else { f32::INFINITY };
+    let t_y = if dir.y.abs() > 1e-4 { half.y / dir.y.abs() } else { f32::INFINITY };
+    let t = t_x.min(t_y);
+    let point = screen_rect.center() + dir * t;
+    (point, t_x <= t_y)
+}
+
+/// Rysuje jedną, wielowarstwową poświatę przy krawędzi ekranu najbliższej
+/// `point` — miękkie gasnięcie w głąb ekranu, symulowane kilkoma nałożonymi,
+/// coraz mniejszymi i coraz bardziej nieprzezroczystymi pasami (canvas nie ma
+/// prawdziwego gradientu), zamiast jednego twardego prostokąta.
+fn draw_edge_glow_at<C: RadarCanvas>(
+    canvas: &C,
+    screen_rect: Rect,
+    point: Pos2,
+    vertical_edge: bool,
+    rgb: (u8, u8, u8),
+    strength: f32,
+    fg: f32,
+) {
+    for &(size_frac, alpha_frac) in &EDGE_GLOW_LAYERS {
+        let depth = EDGE_GLOW_MAX_DEPTH * size_frac;
+        let span = EDGE_GLOW_MAX_SPAN * size_frac;
+        let alpha = (255.0 * alpha_frac * strength * fg).clamp(0.0, 255.0) as u8;
+        if alpha == 0 {
+            continue;
+        }
+        let color = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha);
+
+        let rect = if vertical_edge {
+            let at_left = (point.x - screen_rect.left()).abs() <= (screen_rect.right() - point.x).abs();
+            let x0 = if at_left { screen_rect.left() } else { screen_rect.right() - depth };
+            Rect::from_min_size(
+                Pos2::new(x0, point.y - span * 0.5),
+                Vec2::new(depth, span),
+            )
+        } else {
+            let at_top = (point.y - screen_rect.top()).abs() <= (screen_rect.bottom() - point.y).abs();
+            let y0 = if at_top { screen_rect.top() } else { screen_rect.bottom() - depth };
+            Rect::from_min_size(
+                Pos2::new(point.x - span * 0.5, y0),
+                Vec2::new(span, depth),
+            )
+        };
+        canvas.rect_filled(rect, depth * 0.25, color);
+    }
+}
+
+/// Rysuje peryferyjne poświaty kierunku na krawędziach `screen_rect` (patrz
+/// doc-komentarz sekcji powyżej) — jedna na każdy aktywny wskaźnik kierunku w
+/// `state` ([`DirectionMarker`], ten sam stan co markery na tarczy radaru w
+/// [`draw_radar`]), więc oba tryby wizualizacji zawsze pokazują dokładnie te
+/// same zdarzenia, tylko w innej formie. Bez efektu, gdy
+/// [`RadarConfig::edge_glow_enabled`] jest wyłączone.
+pub fn draw_edge_glow_indicators<C: RadarCanvas>(
+    canvas: &C,
+    screen_rect: Rect,
+    state: &RadarState,
+    now: f64,
+    cfg: &RadarConfig,
+) {
+    if !cfg.edge_glow_enabled {
+        return;
+    }
+    let hc = cfg.high_contrast;
+    let fg = cfg.fg_alpha;
+
+    for marker in &state.direction_markers {
+        let age = (now - marker.spawned_at) as f32;
+        if age < 0.0 || age > DIRECTION_MARKER_LIFETIME_SECS as f32 {
+            continue;
+        }
+        let life = 1.0 - (age / DIRECTION_MARKER_LIFETIME_SECS as f32).clamp(0.0, 1.0);
+        let alpha_frac = life.powf(1.6);
+        let intensity = marker.intensity.clamp(0.0, 1.0);
+        let strength = (intensity * 0.7 + 0.3) * alpha_frac;
+
+        let rgb = if hc { (255, 255, 255) } else { marker.color_rgb };
+        let dir = screen_direction(marker.angle_deg);
+        let (point, vertical_edge) = edge_intersection(screen_rect, dir);
+        draw_edge_glow_at(canvas, screen_rect, point, vertical_edge, rgb, strength, fg);
+    }
 }

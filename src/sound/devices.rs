@@ -57,6 +57,26 @@ pub struct RadarConfig {
     /// wprowadzono); teraz user może ją dostroić suwakiem zamiast na sztywno.
     #[serde(default = "default_radar_sensitivity")]
     pub radar_sensitivity: f32,
+    /// Drugi, opcjonalny tryb wizualizacji kierunku dźwięku, OBOK tarczy
+    /// radaru (nie zamiast niej): poświata na krawędzi ekranu najbliższej
+    /// kierunkowi każdego aktywnego wskaźnika (patrz
+    /// `ui::radar_egui::draw_edge_glow_indicators`) — peryferyjna podpowiedź
+    /// w stylu "screen edge indicator" ze strzelanek, żeby kierunek dźwięku
+    /// był czytelny nawet kątem oka, bez patrzenia wprost na tarczę w rogu
+    /// ekranu. Domyślnie wyłączone (`#[serde(default)]`), żeby nie zmieniać
+    /// wyglądu dla obecnych użytkowników bez ich zgody — wymaga też, żeby
+    /// overlay rozciągnął się na cały ekran zamiast małego kwadratu wokół
+    /// tarczy (patrz `HearRadarApp::ui_overlay_contents`).
+    #[serde(default)]
+    pub edge_glow_enabled: bool,
+    /// Mnożnik grubości WSZYSTKICH linii rysowanych na radarze (okręgi skali,
+    /// krzyż kierunków, sektory 7.1, obrys kropek/wskaźników) — `1.0`
+    /// odtwarza dawne, sztywne szerokości linii z `radar_egui::draw_radar`.
+    /// `#[serde(default = ...)]` na `1.0` (nie na `0.0`, jak dałby zwykły
+    /// `Default`), żeby wczytanie starszego pliku konfiguracji (sprzed tego
+    /// pola) nie wyzerowało linii do niewidocznych.
+    #[serde(default = "default_line_thickness")]
+    pub line_thickness: f32,
 }
 
 fn default_overlay_click_through() -> bool {
@@ -65,6 +85,10 @@ fn default_overlay_click_through() -> bool {
 
 fn default_radar_sensitivity() -> f32 {
     crate::sound::direction::INTENSITY_SCALE
+}
+
+fn default_line_thickness() -> f32 {
+    1.0
 }
 
 impl Default for RadarConfig {
@@ -82,6 +106,8 @@ impl Default for RadarConfig {
             overlay_click_through: true,
             mono_boost_db: 0.0,
             radar_sensitivity: default_radar_sensitivity(),
+            edge_glow_enabled: false,
+            line_thickness: default_line_thickness(),
         }
     }
 }
