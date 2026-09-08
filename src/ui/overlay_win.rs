@@ -170,7 +170,22 @@ impl RadarCanvas for SkiaCanvas<'_> {
         else {
             return;
         };
-        let paint = skia_paint(color);
+        // Antyaliasing wyłączony celowo: to jedyny kształt tu rysowany, który
+        // NIE idzie przez `hairline_safe_width` (patrz ten komentarz) — a
+        // `PixmapMut::fill_rect` z `paint.anti_alias = true` i transformacją
+        // tożsamościową ZAWSZE trafia w tę samą buggy'ą ścieżkę skanlinii
+        // `scan::hairline_aa`, niezależnie od szerokości prostokąta (nie tylko
+        // "hairline" grubości). Pasek LFE (`draw_lfe_indicator`) rysuje
+        // prostokąt, którego szerokość płynnie zmienia się z poziomem sygnału
+        // — co klatkę przechodzi więc przez całe spektrum szerokości
+        // subpikselowych, w tym przez tę samą degenerującą się do zera
+        // szerokość kolumny pikseli, która wywołała `debug_assert!(false)`
+        // przy kropce. Prostokąty są tu zawsze osiowo wyrównane, więc AA na
+        // ich krawędziach i tak nic nie daje wizualnie — wyłączenie go
+        // przełącza tiny-skia na prosty, całkowitoliczbowy `blit_rect`, który
+        // tego kodu wcale nie dotyka.
+        let mut paint = skia_paint(color);
+        paint.anti_alias = false;
         self.pixmap
             .borrow_mut()
             .fill_rect(sk_rect, &paint, Transform::identity(), None);
