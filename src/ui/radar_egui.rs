@@ -564,6 +564,23 @@ pub fn draw_radar<C: RadarCanvas>(
         let marker_r = (intensity * r).clamp(10.0, r);
         let pos = center + dir * marker_r;
 
+        // Dokładna pozycja piksela wskaźnika na tarczy w TYM oknie (podgląd w
+        // głównym oknie i overlay wołają `draw_radar` osobno, każde z własnym
+        // `center` — ta sama logiczna kropka wypadnie więc pod innymi x/y w
+        // każdym z nich). Loguje się co klatkę przez cały czas życia markera
+        // (~1 s), więc plik rośnie szybko — to świadomy kompromis dla
+        // dokładnego śledzenia ruchu/zaniku wskaźnika w czasie.
+        crate::dlog!(
+            "[marker-pos] angle={:.1}° age={:.2}s life={:.2} x={:.1} y={:.1} (center=({:.1},{:.1}))",
+            marker.angle_deg,
+            age,
+            life,
+            pos.x,
+            pos.y,
+            center.x,
+            center.y
+        );
+
         let alpha = ((intensity * 0.6 + 0.4) * 255.0 * fg * alpha_frac).clamp(0.0, 255.0) as u8;
         let beacon_color =
             Color32::from_rgba_unmultiplied(beacon_rgb.0, beacon_rgb.1, beacon_rgb.2, alpha);

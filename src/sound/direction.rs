@@ -228,10 +228,13 @@ const ONSET_MIN_ENERGY: f32 = 0.02;
 /// wolniejsza, stabilniejsza średnia).
 const ONSET_EMA_FACTOR: f32 = 0.1;
 
-/// Maksymalna odległość kątowa (stopnie) sąsiedniego kanału, którego energia
-/// wpływa na [`onset_angle_deg`] danego kanału. Kanały leżące PO PRZECIWNEJ
-/// stronie tarczy (`> 90°`) nigdy nie powinny przeciągać kąta na swoją stronę
-/// — stąd próg dokładnie w połowie okręgu.
+/// Próg odległości kątowej (stopnie) sąsiedniego kanału, którego energia
+/// wpływa na [`onset_angle_deg`] danego kanału — WYŁĄCZNIE ŚCIŚLE PONIŻEJ tej
+/// wartości (`<`, nie `<=`): kanały leżące PO PRZECIWNEJ stronie tarczy
+/// (`>= 90°`) nigdy nie powinny przeciągać kąta na swoją stronę. Ostry próg
+/// jest tu kluczowy — `FrontLeft`/`FrontRight` leżą dokładnie 90° od siebie,
+/// więc przy `<=` ta para (czyli zwykłe stereo!) wzajemnie się uśredniała,
+/// zamiast pozostać wyraźnie rozdzielona.
 const NEIGHBOR_MAX_ANGLE_DIFF_DEG: f32 = 90.0;
 
 /// Pojedyncze, niezależne zdarzenie dźwiękowe wykryte na jednym kanale.
@@ -255,7 +258,19 @@ pub struct ChannelOnset {
 ///
 /// `ema_state` jest automatycznie dopasowywany do rozmiaru `channel_rms`,
 /// jeśli liczba kanałów strumienia się zmieni (np. przełączenie urządzenia).
-pub fn detect_onsets(channel_rms: &[f32], ema_state: &mut Vec<f32>) -> Vec<ChannelOnset> {
+///
+/// `sensitivity` to ten sam mnożnik co [`crate::sound::devices::RadarConfig::radar_sensitivity`]
+/// (suwak "Czułość radaru" w ustawieniach) — bez niego progi [`ONSET_MIN_ENERGY`]
+/// i [`TRANSIENT_RATIO`] są sztywne i niezależne od tego suwaka, co w praktyce
+/// (patrz log diagnostyczny z prawdziwego audio) oznacza, że przy typowych,
+/// niegłośnych nagraniach (RMS rzędu 0.01-0.03) detekcja odpala się raz na
+/// starcie i potem prawie nigdy więcej — średnia krocząca "dogania" rosnący
+/// poziom głośności szybciej, niż zdąży pojawić się coś, co przebije próg.
+/// Podnosząc suwak, użytkownik podnosi też `level * sensitivity` tu, więc
+/// dotąd niewystarczające skoki zaczynają przebijać próg — dokładnie tak samo
+/// jak już dziś reguluje to, jak duże/daleko od środka są kropki kanałów w
+/// [`crate::sound::devices::AudioAnalysis`].
+pub fn detect_onsets(channel_rms: &[f32], ema_state: &mut Vec<f32>, sensitivity: f32) -> Vec<ChannelOnset> {
     if ema_state.len() != channel_rms.len() {
         *ema_state = vec![0.0; channel_rms.len()];
     }
@@ -265,22 +280,27 @@ pub fn detect_onsets(channel_rms: &[f32], ema_state: &mut Vec<f32>) -> Vec<Chann
 
     for (i, &level) in channel_rms.iter().enumerate() {
         let level = level.max(0.0);
+        let scaled = (level * sensitivity).clamp(0.0, 1.0);
         let has_direction = layout
             .get(i)
             .and_then(|role| role.radar_angle_degrees())
             .is_some();
 
         if !has_direction {
-            ema_state[i] = ema_state[i] * (1.0 - ONSET_EMA_FACTOR) + level * ONSET_EMA_FACTOR;
+            ema_state[i] = ema_state[i] * (1.0 - ONSET_EMA_FACTOR) + scaled * ONSET_EMA_FACTOR;
             continue;
         }
 
         let prev_ema = ema_state[i];
-        let is_onset = level > ONSET_MIN_ENERGY && level > prev_ema * TRANSIENT_RATIO + 0.02;
-        ema_state[i] = prev_ema * (1.0 - ONSET_EMA_FACTOR) + level * ONSET_EMA_FACTOR;
+        let is_onset = scaled > ONSET_MIN_ENERGY && scaled > prev_ema * TRANSIENT_RATIO + 0.02;
+        ema_state[i] = prev_ema * (1.0 - ONSET_EMA_FACTOR) + scaled * ONSET_EMA_FACTOR;
 
         if is_onset {
             onsets.push(ChannelOnset {
+                // Nieskalowane RMS — `sensitivity` wpływa tylko na to, KIEDY
+                // odpala się onset (bramka), nie na to, jaką energię niesie
+                // (o skalowaniu do jasności/odległości markera decyduje
+                // wywołujący, patrz `sound::devices::update_analysis`).
                 channel_index: i,
                 energy: level,
                 angle_deg: onset_angle_deg(channel_rms, i),
@@ -293,12 +313,24 @@ pub fn detect_onsets(channel_rms: &[f32], ema_state: &mut Vec<f32>) -> Vec<Chann
 
 /// Płynny kąt onsetu wykrytego na `channel_index`: średnia ważona energią
 /// własnego kąta kanału i kątów jego kątowych sąsiadów (odległość kątowa
-/// `<= `[`NEIGHBOR_MAX_ANGLE_DIFF_DEG`]`°`, NIE sąsiedztwo w tablicy
-/// `channel_layout` — w układzie 2.0 jedynym sąsiadem indeksowym L jest R,
-/// czyli kanał dokładnie naprzeciwko, więc głośny R przeciągałby kąt L na
-/// swoją stronę, gdyby liczyć po indeksie). Dzięki temu głośny, sąsiedni
+/// ŚCIŚLE MNIEJSZA niż [`NEIGHBOR_MAX_ANGLE_DIFF_DEG`]`°`, NIE sąsiedztwo w
+/// tablicy `channel_layout` — w układzie 2.0 jedynym sąsiadem indeksowym L
+/// jest R, czyli kanał dokładnie naprzeciwko, więc głośny R przeciągałby kąt
+/// L na swoją stronę, gdyby liczyć po indeksie). Dzięki temu głośny, sąsiedni
 /// kanał płynnie przesuwa kąt w swoją stronę, ale kanał po przeciwnej stronie
 /// tarczy nigdy nie wpływa na wynik.
+///
+/// Próg jest CELOWO ostry (`<`, nie `<=`): `FrontLeft`/`FrontRight` leżą
+/// dokładnie [`NEIGHBOR_MAX_ANGLE_DIFF_DEG`]`°` (90°) od siebie — to DOKŁADNIE
+/// granica progu. Przy `<=` (poprzednia wersja) ta para wzajemnie się
+/// uśredniała: dla zwykłego stereo o podobnej energii L i R oba onsety
+/// zbiegały do niemal identycznego kąta blisko `0°`, więc dwa niezależne
+/// wskaźniki kierunku (patrz [`detect_onsets`]) wizualnie nakładały się na
+/// siebie w jednym punkcie — dokładnie ten problem, który cała ta funkcja
+/// miała rozwiązać. Znalezione w logu diagnostycznym: `L:3 R:3` dawało
+/// `angle=-0.2°` dla OBU kanałów naraz, zamiast dwóch wyraźnie odrębnych
+/// kątów. Przy ostrym `<` FL/FR (i inne pary dokładnie 90° od siebie: FL/RL,
+/// FR/RR, C/SL, C/SR) już się nie zlewają.
 pub fn onset_angle_deg(channel_rms: &[f32], channel_index: usize) -> f32 {
     let layout = channel_layout(channel_rms.len());
     let Some(own_role) = layout.get(channel_index).copied() else {
@@ -316,7 +348,7 @@ pub fn onset_angle_deg(channel_rms: &[f32], channel_index: usize) -> f32 {
         let Some(angle_deg) = role.radar_angle_degrees() else {
             continue;
         };
-        if i != channel_index && wrap_angle_deg(angle_deg - own_angle).abs() > NEIGHBOR_MAX_ANGLE_DIFF_DEG {
+        if i != channel_index && wrap_angle_deg(angle_deg - own_angle).abs() >= NEIGHBOR_MAX_ANGLE_DIFF_DEG {
             continue;
         }
         let energy = channel_rms.get(i).copied().unwrap_or(0.0).max(0.0);
@@ -768,7 +800,7 @@ mod tests {
         // powinien zamiast tego zgłosić DWA niezależne zdarzenia, każde na
         // swoim kanale. [FL, FR, C, LFE, RL, RR, SL, SR]
         let mut ema = vec![0.0; 8];
-        let onsets = detect_onsets(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.3], &mut ema);
+        let onsets = detect_onsets(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.3], &mut ema, 1.0);
         let left = onsets.iter().find(|o| o.channel_index == 6).unwrap();
         let right = onsets.iter().find(|o| o.channel_index == 7).unwrap();
         assert_close(left.angle_deg, -90.0, "onset lewego kanału (SL)");
@@ -781,23 +813,23 @@ mod tests {
         // Kilka ramek o stałym poziomie — po "rozgrzaniu" średniej kroczącej
         // dalsze ramki o tym samym poziomie nie powinny być onsetami.
         for _ in 0..50 {
-            detect_onsets(&[0.2, 0.2], &mut ema);
+            detect_onsets(&[0.2, 0.2], &mut ema, 1.0);
         }
-        let onsets = detect_onsets(&[0.2, 0.2], &mut ema);
+        let onsets = detect_onsets(&[0.2, 0.2], &mut ema, 1.0);
         assert!(onsets.is_empty(), "stały poziom nie powinien generować onsetów");
     }
 
     #[test]
     fn detect_onsets_silence_yields_nothing() {
         let mut ema = vec![0.0, 0.0];
-        assert!(detect_onsets(&[0.0, 0.0], &mut ema).is_empty());
+        assert!(detect_onsets(&[0.0, 0.0], &mut ema, 1.0).is_empty());
     }
 
     #[test]
     fn detect_onsets_skips_lfe_channel() {
         // [FL, FR, C, LFE, RL, RR]
         let mut ema = vec![0.0; 6];
-        let onsets = detect_onsets(&[0.0, 0.0, 0.0, 0.5, 0.0, 0.0], &mut ema);
+        let onsets = detect_onsets(&[0.0, 0.0, 0.0, 0.5, 0.0, 0.0], &mut ema, 1.0);
         assert!(
             onsets.iter().all(|o| o.channel_index != 3),
             "LFE nie niesie kierunku, nie powinien generować onsetu"
@@ -807,11 +839,35 @@ mod tests {
     #[test]
     fn detect_onsets_resizes_ema_state_for_new_channel_count() {
         let mut ema = vec![0.0, 0.0];
-        let _ = detect_onsets(&[0.1, 0.1], &mut ema);
+        let _ = detect_onsets(&[0.1, 0.1], &mut ema, 1.0);
         assert_eq!(ema.len(), 2);
         // Zmiana urządzenia -> inna liczba kanałów; nie powinno panikować.
-        let _ = detect_onsets(&[0.0; 6], &mut ema);
+        let _ = detect_onsets(&[0.0; 6], &mut ema, 1.0);
         assert_eq!(ema.len(), 6);
+    }
+
+    #[test]
+    fn detect_onsets_sensitivity_lets_a_too_quiet_jump_cross_the_threshold() {
+        // Regresja: przy typowych, niegłośnych nagraniach (RMS ~0.01-0.03,
+        // patrz log diagnostyczny z prawdziwego audio) domyślna czułość
+        // (1.0) w ogóle nie widziała skoku głośności — dopiero podniesienie
+        // suwaka "Czułość radaru" (ten sam `sensitivity` co
+        // `RadarConfig::radar_sensitivity`) miało pozwolić dotąd
+        // niewystarczającym skokom przebić próg.
+        let jump = [0.012, 0.012]; // wyraźnie poniżej ONSET_MIN_ENERGY (0.02)
+        let mut ema_low = vec![0.0, 0.0];
+        assert!(
+            detect_onsets(&jump, &mut ema_low, 1.0).is_empty(),
+            "przy domyślnej czułości ten poziom nie powinien jeszcze przebić progu"
+        );
+
+        let mut ema_high = vec![0.0, 0.0];
+        let onsets = detect_onsets(&jump, &mut ema_high, 3.0);
+        assert_eq!(
+            onsets.len(),
+            2,
+            "podniesiona czułość powinna pozwolić temu samemu skokowi przebić próg"
+        );
     }
 
     #[test]
@@ -844,5 +900,21 @@ mod tests {
         // nie powinien przesunąć kąta onsetu na SL.
         let angle = onset_angle_deg(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05, 0.9], 6);
         assert_close(angle, -90.0, "SL nie powinien być ciągnięty przez przeciwległy SR");
+    }
+
+    #[test]
+    fn onset_angle_deg_front_left_and_front_right_stay_distinct_for_plain_stereo() {
+        // Regresja znaleziona w logu diagnostycznym z prawdziwego audio:
+        // zwykłe stereo (2.0: [FL, FR], podobna energia na obu) dawało IDENTYCZNY
+        // kąt dla onsetów L i R (oba ~0°), bo FL(-45°)/FR(45°) leżą DOKŁADNIE
+        // NEIGHBOR_MAX_ANGLE_DIFF_DEG (90°) od siebie, a próg był domknięty
+        // (`<=`), więc ta para się wzajemnie uśredniała — dokładnie ten problem,
+        // który detect_onsets miał rozwiązywać (dwa niezależne, ROZRÓŻNIALNE
+        // wskaźniki), zamiast tego zapadały się w jeden punkt na środku.
+        let rms = [0.025, 0.030]; // niemal identyczna energia L/R
+        let angle_l = onset_angle_deg(&rms, 0);
+        let angle_r = onset_angle_deg(&rms, 1);
+        assert_close(angle_l, -45.0, "onset L powinien zostać przy własnym kącie FL");
+        assert_close(angle_r, 45.0, "onset R powinien zostać przy własnym kącie FR");
     }
 }

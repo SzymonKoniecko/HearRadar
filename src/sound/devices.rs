@@ -460,7 +460,7 @@ pub fn fetch_audio_from_device(
     let sample_rate = config.sample_rate.0 as f32;
     let err_fn = |e| eprintln!("Stream error: {e}");
 
-    println!(
+    crate::dlog!(
         "[audio] stream start: device={:?} format={:?} rate={}Hz channels={}",
         target_device_name,
         default_config.sample_format(),
@@ -480,7 +480,7 @@ pub fn fetch_audio_from_device(
                     let n = counter.fetch_add(1, Ordering::Relaxed);
                     if n % 200 == 0 {
                         let peak = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        println!("[audio] cb #{n} samples={} peak={peak:.4}", data.len());
+                        crate::dlog!("[audio] cb #{n} samples={} peak={peak:.4}", data.len());
                     }
                     update_analysis(data, channels, sample_rate, &a);
                 },
@@ -498,7 +498,7 @@ pub fn fetch_audio_from_device(
                     let f: Vec<f32> = data.iter().map(|&s| direction::i16_to_f32(s)).collect();
                     if n % 200 == 0 {
                         let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        println!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
+                        crate::dlog!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
                     }
                     update_analysis(&f, channels, sample_rate, &a);
                 },
@@ -516,7 +516,7 @@ pub fn fetch_audio_from_device(
                     let f: Vec<f32> = data.iter().map(|&s| direction::u16_to_f32(s)).collect();
                     if n % 200 == 0 {
                         let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        println!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
+                        crate::dlog!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
                     }
                     update_analysis(&f, channels, sample_rate, &a);
                 },
@@ -534,26 +534,31 @@ pub fn fetch_audio_from_device(
 fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis: &SharedAudioAnalysis) {
     let stats = analyze_channels(samples, channels);
 
-    // Reguły kolorowania mogą się zmienić w dowolnym momencie z panelu
-    // ustawień (UI), więc czytamy je świeżo przy każdej ramce zamiast
-    // zakładać stały, sztywny zestaw pasm.
-    let rules = analysis
+    // Reguły kolorowania i czułość mogą się zmienić w dowolnym momencie z
+    // panelu ustawień (UI), więc czytamy je świeżo przy każdej ramce zamiast
+    // zakładać stałe wartości.
+    let (rules, sensitivity) = analysis
         .lock()
-        .map(|g| g.radar_config.color_rules.clone())
-        .unwrap_or_else(|_| spectrum::default_color_rules());
+        .map(|g| (g.radar_config.color_rules.clone(), g.radar_config.radar_sensitivity))
+        .unwrap_or_else(|_| (spectrum::default_color_rules(), default_radar_sensitivity()));
     let rule_energies = spectrum::analyze_channel_rule_energies(samples, channels, sample_rate, &rules);
 
     // Niezależne zdarzenia kierunku: KAŻDY nagły skok energii na KAŻDYM
     // kanale osobno, zamiast jednego sumarycznego wektora, który przy dwóch
     // przeciwstawnych źródłach o podobnej energii potrafi się wyzerować
-    // (patrz doc-komentarz `direction::detect_onsets`).
+    // (patrz doc-komentarz `direction::detect_onsets`). Ten sam suwak
+    // "Czułość radaru", który już reguluje jak duże/daleko są kropki kanałów,
+    // reguluje też PRÓG detekcji onsetów — bez tego, przy cichszych źródłach
+    // (patrz log diagnostyczny), detekcja odpalała się raz na starcie i
+    // prawie nigdy więcej, niezależnie od tego, jak wysoko user podniósłby
+    // suwak.
     let direction_events: Vec<DirectionEvent> = {
         let mut ema_guard = analysis.onset_ema.lock().unwrap_or_else(|e| e.into_inner());
-        direction::detect_onsets(&stats.rms, &mut ema_guard)
+        direction::detect_onsets(&stats.rms, &mut ema_guard, sensitivity)
             .into_iter()
             .map(|onset| DirectionEvent {
                 angle_deg: onset.angle_deg,
-                intensity: (onset.energy * direction::INTENSITY_SCALE).clamp(0.0, 1.0),
+                intensity: (onset.energy * sensitivity).clamp(0.0, 1.0),
                 color_rgb: spectrum::resolve_color(
                     &rules,
                     rule_energies.get(onset.channel_index).map(Vec::as_slice).unwrap_or(&[]),
@@ -568,8 +573,23 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         let pct = (rms.clamp(0.0, 1.0) * 100.0).round() as u32;
         format!("{label}:{pct}")
     }).collect();
-    println!("[ch] {} | onsets={}", ch_str.join(" "), direction_events.len());
-    println!("[analysis] rms={:?}", &stats.rms);
+    crate::dlog!("[ch] {} | onsets={}", ch_str.join(" "), direction_events.len());
+    crate::dlog!("[analysis] rms={:?}", &stats.rms);
+    // Pozycja (kąt na tarczy) i intensywność każdego wskaźnika kierunku —
+    // dokładnie to, co dostaje `RadarState::update` i zamienia na osobny,
+    // gasnący marker na radarze (patrz `ui::radar_egui::DirectionMarker`).
+    // Logowane tylko gdy coś faktycznie wykryto, żeby nie zalewać pliku
+    // pustymi liniami przy każdej ramce ciszy.
+    for event in &direction_events {
+        crate::dlog!(
+            "[onset] angle={:.1}° intensity={:.2} color=rgb({},{},{})",
+            event.angle_deg,
+            event.intensity,
+            event.color_rgb.0,
+            event.color_rgb.1,
+            event.color_rgb.2
+        );
+    }
     if let Ok(mut lock) = analysis.lock() {
         lock.peak_l = stats.peak.first().copied().unwrap_or(0.0);
         lock.peak_r = stats.peak.get(1).copied().unwrap_or(0.0);
