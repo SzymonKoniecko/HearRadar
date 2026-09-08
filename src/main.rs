@@ -1,4 +1,5 @@
 mod config_store;
+mod debug_log;
 mod sound;
 mod ui;
 
@@ -6,6 +7,10 @@ use sound::devices::SharedAudioAnalysis;
 use ui::HearRadarApp;
 
 fn main() {
+    // Dubluje logi diagnostyczne (patrz `dlog!` w `sound::devices`/`mono_router`)
+    // do pliku `config/debug.log`, obok konsoli — patrz `debug_log::init`.
+    debug_log::init();
+
     let analysis = SharedAudioAnalysis::new();
 
     let options = eframe::NativeOptions {

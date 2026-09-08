@@ -460,7 +460,7 @@ pub fn fetch_audio_from_device(
     let sample_rate = config.sample_rate.0 as f32;
     let err_fn = |e| eprintln!("Stream error: {e}");
 
-    println!(
+    crate::dlog!(
         "[audio] stream start: device={:?} format={:?} rate={}Hz channels={}",
         target_device_name,
         default_config.sample_format(),
@@ -480,7 +480,7 @@ pub fn fetch_audio_from_device(
                     let n = counter.fetch_add(1, Ordering::Relaxed);
                     if n % 200 == 0 {
                         let peak = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        println!("[audio] cb #{n} samples={} peak={peak:.4}", data.len());
+                        crate::dlog!("[audio] cb #{n} samples={} peak={peak:.4}", data.len());
                     }
                     update_analysis(data, channels, sample_rate, &a);
                 },
@@ -498,7 +498,7 @@ pub fn fetch_audio_from_device(
                     let f: Vec<f32> = data.iter().map(|&s| direction::i16_to_f32(s)).collect();
                     if n % 200 == 0 {
                         let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        println!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
+                        crate::dlog!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
                     }
                     update_analysis(&f, channels, sample_rate, &a);
                 },
@@ -516,7 +516,7 @@ pub fn fetch_audio_from_device(
                     let f: Vec<f32> = data.iter().map(|&s| direction::u16_to_f32(s)).collect();
                     if n % 200 == 0 {
                         let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        println!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
+                        crate::dlog!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
                     }
                     update_analysis(&f, channels, sample_rate, &a);
                 },
@@ -568,8 +568,8 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         let pct = (rms.clamp(0.0, 1.0) * 100.0).round() as u32;
         format!("{label}:{pct}")
     }).collect();
-    println!("[ch] {} | onsets={}", ch_str.join(" "), direction_events.len());
-    println!("[analysis] rms={:?}", &stats.rms);
+    crate::dlog!("[ch] {} | onsets={}", ch_str.join(" "), direction_events.len());
+    crate::dlog!("[analysis] rms={:?}", &stats.rms);
     if let Ok(mut lock) = analysis.lock() {
         lock.peak_l = stats.peak.first().copied().unwrap_or(0.0);
         lock.peak_r = stats.peak.get(1).copied().unwrap_or(0.0);

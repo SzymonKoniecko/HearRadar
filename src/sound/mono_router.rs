@@ -178,7 +178,7 @@ pub fn start_mono_output(
         .ok_or_else(|| anyhow::anyhow!("Output device not found: {}", output_device_name))?;
 
     let output_config = output_device.default_output_config()?;
-    println!(
+    crate::dlog!(
         "[mono_router] output: {:?} | {}ch | {}Hz | {:?}",
         output_device_name,
         output_config.channels(),
@@ -189,7 +189,7 @@ pub fn start_mono_output(
     let output_stream = build_output_stream(&output_device, &output_config, analysis)?;
     output_stream.play()?;
 
-    println!("[mono_router] routing active");
+    crate::dlog!("[mono_router] routing active");
 
     Ok(MonoRouter { _output_stream: output_stream })
 }
