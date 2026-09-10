@@ -250,6 +250,30 @@ pub struct ChannelOnset {
     pub angle_deg: f32,
 }
 
+/// Stan JEDNEGO kanału (z kierunkiem) w bieżącej ramce analizy — to samo, co
+/// bada [`detect_onsets`] wewnętrznie, ale dla KAŻDEGO kanału, nie tylko tych,
+/// które przebiły próg onsetu. Używane m.in. przez logger próbek
+/// (`crate::sound::sample_logger`), żeby dało się ręcznie sprawdzić dźwięki,
+/// które były słyszalne (`energy`/`scaled_energy` > 0), ale nigdy nie
+/// wygenerowały markera na radarze (`is_onset == false`) — patrz doc-komentarz
+/// [`detect_onsets`] o tym, dlaczego to się zdarza.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChannelActivity {
+    /// Indeks kanału (w `channel_rms`/`channel_layout`).
+    pub channel_index: usize,
+    /// Poziom RMS kanału w tej ramce (0.0..=1.0), nieprzeskalowany `sensitivity`.
+    pub energy: f32,
+    /// `energy * sensitivity`, obcięte do 0.0..=1.0 — to porównujemy z progiem onsetu.
+    pub scaled_energy: f32,
+    /// Płynny kąt (patrz [`onset_angle_deg`]) — liczony niezależnie od tego,
+    /// czy kanał akurat jest onsetem, żeby logger miał kąt nawet dla
+    /// "cichych" próbek.
+    pub angle_deg: f32,
+    /// `true`, gdy ten kanał w tej ramce przebił próg onsetu i realnie
+    /// wygenerował [`ChannelOnset`] (a więc i marker na radarze).
+    pub is_onset: bool,
+}
+
 /// Wykrywa nagłe skoki energii (onsety) na każdym kanale osobno, porównując
 /// bieżący RMS ze średnią kroczącą tego kanału (stan przekazywany z zewnątrz
 /// w `ema_state`, żeby funkcja zostawała czystą/testowalną bez żywego audio —
@@ -271,12 +295,32 @@ pub struct ChannelOnset {
 /// jak już dziś reguluje to, jak duże/daleko od środka są kropki kanałów w
 /// [`crate::sound::devices::AudioAnalysis`].
 pub fn detect_onsets(channel_rms: &[f32], ema_state: &mut Vec<f32>, sensitivity: f32) -> Vec<ChannelOnset> {
+    detect_channel_activity(channel_rms, ema_state, sensitivity)
+        .into_iter()
+        .filter(|a| a.is_onset)
+        .map(|a| ChannelOnset {
+            channel_index: a.channel_index,
+            energy: a.energy,
+            angle_deg: a.angle_deg,
+        })
+        .collect()
+}
+
+/// Jak [`detect_onsets`], ale zwraca stan KAŻDEGO kanału z kierunkiem (patrz
+/// [`ChannelActivity`]), nie tylko tych, które przebiły próg onsetu —
+/// `detect_onsets` jest teraz cienkim filtrem nad tą funkcją, więc oba
+/// warianty zawsze widzą dokładnie te same progi/EMA.
+pub fn detect_channel_activity(
+    channel_rms: &[f32],
+    ema_state: &mut Vec<f32>,
+    sensitivity: f32,
+) -> Vec<ChannelActivity> {
     if ema_state.len() != channel_rms.len() {
         *ema_state = vec![0.0; channel_rms.len()];
     }
 
     let layout = channel_layout(channel_rms.len());
-    let mut onsets = Vec::new();
+    let mut activity = Vec::new();
 
     for (i, &level) in channel_rms.iter().enumerate() {
         let level = level.max(0.0);
@@ -295,20 +339,20 @@ pub fn detect_onsets(channel_rms: &[f32], ema_state: &mut Vec<f32>, sensitivity:
         let is_onset = scaled > ONSET_MIN_ENERGY && scaled > prev_ema * TRANSIENT_RATIO + 0.02;
         ema_state[i] = prev_ema * (1.0 - ONSET_EMA_FACTOR) + scaled * ONSET_EMA_FACTOR;
 
-        if is_onset {
-            onsets.push(ChannelOnset {
-                // Nieskalowane RMS — `sensitivity` wpływa tylko na to, KIEDY
-                // odpala się onset (bramka), nie na to, jaką energię niesie
-                // (o skalowaniu do jasności/odległości markera decyduje
-                // wywołujący, patrz `sound::devices::update_analysis`).
-                channel_index: i,
-                energy: level,
-                angle_deg: onset_angle_deg(channel_rms, i),
-            });
-        }
+        activity.push(ChannelActivity {
+            // Nieskalowane RMS — `sensitivity` wpływa tylko na to, KIEDY
+            // odpala się onset (bramka), nie na to, jaką energię niesie
+            // (o skalowaniu do jasności/odległości markera decyduje
+            // wywołujący, patrz `sound::devices::update_analysis`).
+            channel_index: i,
+            energy: level,
+            scaled_energy: scaled,
+            angle_deg: onset_angle_deg(channel_rms, i),
+            is_onset,
+        });
     }
 
-    onsets
+    activity
 }
 
 /// Płynny kąt onsetu wykrytego na `channel_index`: średnia ważona energią

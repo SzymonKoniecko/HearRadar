@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sound::direction::{self, analyze_channels};
+use crate::sound::sample_logger;
 use crate::sound::spectrum::{self, ColorRule};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -210,6 +211,10 @@ pub struct SharedAudioAnalysis {
     /// (jeden callback cpal na ramkę) — stąd trzymany tu, obok `mono_ring`,
     /// zamiast jako zmienna lokalna.
     onset_ema: Arc<Mutex<Vec<f32>>>,
+    /// Logger próbek klasyfikacji koloru do ręcznej analizy configu — patrz
+    /// [`crate::sound::sample_logger`]. Wyłączony domyślnie; włączany
+    /// checkboxem w UI (`ui::app`).
+    sample_logger: Arc<sample_logger::SampleLogger>,
 }
 
 impl PartialEq for SharedAudioAnalysis {
@@ -224,6 +229,7 @@ impl Default for SharedAudioAnalysis {
             inner: Arc::new(Mutex::new(AudioAnalysis::default())),
             mono_ring: Arc::new(Mutex::new(VecDeque::with_capacity(MONO_RING_CAPACITY))),
             onset_ema: Arc::new(Mutex::new(Vec::new())),
+            sample_logger: Arc::new(sample_logger::SampleLogger::new()),
         }
     }
 }
@@ -265,6 +271,19 @@ impl SharedAudioAnalysis {
             out.resize(count, 0.0);
         }
         out
+    }
+
+    /// Czy logger próbek (`sample_logger::SampleLogger`) jest aktualnie
+    /// włączony — odczytywane przez checkbox w UI, żeby odzwierciedlić stan
+    /// nawet po tym, jak zapis pliku faktycznie się nie powiódł.
+    pub fn sample_logging_enabled(&self) -> bool {
+        self.sample_logger.is_enabled()
+    }
+
+    /// Włącza/wyłącza logger próbek. Włączenie ZAWSZE zaczyna nowy plik —
+    /// patrz [`sample_logger::SampleLogger::set_enabled`].
+    pub fn set_sample_logging_enabled(&self, enabled: bool) {
+        self.sample_logger.set_enabled(enabled);
     }
 }
 
@@ -552,20 +571,59 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
     // (patrz log diagnostyczny), detekcja odpalała się raz na starcie i
     // prawie nigdy więcej, niezależnie od tego, jak wysoko user podniósłby
     // suwak.
-    let direction_events: Vec<DirectionEvent> = {
+    // Stan KAŻDEGO kanału z kierunkiem (nie tylko tych, które przebiły próg
+    // onsetu) — `direction_events` niżej filtruje z tego tylko onsety
+    // (identycznie jak dawne `detect_onsets`), a logger próbek (niżej) widzi
+    // WSZYSTKIE, żeby dało się złapać dźwięk, który był słyszalny, ale nigdy
+    // nie wygenerował markera (patrz doc-komentarz `direction::ChannelActivity`).
+    let channel_activity: Vec<direction::ChannelActivity> = {
         let mut ema_guard = analysis.onset_ema.lock().unwrap_or_else(|e| e.into_inner());
-        direction::detect_onsets(&stats.rms, &mut ema_guard, sensitivity)
-            .into_iter()
-            .map(|onset| DirectionEvent {
-                angle_deg: onset.angle_deg,
-                intensity: (onset.energy * sensitivity).clamp(0.0, 1.0),
-                color_rgb: spectrum::resolve_color(
-                    &rules,
-                    rule_energies.get(onset.channel_index).map(Vec::as_slice).unwrap_or(&[]),
-                ),
-            })
-            .collect()
+        direction::detect_channel_activity(&stats.rms, &mut ema_guard, sensitivity)
     };
+
+    let direction_events: Vec<DirectionEvent> = channel_activity
+        .iter()
+        .filter(|a| a.is_onset)
+        .map(|onset| DirectionEvent {
+            angle_deg: onset.angle_deg,
+            intensity: (onset.energy * sensitivity).clamp(0.0, 1.0),
+            color_rgb: spectrum::resolve_color(
+                &rules,
+                rule_energies.get(onset.channel_index).map(Vec::as_slice).unwrap_or(&[]),
+            ),
+        })
+        .collect();
+
+    // Logger próbek do ręcznego dostrajania `color_rules` — patrz
+    // `sample_logger`. Sprawdzamy `is_enabled()` najpierw, żeby przy
+    // wyłączonym loggerze nie liczyć nic dodatkowego co ramkę audio.
+    // Próg 0.01 to ten sam floor co przy spawnowaniu `ChannelDot`
+    // (patrz `ui::radar_egui::RadarState::update`) — poniżej niego kanał
+    // uznajemy za ciszę, niewartą logowania.
+    if analysis.sample_logger.is_enabled() {
+        let unix_ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        for a in &channel_activity {
+            if a.scaled_energy < 0.01 {
+                continue;
+            }
+            let energies = rule_energies.get(a.channel_index).map(Vec::as_slice).unwrap_or(&[]);
+            let rule_index = spectrum::dominant_rule_index(energies);
+            let rule_label = rule_index.and_then(|i| rules.get(i)).and_then(|r| r.label.clone());
+            analysis.sample_logger.log_sample(&sample_logger::SampleRow {
+                unix_ts_ms,
+                channel_index: a.channel_index,
+                rms: a.energy,
+                scaled_energy: a.scaled_energy,
+                marker_spawned: a.is_onset,
+                rule_index,
+                rule_label,
+                color: spectrum::resolve_color(&rules, energies),
+            });
+        }
+    }
 
     let labels = ["L", "R", "C", "LFE", "RL", "RR", "SL", "SR"];
     let ch_str: Vec<String> = stats.rms.iter().enumerate().map(|(i, rms)| {

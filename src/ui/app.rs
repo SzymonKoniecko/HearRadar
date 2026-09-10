@@ -790,7 +790,30 @@ impl HearRadarApp {
 
         ui.add_space(6.0);
         ui.separator();
+        self.ui_sample_logging_toggle(ui);
+
+        ui.add_space(6.0);
+        ui.separator();
         self.ui_config_persistence(ui);
+    }
+
+    /// Checkbox włączający/wyłączający logger próbek (`sound::sample_logger`)
+    /// do ręcznej analizy, który z każdej ramki audio zapisuje realny kolor
+    /// (albo brak markera) każdego słyszalnego kanału do pliku CSV w
+    /// katalogu configu — patrz doc-komentarz modułu `sample_logger`. Każde
+    /// włączenie startuje NOWY plik, więc kolejne sesje nagrywania da się
+    /// porównywać osobno.
+    fn ui_sample_logging_toggle(&mut self, ui: &mut egui::Ui) {
+        let mut enabled = self.analysis.sample_logging_enabled();
+        if ui
+            .checkbox(&mut enabled, "Loguj próbki kolorów do CSV (do ręcznej analizy configu)")
+            .changed()
+        {
+            self.analysis.set_sample_logging_enabled(enabled);
+        }
+        if enabled {
+            ui.weak("Zapisuje do config/sample_log_NNNN.csv — kolejny plik przy każdym włączeniu.");
+        }
     }
 
     /// Rozwijana lista gotowych profili kolorów pod konkretne style gier

@@ -19,7 +19,7 @@ const CONFIG_FILE_NAME: &str = "radar_config.json";
 /// wypalane w binarkę w czasie kompilacji i wskazuje katalog z `Cargo.toml`
 /// — działa niezależnie od tego, z jakiego katalogu roboczego uruchomiono
 /// `cargo run`/gotową binarkę.
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config")
 }
 
