@@ -478,6 +478,25 @@ impl HearRadarApp {
             }
         });
 
+        // Ring modulation na stronie przeciwnej do granego ucha (patrz
+        // `mono_router::fill_output_f32`) — bez tego w trybie jednousznym
+        // (Lewe/Prawe) cała informacja "z której strony był dźwięk" ginie,
+        // bo obie strony grają identycznie w jednej słuchawce.
+        if ui
+            .checkbox(
+                &mut self.radar_config.mono_ring_mod_enabled,
+                "Oznacz dźwięk z przeciwnej strony brzęczeniem (tryb jednouszny)",
+            )
+            .on_hover_text(
+                "Włączone: dźwięk z przeciwnej strony niż wybrane ucho brzmi lekko \"brzęcząco\" \
+                 (ring modulation), więc po samym brzmieniu poznasz, że był z drugiej strony. \
+                 Wyłączone: obie strony grają identycznie, jak dawniej.",
+            )
+            .changed()
+        {
+            self.write_radar_config();
+        }
+
         // Wzmocnienie sygnału mono na wyjściu — odpowiednik `INTENSITY_SCALE`
         // z `sound::direction` (tam sztywny mnożnik dla WYŚWIETLANIA na
         // radarze), tylko tu regulowalny przez użytkownika i wpływający na

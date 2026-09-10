@@ -78,9 +78,22 @@ pub struct RadarConfig {
     /// pola) nie wyzerowało linii do niewidocznych.
     #[serde(default = "default_line_thickness")]
     pub line_thickness: f32,
+    /// Gdy `true` (domyślnie), dźwięk z przeciwnej strony niż wybrane ucho w
+    /// trybie jednousznym (`MonoEar::Left`/`Right`) dostaje ring modulation
+    /// zamiast po prostu ginąć — patrz `mono_router::fill_output_f32`.
+    /// Wyłączenie wraca do starego, prostszego zachowania (przeciwna strona
+    /// po prostu cicho) dla osób, którym brzęczenie przeszkadza.
+    /// `#[serde(default = ...)]` na `true`, żeby wczytanie starszego pliku
+    /// configu (sprzed tego pola) włączyło nową funkcję zamiast ją wyciszyć.
+    #[serde(default = "default_mono_ring_mod_enabled")]
+    pub mono_ring_mod_enabled: bool,
 }
 
 fn default_overlay_click_through() -> bool {
+    true
+}
+
+fn default_mono_ring_mod_enabled() -> bool {
     true
 }
 
@@ -109,6 +122,7 @@ impl Default for RadarConfig {
             radar_sensitivity: default_radar_sensitivity(),
             edge_glow_enabled: false,
             line_thickness: default_line_thickness(),
+            mono_ring_mod_enabled: default_mono_ring_mod_enabled(),
         }
     }
 }
@@ -193,19 +207,22 @@ const MONO_RING_CAPACITY: usize = 16_384;
 #[derive(Debug, Clone)]
 pub struct SharedAudioAnalysis {
     inner: Arc<Mutex<AudioAnalysis>>,
-    /// Bufor kołowy próbek mono, już zmiksowanych ze wszystkich kanałów —
-    /// zasilany przez TEN SAM strumień wejściowy, który karmi radar
-    /// (`update_analysis`), i czytany przez `mono_router` przy odtwarzaniu.
-    /// Miks do mono dzieje się więc dopiero na samym końcu łańcucha, tuż
-    /// przed wyjściem — radar cały czas dostaje pełne dane per-kanał. Wcześniej
-    /// `mono_router` otwierał WŁASNY, niezależny strumień wejściowy na
-    /// nazwie urządzenia z tej samej listy co radar — na Windows ta lista
-    /// zawiera nazwy urządzeń WYJŚCIOWYCH (do przechwytywania pętlą zwrotną
-    /// WASAPI, patrz `fetch_output_devices`), a `mono_router` szukał ich
-    /// tylko wśród `host.input_devices()`, więc lookup zawsze się nie
-    /// powodził i routing w ogóle nie startował (błąd widoczny tylko w
-    /// konsoli, niewidoczny w UI).
-    mono_ring: Arc<Mutex<VecDeque<f32>>>,
+    /// Bufor kołowy próbek "ważonego mono" — KAŻDA para to `(left_weight,
+    /// right_weight)`, czyli ile energii danej ramki pochodzi z kanałów
+    /// lewej, a ile z prawej strony (patrz [`downmix_to_stereo_pan`]),
+    /// zamiast jednego płaskiego uśrednienia wszystkich kanałów. Dzięki temu
+    /// `mono_router` może w trybie jednousznym oznaczyć dźwięk z przeciwnej
+    /// strony efektem (ring modulation), zamiast bezpowrotnie tracić
+    /// informację L/R już na etapie miksu. Zasilany przez TEN SAM strumień
+    /// wejściowy, który karmi radar (`update_analysis`), i czytany przez
+    /// `mono_router` przy odtwarzaniu. Wcześniej `mono_router` otwierał
+    /// WŁASNY, niezależny strumień wejściowy na nazwie urządzenia z tej samej
+    /// listy co radar — na Windows ta lista zawiera nazwy urządzeń
+    /// WYJŚCIOWYCH (do przechwytywania pętlą zwrotną WASAPI, patrz
+    /// `fetch_output_devices`), a `mono_router` szukał ich tylko wśród
+    /// `host.input_devices()`, więc lookup zawsze się nie powodził i routing
+    /// w ogóle nie startował (błąd widoczny tylko w konsoli, niewidoczny w UI).
+    mono_ring: Arc<Mutex<VecDeque<(f32, f32)>>>,
     /// Stan średniej kroczącej per kanał dla [`crate::sound::direction::detect_onsets`],
     /// który musi przetrwać między kolejnymi wywołaniami `update_analysis`
     /// (jeden callback cpal na ramkę) — stąd trzymany tu, obok `mono_ring`,
@@ -243,11 +260,11 @@ impl SharedAudioAnalysis {
         self.inner.lock()
     }
 
-    /// Dopisuje próbki mono (już zmiksowane) do bufora kołowego czytanego
-    /// przez strumień wyjściowy `mono_router`. Najstarsze próbki są
-    /// odrzucane, gdy bufor jest pełny — routing ma pokazywać "teraz", nie
-    /// gonić zaległości.
-    pub(crate) fn push_mono(&self, samples: &[f32]) {
+    /// Dopisuje próbki "ważonego mono" (`(left_weight, right_weight)`, patrz
+    /// [`downmix_to_stereo_pan`]) do bufora kołowego czytanego przez strumień
+    /// wyjściowy `mono_router`. Najstarsze próbki są odrzucane, gdy bufor
+    /// jest pełny — routing ma pokazywać "teraz", nie gonić zaległości.
+    pub(crate) fn push_stereo_pan(&self, samples: &[(f32, f32)]) {
         if let Ok(mut ring) = self.mono_ring.lock() {
             for &s in samples {
                 if ring.len() >= MONO_RING_CAPACITY {
@@ -258,17 +275,18 @@ impl SharedAudioAnalysis {
         }
     }
 
-    /// Czyta dokładnie `count` próbek mono. Brakujące miejsce (bufor pusty,
-    /// bo przechwytywanie jeszcze nie działa albo dopiero wystartowało)
-    /// wypełnia ciszą, zamiast blokować/zacinać strumień wyjściowy.
-    pub(crate) fn read_mono(&self, count: usize) -> Vec<f32> {
+    /// Czyta dokładnie `count` próbek "ważonego mono". Brakujące miejsce
+    /// (bufor pusty, bo przechwytywanie jeszcze nie działa albo dopiero
+    /// wystartowało) wypełnia ciszą, zamiast blokować/zacinać strumień
+    /// wyjściowy.
+    pub(crate) fn read_stereo_pan(&self, count: usize) -> Vec<(f32, f32)> {
         let mut out = Vec::with_capacity(count);
         if let Ok(mut ring) = self.mono_ring.lock() {
             for _ in 0..count {
-                out.push(ring.pop_front().unwrap_or(0.0));
+                out.push(ring.pop_front().unwrap_or((0.0, 0.0)));
             }
         } else {
-            out.resize(count, 0.0);
+            out.resize(count, (0.0, 0.0));
         }
         out
     }
@@ -657,24 +675,58 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         lock.active_direction_events = direction_events;
     }
 
-    // Miks do mono na sam koniec — dopiero tu, dla ewentualnego odtwarzania
-    // przez `mono_router`. Radar powyżej już dostał pełne dane per-kanał,
-    // więc to nie zastępuje ich, tylko dokłada osobny strumień do wyjścia.
-    analysis.push_mono(&downmix_to_mono(samples, channels));
+    // Miks do "ważonego mono" na sam koniec — dopiero tu, dla ewentualnego
+    // odtwarzania przez `mono_router`. Radar powyżej już dostał pełne dane
+    // per-kanał, więc to nie zastępuje ich, tylko dokłada osobny strumień do
+    // wyjścia.
+    analysis.push_stereo_pan(&downmix_to_stereo_pan(samples, channels));
 }
 
-/// Zinterlacowane próbki `channels`-kanałowe → próbki mono (uśrednione).
-fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
+/// Rozdziela zinterlacowane próbki na dwa "ważone" miksy mono: `(left,
+/// right)`, gdzie każdy to udział energii kanałów danej strony w tej ramce
+/// (patrz [`channel_pan_weights`]) — w przeciwieństwie do dawnego, płaskiego
+/// uśrednienia WSZYSTKICH kanałów, tu informacja L/R przeżywa aż do
+/// `mono_router`, który (w trybie jednousznym) może nią oznaczyć dźwięk z
+/// przeciwnej strony efektem (ring modulation), zamiast go bezpowrotnie
+/// zlewać z resztą.
+fn downmix_to_stereo_pan(interleaved: &[f32], channels: usize) -> Vec<(f32, f32)> {
     if channels == 0 {
         return Vec::new();
     }
     if channels == 1 {
-        return interleaved.to_vec();
+        // Mono źródło: brak informacji o stronie, więc dzielimy po równo.
+        return interleaved.iter().map(|&s| (s * 0.5, s * 0.5)).collect();
     }
+    let layout = direction::channel_layout(channels);
+    let weights: Vec<(f32, f32)> = (0..channels)
+        .map(|i| layout.get(i).copied().map(channel_pan_weights).unwrap_or((0.5, 0.5)))
+        .collect();
     interleaved
         .chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .map(|frame| {
+            let mut left = 0.0f32;
+            let mut right = 0.0f32;
+            for (i, &s) in frame.iter().enumerate() {
+                let (wl, wr) = weights[i];
+                left += s * wl;
+                right += s * wr;
+            }
+            (left / channels as f32, right / channels as f32)
+        })
         .collect()
+}
+
+/// Waga `(lewa, prawa)` pojedynczego kanału przy miksowaniu do "ważonego
+/// mono": pełne `1.0` po swojej stronie dla kanałów jednoznacznie bocznych,
+/// po połowie dla środka/LFE (brak wyraźnej strony, więc trafiają w obie
+/// bez efektu ring modulation w `mono_router`).
+fn channel_pan_weights(role: direction::ChannelRole) -> (f32, f32) {
+    use direction::ChannelRole::*;
+    match role {
+        FrontLeft | RearLeft | SideLeft => (1.0, 0.0),
+        FrontRight | RearRight | SideRight => (0.0, 1.0),
+        Center | Lfe => (0.5, 0.5),
+    }
 }
 
 #[cfg(test)]
@@ -692,5 +744,37 @@ mod tests {
         };
         assert_eq!(dev.get_device_direction(), "Input");
         assert_eq!(dev.get_default_status(), "No");
+    }
+
+    #[test]
+    fn downmix_to_stereo_pan_keeps_left_and_right_separate_for_plain_stereo() {
+        // L=1.0, R=0.5 przez 2 ramki.
+        let interleaved = [1.0, 0.5, 1.0, 0.5];
+        let pan = downmix_to_stereo_pan(&interleaved, 2);
+        assert_eq!(pan, vec![(0.5, 0.25), (0.5, 0.25)]);
+    }
+
+    #[test]
+    fn downmix_to_stereo_pan_sums_back_to_the_old_flat_mono_average() {
+        // (left + right) musi się zgadzać z dawnym płaskim `sum(channels)/channels`
+        // dla KAŻDEGO układu kanałów, bo `mono_router::MonoEar::Both` na tym polega.
+        let interleaved = [1.0, 0.5, 0.2, -0.4, -0.1, 0.3];
+        for &channels in &[1usize, 2, 6] {
+            let pan = downmix_to_stereo_pan(&interleaved[..channels.min(interleaved.len())], channels);
+            if let Some(&(l, r)) = pan.first() {
+                let expected: f32 = interleaved[..channels].iter().sum::<f32>() / channels as f32;
+                assert!((l + r - expected).abs() < 1e-6, "channels={channels}");
+            }
+        }
+    }
+
+    #[test]
+    fn downmix_to_stereo_pan_center_and_lfe_split_evenly() {
+        // 5.1: FrontLeft, FrontRight, Center, Lfe, RearLeft, RearRight — tylko Center głośny.
+        let interleaved = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        let pan = downmix_to_stereo_pan(&interleaved, 6);
+        let (l, r) = pan[0];
+        assert!((l - r).abs() < 1e-6, "Center powinien trafić po równo w obie strony: {pan:?}");
+        assert!(l > 0.0);
     }
 }
