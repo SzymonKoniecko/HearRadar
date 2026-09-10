@@ -78,22 +78,17 @@ pub struct RadarConfig {
     /// pola) nie wyzerowało linii do niewidocznych.
     #[serde(default = "default_line_thickness")]
     pub line_thickness: f32,
-    /// Gdy `true` (domyślnie), dźwięk z przeciwnej strony niż wybrane ucho w
-    /// trybie jednousznym (`MonoEar::Left`/`Right`) dostaje ring modulation
-    /// zamiast po prostu ginąć — patrz `mono_router::fill_output_f32`.
-    /// Wyłączenie wraca do starego, prostszego zachowania (przeciwna strona
-    /// po prostu cicho) dla osób, którym brzęczenie przeszkadza.
-    /// `#[serde(default = ...)]` na `true`, żeby wczytanie starszego pliku
-    /// configu (sprzed tego pola) włączyło nową funkcję zamiast ją wyciszyć.
-    #[serde(default = "default_mono_ring_mod_enabled")]
-    pub mono_ring_mod_enabled: bool,
+    /// Jak oznaczyć dźwięk z przeciwnej strony niż wybrane ucho w trybie
+    /// jednousznym (`MonoEar::Left`/`Right`), żeby dało się po samym
+    /// brzmieniu poznać, że był z drugiej strony — patrz
+    /// [`MonoCueStyle`]/`mono_router::fill_output_f32`. `#[serde(default)]`
+    /// korzysta z `#[default]` wariantu enuma, więc wczytanie starszego
+    /// pliku configu (sprzed tego pola) włącza nową funkcję zamiast ją wyciszyć.
+    #[serde(default)]
+    pub mono_cue_style: MonoCueStyle,
 }
 
 fn default_overlay_click_through() -> bool {
-    true
-}
-
-fn default_mono_ring_mod_enabled() -> bool {
     true
 }
 
@@ -122,7 +117,7 @@ impl Default for RadarConfig {
             radar_sensitivity: default_radar_sensitivity(),
             edge_glow_enabled: false,
             line_thickness: default_line_thickness(),
-            mono_ring_mod_enabled: default_mono_ring_mod_enabled(),
+            mono_cue_style: MonoCueStyle::default(),
         }
     }
 }
@@ -150,6 +145,47 @@ impl MonoEar {
             Self::Left  => "← Lewe ucho",
             Self::Right => "→ Prawe ucho",
             Self::Both  => "↔ Oba",
+        }
+    }
+}
+
+/// Sposób oznaczenia w słuchawce dźwięku z PRZECIWNEJ strony niż aktualnie
+/// grane ucho w trybie jednousznym (`MonoEar::Left`/`Right`) — bez tego cała
+/// informacja L/R ginęłaby, bo obie strony grałyby identycznie w jednym
+/// kanale. Każdy wariant to inny, tani obliczeniowo efekt DSP w czasie
+/// rzeczywistym (patrz `mono_router::apply_cue`), do wyboru wg tego, co komu
+/// łatwiej rozróżnić na ucho.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum MonoCueStyle {
+    /// Strona przeciwna gra niezmieniona, tak samo jak swoja — brak wskazówki
+    /// (zachowanie sprzed dodania tej funkcji).
+    Off,
+    /// Ring modulation ~45 Hz — wyraźne, niskie "brzęczenie".
+    #[default]
+    Buzz,
+    /// Ring modulation ~220 Hz — ten sam mechanizm co `Buzz`, ale szybciej,
+    /// więc brzmi wyżej/"piskliwiej".
+    Squeaky,
+    /// Rytmiczne wyciszanie/odciszanie (~8 Hz) zamiast płynnej fali —
+    /// dźwięk "mruga" zamiast brzęczeć.
+    Pulse,
+    /// Filtr dolnoprzepustowy — strona przeciwna brzmi stłumiona, "zza
+    /// ściany", bez zmiany rytmu głośności (w odróżnieniu od pozostałych
+    /// wariantów, które modulują amplitudę).
+    Muffled,
+}
+
+impl MonoCueStyle {
+    pub const ALL: &'static [Self] =
+        &[Self::Off, Self::Buzz, Self::Squeaky, Self::Pulse, Self::Muffled];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Wyłączone",
+            Self::Buzz => "Brzęczenie",
+            Self::Squeaky => "Bardziej piskliwy",
+            Self::Pulse => "Pulsowanie",
+            Self::Muffled => "Stłumiony",
         }
     }
 }

@@ -11,7 +11,7 @@
 
 use crate::config_store;
 use crate::sound::color_profiles;
-use crate::sound::devices::{self, MonoEar, RadarConfig, SharedAudioAnalysis, SoundDevice};
+use crate::sound::devices::{self, MonoCueStyle, MonoEar, RadarConfig, SharedAudioAnalysis, SoundDevice};
 use crate::sound::direction;
 use crate::sound::mono_router::{self, MonoRouter};
 use crate::sound::spectrum;
@@ -478,24 +478,27 @@ impl HearRadarApp {
             }
         });
 
-        // Ring modulation na stronie przeciwnej do granego ucha (patrz
-        // `mono_router::fill_output_f32`) — bez tego w trybie jednousznym
+        // Efekt na stronie przeciwnej do granego ucha (patrz
+        // `mono_router::apply_cue`) — bez tego w trybie jednousznym
         // (Lewe/Prawe) cała informacja "z której strony był dźwięk" ginie,
         // bo obie strony grają identycznie w jednej słuchawce.
-        if ui
-            .checkbox(
-                &mut self.radar_config.mono_ring_mod_enabled,
-                "Oznacz dźwięk z przeciwnej strony brzęczeniem (tryb jednouszny)",
-            )
-            .on_hover_text(
-                "Włączone: dźwięk z przeciwnej strony niż wybrane ucho brzmi lekko \"brzęcząco\" \
-                 (ring modulation), więc po samym brzmieniu poznasz, że był z drugiej strony. \
-                 Wyłączone: obie strony grają identycznie, jak dawniej.",
-            )
-            .changed()
-        {
-            self.write_radar_config();
-        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Wskazówka dla strony przeciwnej (tryb jednouszny):");
+            for style in MonoCueStyle::ALL {
+                let style = *style;
+                if ui
+                    .selectable_label(self.radar_config.mono_cue_style == style, style.label())
+                    .clicked()
+                {
+                    self.radar_config.mono_cue_style = style;
+                    self.write_radar_config();
+                }
+            }
+        });
+        ui.weak(
+            "Dotyczy tylko ucha Lewe/Prawe: strona przeciwna dostaje wybrany efekt zamiast grać \
+             identycznie jak swoja, żeby po brzmieniu poznać, że dźwięk był z drugiej strony.",
+        );
 
         // Wzmocnienie sygnału mono na wyjściu — odpowiednik `INTENSITY_SCALE`
         // z `sound::direction` (tam sztywny mnożnik dla WYŚWIETLANIA na

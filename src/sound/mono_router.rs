@@ -40,13 +40,74 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
-use crate::sound::devices::{MonoEar, SharedAudioAnalysis};
+use crate::sound::devices::{MonoCueStyle, MonoEar, SharedAudioAnalysis};
 
-/// Częstotliwość (Hz) modulacji pierścieniowej ("brzęczenia") nakładanej na
-/// dźwięk z PRZECIWNEJ strony niż aktualne ucho w trybie jednousznym (patrz
-/// [`fill_output_f32`]) — na tyle nisko, żeby brzmieć jak wyraźna, chropowata
-/// wibracja odróżnialna od czystego dźwięku, a nie po prostu "wyższy ton".
-const RING_MOD_FREQ_HZ: f32 = 45.0;
+/// Częstotliwość (Hz) ring modulation dla [`MonoCueStyle::Buzz`] — na tyle
+/// nisko, żeby brzmieć jak wyraźna, chropowata wibracja odróżnialna od
+/// czystego dźwięku, a nie po prostu "wyższy ton".
+const RING_MOD_BUZZ_HZ: f32 = 45.0;
+
+/// Jak [`RING_MOD_BUZZ_HZ`], ale dla [`MonoCueStyle::Squeaky`] — ten sam
+/// mechanizm (ring modulation), po prostu szybciej, więc brzmi wyżej.
+const RING_MOD_SQUEAKY_HZ: f32 = 220.0;
+
+/// Częstotliwość (Hz) rytmicznego wyciszania/odciszania dla
+/// [`MonoCueStyle::Pulse`] — na tyle wolno, żeby słychać było osobne
+/// "mrugnięcia", a nie ciągłe brzęczenie.
+const PULSE_HZ: f32 = 8.0;
+
+/// Częstotliwość odcięcia (Hz) filtra dolnoprzepustowego dla
+/// [`MonoCueStyle::Muffled`] — poniżej typowego pasma mowy, więc strona
+/// przeciwna brzmi wyraźnie "przytłumiona"/zza ściany.
+const MUFFLED_CUTOFF_HZ: f32 = 800.0;
+
+/// Stan efektu DSP nakładanego na stronę przeciwną (patrz
+/// [`apply_cue`]/[`fill_output_f32`]), trzymany przez wywołującego MIĘDZY
+/// kolejnymi wywołaniami callbacku wyjściowego — inaczej faza oscylatora
+/// (`phase`) i stan filtra (`lp`) resetowałyby się co bufor, dając trzaski na
+/// granicach zamiast płynnego efektu.
+#[derive(Debug, Default, Clone, Copy)]
+struct CueState {
+    /// Faza oscylatora (0.0..=1.0) dla `Buzz`/`Squeaky`/`Pulse`.
+    phase: f32,
+    /// Stan filtra dolnoprzepustowego jednobiegunowego dla `Muffled`.
+    lp: f32,
+}
+
+/// Nakłada efekt `style` na próbkę ze strony przeciwnej do granego ucha —
+/// patrz [`MonoCueStyle`] po opis każdego wariantu. `Off` zwraca próbkę bez
+/// zmian (stare zachowanie sprzed tej funkcji).
+#[inline]
+fn apply_cue(style: MonoCueStyle, sample: f32, sample_rate: f32, state: &mut CueState) -> f32 {
+    let sample_rate = sample_rate.max(1.0);
+    match style {
+        MonoCueStyle::Off => sample,
+        MonoCueStyle::Buzz => {
+            state.phase = (state.phase + RING_MOD_BUZZ_HZ / sample_rate).fract();
+            sample * (0.5 + 0.5 * (state.phase * std::f32::consts::TAU).sin())
+        }
+        MonoCueStyle::Squeaky => {
+            state.phase = (state.phase + RING_MOD_SQUEAKY_HZ / sample_rate).fract();
+            sample * (0.5 + 0.5 * (state.phase * std::f32::consts::TAU).sin())
+        }
+        MonoCueStyle::Pulse => {
+            state.phase = (state.phase + PULSE_HZ / sample_rate).fract();
+            let gate = if (state.phase * std::f32::consts::TAU).sin() > 0.0 { 1.0 } else { 0.0 };
+            sample * gate
+        }
+        MonoCueStyle::Muffled => {
+            // Ten sam jednobiegunowy filtr co `sound::spectrum::one_pole_lowpass`,
+            // tylko ze stanem trzymanym MIĘDZY callbackami zamiast resetowanym
+            // co bufor — filtr ma tu wygładzać ciągły strumień, nie pojedynczą
+            // krótką ramkę analizy.
+            let dt = 1.0 / sample_rate;
+            let rc = 1.0 / (std::f32::consts::TAU * MUFFLED_CUTOFF_HZ);
+            let alpha = dt / (rc + dt);
+            state.lp += alpha * (sample - state.lp);
+            state.lp
+        }
+    }
+}
 
 // ── Uchwyt do strumienia wyjściowego ─────────────────────────────────────────
 
@@ -69,36 +130,37 @@ fn build_output_stream(
     let err_fn = |e| eprintln!("[mono_router] output error: {e}");
 
     // Wyjście obsługujemy tylko jako F32 — konwertujemy jeśli potrzeba.
-    // Sterowanie lewym/prawym uchem przez `analysis.mono_ear`. `mod_phase`
-    // to stan oscylatora ring modulation (patrz `fill_output_f32`) — musi
-    // przetrwać między kolejnymi wywołaniami callbacku, żeby fala nie
-    // "przeskakiwała" fazy i nie trzaskała na granicy buforów.
+    // Sterowanie lewym/prawym uchem przez `analysis.mono_ear`. `cue_state`
+    // (patrz [`CueState`]) to stan efektu nakładanego na stronę przeciwną
+    // (patrz `fill_output_f32`/`apply_cue`) — musi przetrwać między kolejnymi
+    // wywołaniami callbacku, żeby fala/filtr nie resetowały się i nie
+    // trzaskały na granicy buforów.
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
-            let mut mod_phase = 0.0f32;
+            let mut cue_state = CueState::default();
             device.build_output_stream(
                 &stream_config,
                 move |out: &mut [f32], _| {
                     let frames = out.len() / out_channels.max(1);
                     let pan = analysis.read_stereo_pan(frames);
-                    let (ear, gain, ring_mod_enabled) = read_ear_and_gain(&analysis);
-                    fill_output_f32(out, &pan, out_channels, ear, gain, ring_mod_enabled, sample_rate, &mut mod_phase);
+                    let (ear, gain, cue_style) = read_ear_and_gain(&analysis);
+                    fill_output_f32(out, &pan, out_channels, ear, gain, cue_style, sample_rate, &mut cue_state);
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::I16 => {
-            let mut mod_phase = 0.0f32;
+            let mut cue_state = CueState::default();
             device.build_output_stream(
                 &stream_config,
                 move |out: &mut [i16], _| {
                     let frames = out.len() / out_channels.max(1);
                     let pan = analysis.read_stereo_pan(frames);
-                    let (ear, gain, ring_mod_enabled) = read_ear_and_gain(&analysis);
+                    let (ear, gain, cue_style) = read_ear_and_gain(&analysis);
                     // Konwersja f32 → i16
                     let mut tmp = vec![0.0f32; out.len()];
-                    fill_output_f32(&mut tmp, &pan, out_channels, ear, gain, ring_mod_enabled, sample_rate, &mut mod_phase);
+                    fill_output_f32(&mut tmp, &pan, out_channels, ear, gain, cue_style, sample_rate, &mut cue_state);
                     for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
                         *dst = (src * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                     }
@@ -108,15 +170,15 @@ fn build_output_stream(
             )?
         }
         SampleFormat::U16 => {
-            let mut mod_phase = 0.0f32;
+            let mut cue_state = CueState::default();
             device.build_output_stream(
                 &stream_config,
                 move |out: &mut [u16], _| {
                     let frames = out.len() / out_channels.max(1);
                     let pan = analysis.read_stereo_pan(frames);
-                    let (ear, gain, ring_mod_enabled) = read_ear_and_gain(&analysis);
+                    let (ear, gain, cue_style) = read_ear_and_gain(&analysis);
                     let mut tmp = vec![0.0f32; out.len()];
-                    fill_output_f32(&mut tmp, &pan, out_channels, ear, gain, ring_mod_enabled, sample_rate, &mut mod_phase);
+                    fill_output_f32(&mut tmp, &pan, out_channels, ear, gain, cue_style, sample_rate, &mut cue_state);
                     for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
                         // f32 (-1..1) → u16 (0..65535), środek = 32768
                         *dst = ((src * 0.5 + 0.5) * u16::MAX as f32)
@@ -140,14 +202,14 @@ fn db_to_linear(db: f32) -> f32 {
 }
 
 /// Czyta `mono_ear`, `radar_config.mono_boost_db` i
-/// `radar_config.mono_ring_mod_enabled` jednym lockiem i od razu zamienia dB
-/// na mnożnik — wołane raz na każdą ramkę callbacku wyjściowego.
-fn read_ear_and_gain(analysis: &SharedAudioAnalysis) -> (MonoEar, f32, bool) {
-    let (ear, boost_db, ring_mod_enabled) = analysis
+/// `radar_config.mono_cue_style` jednym lockiem i od razu zamienia dB na
+/// mnożnik — wołane raz na każdą ramkę callbacku wyjściowego.
+fn read_ear_and_gain(analysis: &SharedAudioAnalysis) -> (MonoEar, f32, MonoCueStyle) {
+    let (ear, boost_db, cue_style) = analysis
         .lock()
-        .map(|g| (g.mono_ear, g.radar_config.mono_boost_db, g.radar_config.mono_ring_mod_enabled))
-        .unwrap_or((MonoEar::Off, 0.0, true));
-    (ear, db_to_linear(boost_db), ring_mod_enabled)
+        .map(|g| (g.mono_ear, g.radar_config.mono_boost_db, g.radar_config.mono_cue_style))
+        .unwrap_or((MonoEar::Off, 0.0, MonoCueStyle::Off));
+    (ear, db_to_linear(boost_db), cue_style)
 }
 
 // ── Wypełnianie bufora wyjściowego ───────────────────────────────────────────
@@ -160,16 +222,15 @@ fn read_ear_and_gain(analysis: &SharedAudioAnalysis) -> (MonoEar, f32, bool) {
 /// łańcuchu. Kanały poza `out_channels` są zerowane.
 ///
 /// `ear` decyduje który kanał stereo dostaje sygnał — w trybach jednousznych
-/// (`Left`/`Right`), gdy `ring_mod_enabled` jest `true`, strona PRZECIWNA do
-/// granego ucha nie jest po prostu domiksowywana "na płasko": dostaje ring
-/// modulation (mnożenie przez falę sinusoidalną o częstotliwości
-/// [`RING_MOD_FREQ_HZ`], stan fazy w `mod_phase`, trzymany przez
-/// wywołującego między callbackami), żeby dało się usłyszeć w jednej
-/// słuchawce, że dźwięk oryginalnie był z drugiej strony — bez tego cała
-/// informacja L/R ginęłaby w trybie jednousznym. `ring_mod_enabled = false`
-/// (checkbox w UI, `RadarConfig::mono_ring_mod_enabled`) wraca do starego
-/// zachowania: strona przeciwna gra na pełnej głośności, tak samo jak swoja,
-/// bez żadnego oznaczenia — dla osób, którym brzęczenie przeszkadza.
+/// (`Left`/`Right`) strona PRZECIWNA do granego ucha nie jest po prostu
+/// domiksowywana "na płasko": dostaje efekt wg `cue_style` (patrz
+/// [`apply_cue`]/[`MonoCueStyle`], `cue_state` trzymany przez wywołującego
+/// między callbackami), żeby dało się usłyszeć w jednej słuchawce, że dźwięk
+/// oryginalnie był z drugiej strony — bez tego cała informacja L/R ginęłaby
+/// w trybie jednousznym. `MonoCueStyle::Off` (checkbox/wybór w UI,
+/// `RadarConfig::mono_cue_style`) wraca do starego zachowania: strona
+/// przeciwna gra na pełnej głośności, tak samo jak swoja, bez żadnego
+/// oznaczenia.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn fill_output_f32(
@@ -178,20 +239,13 @@ fn fill_output_f32(
     out_channels: usize,
     ear: MonoEar,
     gain: f32,
-    ring_mod_enabled: bool,
+    cue_style: MonoCueStyle,
     sample_rate: f32,
-    mod_phase: &mut f32,
+    cue_state: &mut CueState,
 ) {
     let ch = out_channels.max(1);
-    let phase_step = RING_MOD_FREQ_HZ / sample_rate.max(1.0);
     for (frame_idx, frame) in out.chunks_exact_mut(ch).enumerate() {
         let (left, right) = pan.get(frame_idx).copied().unwrap_or((0.0, 0.0));
-        *mod_phase = (*mod_phase + phase_step).fract();
-        let ring_gain = if ring_mod_enabled {
-            0.5 + 0.5 * (*mod_phase * std::f32::consts::TAU).sin()
-        } else {
-            1.0
-        };
 
         for s in frame.iter_mut() {
             *s = 0.0;
@@ -199,18 +253,21 @@ fn fill_output_f32(
         match ear {
             MonoEar::Off => { /* cisza */ }
             MonoEar::Left => {
-                frame[0] = ((left + right * ring_gain) * gain).clamp(-1.0, 1.0);
+                let opposite = apply_cue(cue_style, right, sample_rate, cue_state);
+                frame[0] = ((left + opposite) * gain).clamp(-1.0, 1.0);
             }
             MonoEar::Right if ch >= 2 => {
-                frame[1] = ((right + left * ring_gain) * gain).clamp(-1.0, 1.0);
+                let opposite = apply_cue(cue_style, left, sample_rate, cue_state);
+                frame[1] = ((right + opposite) * gain).clamp(-1.0, 1.0);
             }
             MonoEar::Right => {
                 // mono device fallback
-                frame[0] = ((right + left * ring_gain) * gain).clamp(-1.0, 1.0);
+                let opposite = apply_cue(cue_style, left, sample_rate, cue_state);
+                frame[0] = ((right + opposite) * gain).clamp(-1.0, 1.0);
             }
             MonoEar::Both => {
                 // Oba uszy już słyszą osobno lewą/prawą stronę (stereo
-                // wyjście) — bez ring modulation, bo cue nie jest tu potrzebne.
+                // wyjście) — bez efektu, bo cue nie jest tu potrzebne.
                 let sample = ((left + right) * gain).clamp(-1.0, 1.0);
                 frame[0] = sample;
                 if ch >= 2 {
@@ -264,24 +321,24 @@ pub fn start_mono_output(
 mod tests {
     use super::*;
 
-    /// Kilka klatek stałej pary `(left, right)`, żeby oscylator ring
-    /// modulation zdążył przejść przez pełny cykl i test złapał zarówno
-    /// szczyt, jak i dolinę fali.
+    /// Kilka klatek stałej pary `(left, right)`, z domyślnym stylem `Buzz`
+    /// (wystarczająco klatek, żeby oscylator zdążył przejść przez pełny
+    /// cykl i test złapał zarówno szczyt, jak i dolinę fali).
     fn run_frames(pan: &(f32, f32), n: usize, out_channels: usize, ear: MonoEar) -> Vec<f32> {
-        run_frames_with_ring_mod(pan, n, out_channels, ear, true)
+        run_frames_with_style(pan, n, out_channels, ear, MonoCueStyle::Buzz)
     }
 
-    fn run_frames_with_ring_mod(
+    fn run_frames_with_style(
         pan: &(f32, f32),
         n: usize,
         out_channels: usize,
         ear: MonoEar,
-        ring_mod_enabled: bool,
+        cue_style: MonoCueStyle,
     ) -> Vec<f32> {
         let pan_frames = vec![*pan; n];
         let mut out = vec![0.0f32; n * out_channels];
-        let mut mod_phase = 0.0f32;
-        fill_output_f32(&mut out, &pan_frames, out_channels, ear, 1.0, ring_mod_enabled, 48_000.0, &mut mod_phase);
+        let mut cue_state = CueState::default();
+        fill_output_f32(&mut out, &pan_frames, out_channels, ear, 1.0, cue_style, 48_000.0, &mut cue_state);
         out
     }
 
@@ -298,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn left_ear_ring_modulates_the_right_side_instead_of_silencing_it() {
+    fn buzz_ring_modulates_the_right_side_instead_of_silencing_it() {
         // Czysty dźwięk z prawej (left=0) grany w trybie Left: nie może być
         // ani ciszą (informacja by zginęła), ani stałą wartością (nie dałoby
         // się jej odróżnić od dźwięku z lewej) — musi się wahać z ring
@@ -312,14 +369,57 @@ mod tests {
     }
 
     #[test]
-    fn ring_mod_disabled_plays_the_opposite_side_at_full_unmodulated_strength() {
-        // Checkbox wyłączony: strona przeciwna wraca do dawnego, prostego
+    fn squeaky_oscillates_faster_than_buzz() {
+        // `Squeaky` to ten sam mechanizm co `Buzz`, tylko szybszy — w tej
+        // samej liczbie klatek powinien przejść więcej pełnych cykli, czyli
+        // więcej razy przeciąć zero.
+        let count_zero_crossings = |samples: &[f32]| {
+            samples.windows(2).filter(|w| (w[0] - 0.35).signum() != (w[1] - 0.35).signum()).count()
+        };
+        let buzz = run_frames_with_style(&(0.0, 0.7), 256, 2, MonoEar::Left, MonoCueStyle::Buzz);
+        let squeaky = run_frames_with_style(&(0.0, 0.7), 256, 2, MonoEar::Left, MonoCueStyle::Squeaky);
+        let buzz_left: Vec<f32> = buzz.chunks_exact(2).map(|f| f[0]).collect();
+        let squeaky_left: Vec<f32> = squeaky.chunks_exact(2).map(|f| f[0]).collect();
+        assert!(
+            count_zero_crossings(&squeaky_left) > count_zero_crossings(&buzz_left),
+            "Squeaky powinien oscylować wyraźnie szybciej niż Buzz"
+        );
+    }
+
+    #[test]
+    fn pulse_fully_mutes_during_gaps_instead_of_smoothly_fading() {
+        // `Pulse` to bramkowanie 0/1, więc w przeciwieństwie do `Buzz`
+        // (płynna fala 0.5..1.0) powinny się pojawić próbki DOKŁADNIE zerowe.
+        // Przy 48 kHz i `PULSE_HZ` = 8 Hz jeden pełny cykl to 6000 klatek —
+        // trzeba ich wygenerować z zapasem, żeby test złapał obie fazy bramki.
+        let out = run_frames_with_style(&(0.0, 0.7), 7_000, 2, MonoEar::Left, MonoCueStyle::Pulse);
+        let left_channel: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
+        assert!(left_channel.iter().any(|&s| s == 0.0), "Pulse powinien mieć momenty całkowitej ciszy");
+        assert!(left_channel.iter().any(|&s| (s - 0.7).abs() < 1e-6), "Pulse powinien mieć momenty pełnej głośności");
+    }
+
+    #[test]
+    fn muffled_smooths_a_step_instead_of_oscillating() {
+        // `Muffled` to filtr dolnoprzepustowy: przy stałym wejściu wartość
+        // powinna monotonicznie zbliżać się do sygnału, NIE oscylować jak
+        // pozostałe style.
+        let out = run_frames_with_style(&(0.0, 0.7), 64, 2, MonoEar::Left, MonoCueStyle::Muffled);
+        let left_channel: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
+        for pair in left_channel.windows(2) {
+            assert!(pair[1] + 1e-6 >= pair[0], "filtr dolnoprzepustowy powinien narastać monotonicznie: {left_channel:?}");
+        }
+        assert!(left_channel.last().unwrap() > &0.3, "po 64 próbkach filtr powinien zdążyć zauważalnie narosnąć");
+    }
+
+    #[test]
+    fn off_style_plays_the_opposite_side_at_full_unmodulated_strength() {
+        // `MonoCueStyle::Off`: strona przeciwna wraca do dawnego, prostego
         // zachowania sprzed tej funkcji — pełna głośność, stała wartość, bez
-        // wahania — zamiast ring modulation.
-        let out = run_frames_with_ring_mod(&(0.0, 0.7), 16, 2, MonoEar::Left, false);
+        // wahania — zamiast jakiegokolwiek efektu.
+        let out = run_frames_with_style(&(0.0, 0.7), 16, 2, MonoEar::Left, MonoCueStyle::Off);
         let left_channel: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
         for &s in &left_channel {
-            assert!((s - 0.7).abs() < 1e-6, "bez ring mod sygnał z prawej ma grać niezmieniony: {s}");
+            assert!((s - 0.7).abs() < 1e-6, "przy Off sygnał z prawej ma grać niezmieniony: {s}");
         }
     }
 
@@ -333,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn off_produces_silence() {
+    fn off_ear_produces_silence() {
         let out = run_frames(&(0.9, 0.9), 8, 2, MonoEar::Off);
         assert!(out.iter().all(|&s| s == 0.0));
     }
