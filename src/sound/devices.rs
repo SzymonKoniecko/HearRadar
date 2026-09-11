@@ -173,11 +173,24 @@ pub enum MonoCueStyle {
     /// ściany", bez zmiany rytmu głośności (w odróżnieniu od pozostałych
     /// wariantów, które modulują amplitudę).
     Muffled,
+    /// Podbicie wysokich tonów (dopełnienie filtra z `Muffled`) — strona
+    /// przeciwna brzmi jaśniej/cieńciej, bez zmiany rytmu głośności.
+    Bright,
+    /// Mocniejszy filtr dolnoprzepustowy niż `Muffled` (niższe odcięcie) —
+    /// strona przeciwna brzmi wyraźnie ciemniej/głucho.
+    Dark,
 }
 
 impl MonoCueStyle {
-    pub const ALL: &'static [Self] =
-        &[Self::Off, Self::Buzz, Self::Squeaky, Self::Pulse, Self::Muffled];
+    pub const ALL: &'static [Self] = &[
+        Self::Off,
+        Self::Buzz,
+        Self::Squeaky,
+        Self::Pulse,
+        Self::Muffled,
+        Self::Bright,
+        Self::Dark,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -186,6 +199,8 @@ impl MonoCueStyle {
             Self::Squeaky => "Bardziej piskliwy",
             Self::Pulse => "Pulsowanie",
             Self::Muffled => "Stłumiony",
+            Self::Bright => "Jasny",
+            Self::Dark => "Ciemny",
         }
     }
 }

@@ -61,6 +61,21 @@ const PULSE_HZ: f32 = 8.0;
 /// przeciwna brzmi wyraźnie "przytłumiona"/zza ściany.
 const MUFFLED_CUTOFF_HZ: f32 = 800.0;
 
+/// Jak [`MUFFLED_CUTOFF_HZ`], ale niższe — dla [`MonoCueStyle::Dark`], który
+/// ma brzmieć wyraźnie bardziej głucho niż zwykły `Muffled`.
+const DARK_CUTOFF_HZ: f32 = 300.0;
+
+/// Odcięcie (Hz) filtra dolnoprzepustowego, którego DOPEŁNIENIE
+/// (`sample - lowpass`) daje składową wysokotonową dla [`MonoCueStyle::Bright`]
+/// — te same pasmo co `Muffled`, tylko użyte w drugą stronę (dodane, nie
+/// odjęte od oryginału).
+const BRIGHT_HIGHPASS_CUTOFF_HZ: f32 = 800.0;
+
+/// O ile wzmocnić składową wysokotonową w [`MonoCueStyle::Bright`] — na tyle
+/// mocno, żeby zmiana barwy była jednoznacznie słyszalna, ale bez ostrego
+/// przesterowania przy typowych, niegłośnych sygnałach z radaru.
+const BRIGHT_BOOST_GAIN: f32 = 1.5;
+
 /// Stan efektu DSP nakładanego na stronę przeciwną (patrz
 /// [`apply_cue`]/[`fill_output_f32`]), trzymany przez wywołującego MIĘDZY
 /// kolejnymi wywołaniami callbacku wyjściowego — inaczej faza oscylatora
@@ -70,8 +85,24 @@ const MUFFLED_CUTOFF_HZ: f32 = 800.0;
 struct CueState {
     /// Faza oscylatora (0.0..=1.0) dla `Buzz`/`Squeaky`/`Pulse`.
     phase: f32,
-    /// Stan filtra dolnoprzepustowego jednobiegunowego dla `Muffled`.
+    /// Stan filtra dolnoprzepustowego jednobiegunowego dla
+    /// `Muffled`/`Dark`/`Bright` (ten ostatni używa go pośrednio, przez
+    /// [`highpass_component`]).
     lp: f32,
+}
+
+/// Jeden krok jednobiegunowego filtra dolnoprzepustowego, ze stanem `lp`
+/// trzymanym MIĘDZY callbackami (w przeciwieństwie do
+/// `sound::spectrum::one_pole_lowpass`, który resetuje stan co krótką ramkę
+/// analizy — tu filtrujemy ciągły strumień wyjściowy). Zwraca przefiltrowaną
+/// próbkę.
+#[inline]
+fn one_pole_lowpass_step(sample: f32, sample_rate: f32, cutoff_hz: f32, lp: &mut f32) -> f32 {
+    let dt = 1.0 / sample_rate;
+    let rc = 1.0 / (std::f32::consts::TAU * cutoff_hz);
+    let alpha = dt / (rc + dt);
+    *lp += alpha * (sample - *lp);
+    *lp
 }
 
 /// Nakłada efekt `style` na próbkę ze strony przeciwnej do granego ucha —
@@ -95,16 +126,16 @@ fn apply_cue(style: MonoCueStyle, sample: f32, sample_rate: f32, state: &mut Cue
             let gate = if (state.phase * std::f32::consts::TAU).sin() > 0.0 { 1.0 } else { 0.0 };
             sample * gate
         }
-        MonoCueStyle::Muffled => {
-            // Ten sam jednobiegunowy filtr co `sound::spectrum::one_pole_lowpass`,
-            // tylko ze stanem trzymanym MIĘDZY callbackami zamiast resetowanym
-            // co bufor — filtr ma tu wygładzać ciągły strumień, nie pojedynczą
-            // krótką ramkę analizy.
-            let dt = 1.0 / sample_rate;
-            let rc = 1.0 / (std::f32::consts::TAU * MUFFLED_CUTOFF_HZ);
-            let alpha = dt / (rc + dt);
-            state.lp += alpha * (sample - state.lp);
-            state.lp
+        MonoCueStyle::Muffled => one_pole_lowpass_step(sample, sample_rate, MUFFLED_CUTOFF_HZ, &mut state.lp),
+        MonoCueStyle::Dark => one_pole_lowpass_step(sample, sample_rate, DARK_CUTOFF_HZ, &mut state.lp),
+        MonoCueStyle::Bright => {
+            // Dopełnienie filtra dolnoprzepustowego (`sample - lowpass`) to
+            // składowa wysokotonowa — dodajemy ją z powrotem do oryginału ze
+            // wzmocnieniem, więc wysokie tony stają się głośniejsze względem
+            // reszty widma zamiast tłumić resztę (jak w `Muffled`/`Dark`).
+            let low = one_pole_lowpass_step(sample, sample_rate, BRIGHT_HIGHPASS_CUTOFF_HZ, &mut state.lp);
+            let high = sample - low;
+            sample + high * BRIGHT_BOOST_GAIN
         }
     }
 }
@@ -409,6 +440,61 @@ mod tests {
             assert!(pair[1] + 1e-6 >= pair[0], "filtr dolnoprzepustowy powinien narastać monotonicznie: {left_channel:?}");
         }
         assert!(left_channel.last().unwrap() > &0.3, "po 64 próbkach filtr powinien zdążyć zauważalnie narosnąć");
+    }
+
+    #[test]
+    fn dark_has_a_lower_cutoff_than_muffled_so_it_rises_slower() {
+        // Ten sam test co `muffled_smooths_a_step_instead_of_oscillating`,
+        // ale porównawczy: przy identycznym skoku wejścia i tej samej liczbie
+        // próbek `Dark` (niższe odcięcie) powinien być dalej od celu niż
+        // `Muffled` — czyli brzmieć wyraźniej "głucho".
+        let sample_rate = 48_000.0;
+        let mut muffled_state = CueState::default();
+        let mut dark_state = CueState::default();
+        let mut muffled_out = 0.0;
+        let mut dark_out = 0.0;
+        for _ in 0..64 {
+            muffled_out = apply_cue(MonoCueStyle::Muffled, 0.7, sample_rate, &mut muffled_state);
+            dark_out = apply_cue(MonoCueStyle::Dark, 0.7, sample_rate, &mut dark_state);
+        }
+        assert!(
+            dark_out < muffled_out,
+            "Dark (niższe odcięcie) powinien narastać wolniej niż Muffled: dark={dark_out} muffled={muffled_out}"
+        );
+    }
+
+    #[test]
+    fn bright_leaves_a_steady_signal_unchanged_once_settled() {
+        // Przy STAŁYM sygnale składowa wysokotonowa (dopełnienie lowpassu)
+        // zanika do zera, więc po ustabilizowaniu się filtra `Bright` nie
+        // powinien nic dokładać — inaczej cichy, ciągły dźwięk brzmiałby
+        // głośniej niż w rzeczywistości.
+        let sample_rate = 48_000.0;
+        let mut state = CueState::default();
+        let mut out = 0.0;
+        for _ in 0..2000 {
+            out = apply_cue(MonoCueStyle::Bright, 0.7, sample_rate, &mut state);
+        }
+        assert!((out - 0.7).abs() < 1e-3, "przy stałym sygnale składowa wysokotonowa powinna zaniknąć: {out}");
+    }
+
+    #[test]
+    fn bright_amplifies_a_fast_alternating_signal_beyond_its_own_amplitude() {
+        // Sygnał zmieniający znak co próbkę to najwyższa możliwa
+        // częstotliwość dla danej częstotliwości próbkowania (Nyquist) —
+        // idealny przypadek do sprawdzenia podbicia wysokich tonów.
+        let sample_rate = 48_000.0;
+        let mut state = CueState::default();
+        let mut max_abs = 0.0f32;
+        for i in 0..64 {
+            let sample = if i % 2 == 0 { 0.5 } else { -0.5 };
+            let out = apply_cue(MonoCueStyle::Bright, sample, sample_rate, &mut state);
+            max_abs = max_abs.max(out.abs());
+        }
+        assert!(
+            max_abs > 0.5,
+            "Bright powinien wzmacniać szybkozmienny sygnał ponad jego własną amplitudę: {max_abs}"
+        );
     }
 
     #[test]
