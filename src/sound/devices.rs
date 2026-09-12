@@ -274,6 +274,10 @@ pub struct SharedAudioAnalysis {
     /// `host.input_devices()`, więc lookup zawsze się nie powodził i routing
     /// w ogóle nie startował (błąd widoczny tylko w konsoli, niewidoczny w UI).
     mono_ring: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    /// Ostatnia próbka realnie zdjęta z `mono_ring` przez [`Self::read_stereo_pan`]
+    /// — trzymana, żeby przy podkręceniu bufora (patrz tam) powtórzyć ją
+    /// zamiast wstawiać twarde zero.
+    last_pan: Arc<Mutex<(f32, f32)>>,
     /// Stan średniej kroczącej per kanał dla [`crate::sound::direction::detect_onsets`],
     /// który musi przetrwać między kolejnymi wywołaniami `update_analysis`
     /// (jeden callback cpal na ramkę) — stąd trzymany tu, obok `mono_ring`,
@@ -296,6 +300,7 @@ impl Default for SharedAudioAnalysis {
         Self {
             inner: Arc::new(Mutex::new(AudioAnalysis::default())),
             mono_ring: Arc::new(Mutex::new(VecDeque::with_capacity(MONO_RING_CAPACITY))),
+            last_pan: Arc::new(Mutex::new((0.0, 0.0))),
             onset_ema: Arc::new(Mutex::new(Vec::new())),
             sample_logger: Arc::new(sample_logger::SampleLogger::new()),
         }
@@ -326,18 +331,40 @@ impl SharedAudioAnalysis {
         }
     }
 
-    /// Czyta dokładnie `count` próbek "ważonego mono". Brakujące miejsce
-    /// (bufor pusty, bo przechwytywanie jeszcze nie działa albo dopiero
-    /// wystartowało) wypełnia ciszą, zamiast blokować/zacinać strumień
-    /// wyjściowy.
+    /// Czyta dokładnie `count` próbek "ważonego mono". Wejście i wyjście to
+    /// dwa NIEZALEŻNE zegary sprzętowe (osobne urządzenia audio) — nawet przy
+    /// tej samej nominalnej częstotliwości próbkowania powoli się rozjeżdżają,
+    /// więc bufor kołowy co jakiś czas na chwilę wysycha (podkręcanie), zanim
+    /// dogoni go kolejna porcja z wejścia. Wcześniej brakujące miejsce
+    /// wypełnialiśmy twardym zerem — nagła cisza-w-środku-sygnału słyszalna
+    /// jako pojedyncza ścinka/trzask co parę sekund. Zamiast tego powtarzamy
+    /// (`last_pan`) ostatnią realnie odczytaną próbkę, lekko wygaszając ją co
+    /// klatkę — jedna-dwie powtórzone próbki są niesłyszalne (zero-order
+    /// hold), a przy dłuższym zaniku (przechwytywanie faktycznie stoi) i tak
+    /// płynnie spada do ciszy zamiast zapętlać się w nieskończoność.
     pub(crate) fn read_stereo_pan(&self, count: usize) -> Vec<(f32, f32)> {
+        const HOLD_DECAY: f32 = 0.999;
         let mut out = Vec::with_capacity(count);
+        let mut last = self.last_pan.lock().map(|g| *g).unwrap_or((0.0, 0.0));
         if let Ok(mut ring) = self.mono_ring.lock() {
             for _ in 0..count {
-                out.push(ring.pop_front().unwrap_or((0.0, 0.0)));
+                let sample = match ring.pop_front() {
+                    Some(s) => {
+                        last = s;
+                        s
+                    }
+                    None => {
+                        last = (last.0 * HOLD_DECAY, last.1 * HOLD_DECAY);
+                        last
+                    }
+                };
+                out.push(sample);
             }
         } else {
             out.resize(count, (0.0, 0.0));
+        }
+        if let Ok(mut guard) = self.last_pan.lock() {
+            *guard = last;
         }
         out
     }
@@ -827,5 +854,25 @@ mod tests {
         let (l, r) = pan[0];
         assert!((l - r).abs() < 1e-6, "Center powinien trafić po równo w obie strony: {pan:?}");
         assert!(l > 0.0);
+    }
+
+    #[test]
+    fn read_stereo_pan_holds_last_sample_on_underrun_instead_of_hard_zero() {
+        // Regresja dla "co parę sekund pojedyncza ścinka dźwięku": gdy wejście
+        // i wyjście (dwa niezależne zegary audio) rozjadą się na tyle, że
+        // bufor na chwilę wyschnie, odczyt NIE może wstawić twardego zera —
+        // to słychać jako trzask. Ma powtórzyć (z lekkim wygaszeniem) ostatnią
+        // realną próbkę.
+        let analysis = SharedAudioAnalysis::new();
+        analysis.push_stereo_pan(&[(0.6, 0.4), (0.6, 0.4)]);
+        // Prosimy o więcej próbek niż jest w buforze — reszta to "podkręcanie".
+        let out = analysis.read_stereo_pan(5);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], (0.6, 0.4));
+        assert_eq!(out[1], (0.6, 0.4));
+        for &(l, r) in &out[2..] {
+            assert!(l > 0.0 && r > 0.0, "podkręcanie ma powtarzać ostatnią próbkę, nie wstawiać ciszy: {out:?}");
+            assert!(l <= 0.6 && r <= 0.4, "powtórzona próbka ma się lekko wygaszać, nie rosnąć: {out:?}");
+        }
     }
 }

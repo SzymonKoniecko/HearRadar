@@ -49,7 +49,21 @@ const RING_MOD_BUZZ_HZ: f32 = 45.0;
 
 /// Jak [`RING_MOD_BUZZ_HZ`], ale dla [`MonoCueStyle::Squeaky`] — ten sam
 /// mechanizm (ring modulation), po prostu szybciej, więc brzmi wyżej.
-const RING_MOD_SQUEAKY_HZ: f32 = 220.0;
+///
+/// Wcześniej 220 Hz przy pełnej głębokości modulacji ([`RING_MOD_SQUEAKY_DEPTH`]
+/// = 1.0) brzmiało nieprzyjemnie piskliwie/metalicznie — obniżone do 140 Hz,
+/// żeby zostać wyraźnie ponad `Buzz` (wciąż jednoznacznie odróżnialne, patrz
+/// test `squeaky_oscillates_faster_than_buzz`), ale poza najbardziej
+/// drażniącym dla ucha zakresem.
+const RING_MOD_SQUEAKY_HZ: f32 = 140.0;
+
+/// Głębokość modulacji amplitudy (0.0 = brak efektu, 1.0 = pełne zejście do
+/// ciszy na dnie każdego cyklu, jak wcześniej) dla [`MonoCueStyle::Squeaky`].
+/// Pełna głębokość przy szybkim oscylatorze brzmi jak ostre bramkowanie —
+/// obniżenie do części zakresu (obwiednia nigdy nie schodzi poniżej ~45%
+/// oryginalnej amplitudy) zaokrągla brzmienie do wyraźnego, ale
+/// znośniejszego "trzepotania", zamiast przeszywającego pisku.
+const RING_MOD_SQUEAKY_DEPTH: f32 = 0.55;
 
 /// Częstotliwość (Hz) rytmicznego wyciszania/odciszania dla
 /// [`MonoCueStyle::Pulse`] — na tyle wolno, żeby słychać było osobne
@@ -91,6 +105,18 @@ struct CueState {
     lp: f32,
 }
 
+/// Jeden krok oscylatora modulacji amplitudy: przesuwa `state.phase` o
+/// `freq_hz` i zwraca `sample` przemnożoną przez obwiednię sinusoidalną w
+/// zakresie `[1 - depth, 1]` — `depth = 1.0` schodzi na dnie cyklu do
+/// całkowitej ciszy (jak dawne `Buzz`/`Squeaky`), niższe wartości zostawiają
+/// resztkę sygnału słyszalną cały czas, co brzmi łagodniej.
+#[inline]
+fn am_modulate(sample: f32, freq_hz: f32, depth: f32, sample_rate: f32, phase: &mut f32) -> f32 {
+    *phase = (*phase + freq_hz / sample_rate).fract();
+    let envelope = 1.0 - depth * 0.5 * (1.0 - (*phase * std::f32::consts::TAU).sin());
+    sample * envelope
+}
+
 /// Jeden krok jednobiegunowego filtra dolnoprzepustowego, ze stanem `lp`
 /// trzymanym MIĘDZY callbackami (w przeciwieństwie do
 /// `sound::spectrum::one_pole_lowpass`, który resetuje stan co krótką ramkę
@@ -113,13 +139,9 @@ fn apply_cue(style: MonoCueStyle, sample: f32, sample_rate: f32, state: &mut Cue
     let sample_rate = sample_rate.max(1.0);
     match style {
         MonoCueStyle::Off => sample,
-        MonoCueStyle::Buzz => {
-            state.phase = (state.phase + RING_MOD_BUZZ_HZ / sample_rate).fract();
-            sample * (0.5 + 0.5 * (state.phase * std::f32::consts::TAU).sin())
-        }
+        MonoCueStyle::Buzz => am_modulate(sample, RING_MOD_BUZZ_HZ, 1.0, sample_rate, &mut state.phase),
         MonoCueStyle::Squeaky => {
-            state.phase = (state.phase + RING_MOD_SQUEAKY_HZ / sample_rate).fract();
-            sample * (0.5 + 0.5 * (state.phase * std::f32::consts::TAU).sin())
+            am_modulate(sample, RING_MOD_SQUEAKY_HZ, RING_MOD_SQUEAKY_DEPTH, sample_rate, &mut state.phase)
         }
         MonoCueStyle::Pulse => {
             state.phase = (state.phase + PULSE_HZ / sample_rate).fract();
@@ -232,6 +254,34 @@ fn db_to_linear(db: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 
+/// Próg (amplituda), poniżej którego [`soft_limit`] nie rusza sygnału wcale
+/// — normalne, nieprzesterowane poziomy (w tym wszystkie dotychczasowe
+/// testy w tym pliku) muszą wyjść niezmienione.
+const SOFT_LIMIT_KNEE: f32 = 0.8;
+
+/// Miękki limiter amplitudy: identyczność poniżej [`SOFT_LIMIT_KNEE`],
+/// powyżej płynne (tanh) dogięcie do `±1.0` zamiast twardego `clamp`.
+///
+/// `frame[0] = (left + opposite) * gain` w [`fill_output_f32`] regularnie
+/// przekracza `±1.0` — zarówno gdy oba kanały grają jednocześnie głośno, jak
+/// i przy `mono_boost_db > 0`. Twarde obcięcie w tym miejscu spłaszcza
+/// szczyt fali (ostra nieciągłość pochodnej), co słychać jako trzaski/ścinki
+/// ("zminimalizuj ścinki dźwięku przy mono"); dodatkowo te produkty
+/// zniekształceń mieszają się z oscylatorem `Buzz`/`Squeaky` z [`apply_cue`]
+/// i wzmacniają jego nieprzyjemną, piskliwą barwę. Miękkie dogięcie
+/// eliminuje tę nieciągłość, więc oba objawy znikają razem.
+#[inline]
+fn soft_limit(x: f32) -> f32 {
+    let mag = x.abs();
+    if mag <= SOFT_LIMIT_KNEE {
+        return x;
+    }
+    let span = 1.0 - SOFT_LIMIT_KNEE;
+    let over = (mag - SOFT_LIMIT_KNEE) / span;
+    let compressed = SOFT_LIMIT_KNEE + span * over.tanh();
+    x.signum() * compressed
+}
+
 /// Czyta `mono_ear`, `radar_config.mono_boost_db` i
 /// `radar_config.mono_cue_style` jednym lockiem i od razu zamienia dB na
 /// mnożnik — wołane raz na każdą ramkę callbacku wyjściowego.
@@ -285,21 +335,21 @@ fn fill_output_f32(
             MonoEar::Off => { /* cisza */ }
             MonoEar::Left => {
                 let opposite = apply_cue(cue_style, right, sample_rate, cue_state);
-                frame[0] = ((left + opposite) * gain).clamp(-1.0, 1.0);
+                frame[0] = soft_limit((left + opposite) * gain);
             }
             MonoEar::Right if ch >= 2 => {
                 let opposite = apply_cue(cue_style, left, sample_rate, cue_state);
-                frame[1] = ((right + opposite) * gain).clamp(-1.0, 1.0);
+                frame[1] = soft_limit((right + opposite) * gain);
             }
             MonoEar::Right => {
                 // mono device fallback
                 let opposite = apply_cue(cue_style, left, sample_rate, cue_state);
-                frame[0] = ((right + opposite) * gain).clamp(-1.0, 1.0);
+                frame[0] = soft_limit((right + opposite) * gain);
             }
             MonoEar::Both => {
                 // Oba uszy już słyszą osobno lewą/prawą stronę (stereo
                 // wyjście) — bez efektu, bo cue nie jest tu potrzebne.
-                let sample = ((left + right) * gain).clamp(-1.0, 1.0);
+                let sample = soft_limit((left + right) * gain);
                 frame[0] = sample;
                 if ch >= 2 {
                     frame[1] = sample;
@@ -418,6 +468,32 @@ mod tests {
     }
 
     #[test]
+    fn squeaky_never_dips_as_deep_as_buzz_so_it_sounds_gentler() {
+        // Regresja dla "popraw piskliwy na przyjemniejszy": `Buzz` (pełna
+        // głębokość modulacji) schodzi na dnie cyklu do dokładnej ciszy;
+        // `Squeaky` po dostrojeniu ma zawsze zostawiać słyszalną resztę
+        // sygnału (`RING_MOD_SQUEAKY_DEPTH` < 1.0), więc brzmi jak łagodniejsze
+        // "trzepotanie", a nie ostre bramkowanie — mimo to nadal wyraźnie
+        // różne od Buzz (test wyżej: szybsze) i od ciszy/stałego dźwięku.
+        // Pełny cykl `Buzz` (45 Hz @ 48 kHz) to ~1067 ramek — trzeba ich
+        // wygenerować z zapasem, żeby złapać dno fali.
+        let buzz = run_frames_with_style(&(0.0, 0.7), 2_000, 2, MonoEar::Left, MonoCueStyle::Buzz);
+        let squeaky = run_frames_with_style(&(0.0, 0.7), 2_000, 2, MonoEar::Left, MonoCueStyle::Squeaky);
+        let buzz_min = buzz.chunks_exact(2).map(|f| f[0]).fold(f32::MAX, f32::min);
+        let squeaky_min = squeaky.chunks_exact(2).map(|f| f[0]).fold(f32::MAX, f32::min);
+        assert!(buzz_min < 1e-3, "Buzz powinien wciąż schodzić blisko zera: {buzz_min}");
+        assert!(
+            squeaky_min > 0.3,
+            "Squeaky nie powinien już schodzić blisko ciszy jak Buzz: {squeaky_min}"
+        );
+        let squeaky_left: Vec<f32> = squeaky.chunks_exact(2).map(|f| f[0]).collect();
+        assert!(
+            squeaky_left.iter().any(|&s| (s - 0.7).abs() > 0.05),
+            "Squeaky ma nadal wyraźnie modulować amplitudę, nie tylko lekko drżeć: {squeaky_left:?}"
+        );
+    }
+
+    #[test]
     fn pulse_fully_mutes_during_gaps_instead_of_smoothly_fading() {
         // `Pulse` to bramkowanie 0/1, więc w przeciwieństwie do `Buzz`
         // (płynna fala 0.5..1.0) powinny się pojawić próbki DOKŁADNIE zerowe.
@@ -522,5 +598,49 @@ mod tests {
     fn off_ear_produces_silence() {
         let out = run_frames(&(0.9, 0.9), 8, 2, MonoEar::Off);
         assert!(out.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn soft_limit_leaves_normal_levels_untouched() {
+        // Poniżej progu (`SOFT_LIMIT_KNEE`) limiter nie może nic zmieniać —
+        // inaczej wszystkie testy powyżej (0.7, 0.5, ...) by się posypały.
+        assert_eq!(soft_limit(0.5), 0.5);
+        assert_eq!(soft_limit(-0.7), -0.7);
+        assert_eq!(soft_limit(0.0), 0.0);
+    }
+
+    #[test]
+    fn soft_limit_bends_loud_peaks_towards_one_instead_of_flattening_them() {
+        // Głośny sygnał z boostem (`mono_boost_db`) albo suma lewej strony i
+        // zmodulowanej prawej łatwo przekracza ±1.0 — twardy `clamp` spłaszczał
+        // szczyt (ścinki/trzaski), miękki limiter ma się do niego zbliżać bez
+        // nagłej nieciągłości i nigdy go nie przekraczać.
+        let just_over = soft_limit(1.05);
+        assert!(just_over < 1.0, "nawet lekkie przesterowanie ma zostać dogięte poniżej 1.0: {just_over}");
+        assert!(just_over > 0.8, "dogięcie ma być łagodne, nie nagłe: {just_over}");
+
+        let way_over = soft_limit(3.0);
+        assert!(way_over <= 1.0 && way_over > 0.95, "przy dużym przesterowaniu limiter ma zbliżać się do 1.0: {way_over}");
+
+        assert_eq!(soft_limit(-3.0), -soft_limit(3.0), "limiter ma być symetryczny dla ujemnych amplitud");
+    }
+
+    #[test]
+    fn boosted_gain_no_longer_hard_clips_the_combined_signal() {
+        // Regresja dla "ścinki dźwięku przy mono": zsumowany sygnał (własna
+        // strona + zmodulowana przeciwna) z boostem łatwo szedł powyżej
+        // ±1.0. Przedtem trafiał w twardy `clamp` (płaski szczyt na każdej
+        // klatce, gdzie suma przekraczała próg); teraz ma się płynnie wyginać.
+        let pan_frames = vec![(0.35, 0.35); 32];
+        let mut out = vec![0.0f32; pan_frames.len() * 2];
+        let mut cue_state = CueState::default();
+        let boosted_gain = db_to_linear(6.0); // ~2.0x, so (0.35+0.35)*2.0 ≈ 1.4 — over the old ±1.0 clamp
+        fill_output_f32(&mut out, &pan_frames, 2, MonoEar::Left, boosted_gain, MonoCueStyle::Off, 48_000.0, &mut cue_state);
+        let left_channel: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
+        assert!(left_channel.iter().all(|&s| s <= 1.0 && s >= -1.0), "limiter nie może przekroczyć zakresu wyjścia");
+        assert!(
+            left_channel.iter().any(|&s| s < 1.0),
+            "przy miękkim dogięciu przesterowany sygnał NIE powinien lądować dokładnie na płaskim 1.0 co klatkę: {left_channel:?}"
+        );
     }
 }

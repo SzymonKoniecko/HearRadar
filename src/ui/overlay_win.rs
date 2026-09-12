@@ -171,9 +171,21 @@ impl RadarCanvas for SkiaCanvas<'_> {
             return;
         };
         let paint = skia_paint(color);
+        // `PixmapMut::fill_rect` with AA and an identity transform (both true
+        // here) routes through tiny-skia's `scan::hairline_aa::fill_dot8`,
+        // which has a `debug_assert!(false)` that fires whenever a thin rect
+        // (e.g. a sub-pixel-wide meter bar, like the LFE level indicator)
+        // rounds to a zero-width inner pixel span in fixed point — the same
+        // class of bug as `hairline_safe_width` above, but in the fill path
+        // rather than the stroke path. Filling the rect as a path instead
+        // goes through the ordinary (unaffected) path scan converter, same
+        // as `circle_filled`/`triangle_filled` below.
+        let mut pb = PathBuilder::new();
+        pb.push_rect(sk_rect);
+        let Some(path) = pb.finish() else { return };
         self.pixmap
             .borrow_mut()
-            .fill_rect(sk_rect, &paint, Transform::identity(), None);
+            .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
     }
 
     fn triangle_filled(&self, points: [Pos2; 3], color: Color32) {
