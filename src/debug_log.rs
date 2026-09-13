@@ -1,19 +1,24 @@
-//! Dublowanie `println!`-owych logów diagnostycznych do pliku, obok konsoli —
-//! żeby dało się przesłać komuś log z sesji (np. do debugowania zachowania
-//! radaru) bez ręcznego kopiowania z terminala. Nie zastępuje `println!`
-//! wszędzie — tylko w miejscach, które i tak już logują stan audio (patrz
-//! `sound::devices`, `sound::mono_router`), przez makro [`dlog!`].
+//! Logi diagnostyczne aplikacji, zapisywane WYŁĄCZNIE do pliku (patrz
+//! [`log_file_path`]) — żeby dało się przesłać komuś log z sesji (np. do
+//! debugowania zachowania radaru) bez ręcznego kopiowania z terminala.
+//! Używane przez makro [`dlog!`] w miejscach, które i tak już logują stan
+//! audio (patrz `sound::devices`, `sound::mono_router`).
 //!
 //! [`dlog!`] jest wołane m.in. z callbacku audio (`sound::devices::update_analysis`)
-//! — CO RAMKĘ (~10ms), bezwarunkowo. Zapis do pliku z jawnym `flush()` (patrz
-//! niżej) potrafi się zablokować na kilka-kilkanaście ms (dysk, antywirus
-//! skanujący plik) — na wątku czasu rzeczywistego audio to wystarczy, żeby
+//! — CO RAMKĘ (~10ms), bezwarunkowo — więc CELOWO nie robi nic poza tanim,
+//! nieblokującym wysłaniem linii przez kanał (patrz [`log_line`]):
+//! - żadnego `println!`/`eprintln!` — na Windows zaznaczenie tekstu w oknie
+//!   konsoli (tryb "Szybkiej Edycji") wstrzymuje zapis do stdout/stderr
+//!   KAŻDEGO procesu, dopóki użytkownik nie odklika zaznaczenia;
+//! - żadnego bezpośredniego `write`/`flush` na dysk — to potrafi się
+//!   zablokować na kilka-kilkanaście ms (dysk, antywirus skanujący plik).
+//!
+//! Na wątku czasu rzeczywistego audio (deadline ~10ms, patrz
+//! `devices::PREFERRED_BUFFER_FRAMES`) każde z powyższych wystarczy, żeby
 //! przekroczyć deadline bufora i wywołać słyszalne przycięcie w dźwięku
-//! przekierowanym przez `mono_router`. Dlatego faktyczny zapis na dysk
-//! przeniesiony jest na OSOBNY wątek roboczy (patrz [`init`]): [`log_line`]
-//! na wątku wołającym (audio albo inny) robi tylko tanie, nieblokujące
-//! wysłanie linii przez kanał — samo `write`/`flush` dzieje się asynchronicznie,
-//! poza ścieżką czasu rzeczywistego.
+//! przekierowanym przez `mono_router` — stąd faktyczny zapis na dysk dzieje
+//! się na OSOBNYM wątku roboczym (patrz [`init`]), poza ścieżką czasu
+//! rzeczywistego.
 
 use std::fs::OpenOptions;
 use std::io::Write;

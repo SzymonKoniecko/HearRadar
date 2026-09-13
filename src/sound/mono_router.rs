@@ -185,7 +185,7 @@ fn build_output_stream(
     stream_config.buffer_size = crate::sound::devices::low_latency_buffer_size(config.buffer_size());
     let out_channels = stream_config.channels as usize;
     let sample_rate = stream_config.sample_rate.0 as f32;
-    let err_fn = |e| eprintln!("[mono_router] output error: {e}");
+    let err_fn = |e| crate::dlog!("[mono_router] output error: {e}");
 
     // Wyjście obsługujemy tylko jako F32 — konwertujemy jeśli potrzeba.
     // Sterowanie lewym/prawym uchem przez `analysis.mono_ear`. `cue_state`

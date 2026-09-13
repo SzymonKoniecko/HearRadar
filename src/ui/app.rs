@@ -1013,7 +1013,7 @@ impl HearRadarApp {
             match crate::ui::overlay_win::WinOverlay::new() {
                 Ok(overlay) => self.win_overlay = Some(overlay),
                 Err(err) => {
-                    eprintln!("nie udało się utworzyć natywnego okna overlay: {err}");
+                    crate::dlog!("nie udało się utworzyć natywnego okna overlay: {err}");
                     self.overlay_open = false;
                     return;
                 }

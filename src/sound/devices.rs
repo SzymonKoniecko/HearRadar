@@ -268,9 +268,34 @@ pub struct AudioAnalysis {
 }
 
 /// Pojemność bufora kołowego próbek mono — ~340ms przy 48kHz, zaokrąglone
-/// w górę do potęgi dwójki. Wystarczająco dużo, żeby przeżyć chwilowe
-/// wahania tempa callbacków wejścia/wyjścia bez przepełnienia.
+/// w górę do potęgi dwójki. To TWARDY limit pamięci (nigdy nie rośnie ponad
+/// to), NIE docelowe opóźnienie — patrz [`RING_TRIM_THRESHOLD_SAMPLES`] niżej,
+/// który utrzymuje faktyczną głębokość bufora dużo niżej na co dzień.
 const MONO_RING_CAPACITY: usize = 16_384;
+
+/// Docelowa głębokość bufora kołowego w próbkach, do której [`SharedAudioAnalysis::push_stereo_pan`]
+/// aktywnie przycina, gdy przekroczy [`RING_TRIM_THRESHOLD_SAMPLES`] — margines
+/// na drobne (rzędu pojedynczej ramki audio) wahania tempa callbacków, nie na
+/// trwały dryf zegarów. ~50ms przy 48kHz.
+const TARGET_RING_LATENCY_SAMPLES: usize = 2_400;
+
+/// Próg, po przekroczeniu którego bufor jest od razu przycinany z powrotem do
+/// [`TARGET_RING_LATENCY_SAMPLES`], zamiast czekać, aż urośnie do
+/// [`MONO_RING_CAPACITY`]. Wejście i wyjście to dwa NIEZALEŻNE zegary
+/// sprzętowe (patrz doc-komentarz [`SharedAudioAnalysis::mono_ring`]) — gdy
+/// wejście choćby ułamek procenta wyprzedza tempem wyjście, bufor bez tego
+/// progu monotonicznie rośnie i UTYKA na twardym limicie (~340ms), więc
+/// KAŻDA odtworzona próbka jest odtąd trwale spóźniona o tyle. Przycinanie
+/// dużo wcześniej, przy przekroczeniu tego niższego progu, utrzymuje
+/// opóźnienie blisko `TARGET_RING_LATENCY_SAMPLES` bez względu na kierunek
+/// dryfu. ~150ms przy 48kHz — trzykrotność celu, żeby nie przycinać przy
+/// zwykłym, chwilowym jitterze.
+const RING_TRIM_THRESHOLD_SAMPLES: usize = TARGET_RING_LATENCY_SAMPLES * 3;
+
+/// Licznik do przerzedzenia diagnostycznego logu głębokości `mono_ring` w
+/// [`SharedAudioAnalysis::push_stereo_pan`] — bez tego logowalibyśmy co
+/// callback (co ~10ms), zalewając `debug.log`.
+static PUSH_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct SharedAudioAnalysis {
@@ -343,6 +368,12 @@ impl SharedAudioAnalysis {
     /// [`downmix_to_stereo_pan`]) do bufora kołowego czytanego przez strumień
     /// wyjściowy `mono_router`. Najstarsze próbki są odrzucane, gdy bufor
     /// jest pełny — routing ma pokazywać "teraz", nie gonić zaległości.
+    ///
+    /// Dodatkowo: gdy bufor urośnie ponad [`RING_TRIM_THRESHOLD_SAMPLES`]
+    /// (bo wejście trwale wyprzedza tempem wyjście — patrz doc-komentarz
+    /// tam), od razu przycina go z powrotem do [`TARGET_RING_LATENCY_SAMPLES`]
+    /// zamiast czekać na twardy limit [`MONO_RING_CAPACITY`] — bez tego
+    /// opóźnienie odtwarzanego dźwięku trwale rosło do ~340ms i tam zostawało.
     pub(crate) fn push_stereo_pan(&self, samples: &[(f32, f32)]) {
         if let Ok(mut ring) = self.mono_ring.lock() {
             for &s in samples {
@@ -350,6 +381,21 @@ impl SharedAudioAnalysis {
                     ring.pop_front();
                 }
                 ring.push_back(s);
+            }
+            if ring.len() > RING_TRIM_THRESHOLD_SAMPLES {
+                let excess = ring.len() - TARGET_RING_LATENCY_SAMPLES;
+                for _ in 0..excess {
+                    ring.pop_front();
+                }
+                crate::dlog!(
+                    "[mono_ring] przycięto {excess} próbek (wejście trwale wyprzedzało wyjście) -> {} (~{:.0}ms @48kHz)",
+                    ring.len(),
+                    ring.len() as f32 / 48.0
+                );
+            }
+            let n = PUSH_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if n % 200 == 0 {
+                crate::dlog!("[mono_ring] depth={} (~{:.0}ms @48kHz)", ring.len(), ring.len() as f32 / 48.0);
             }
         }
     }
@@ -627,7 +673,7 @@ pub fn fetch_audio_from_device(
     config.buffer_size = low_latency_buffer_size(default_config.buffer_size());
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0 as f32;
-    let err_fn = |e| eprintln!("Stream error: {e}");
+    let err_fn = |e| crate::dlog!("Stream error: {e}");
 
     crate::dlog!(
         "[audio] stream start: device={:?} format={:?} rate={}Hz channels={}",
@@ -944,5 +990,30 @@ mod tests {
             assert!(l > 0.0 && r > 0.0, "podkręcanie ma powtarzać ostatnią próbkę, nie wstawiać ciszy: {out:?}");
             assert!(l <= 0.6 && r <= 0.4, "powtórzona próbka ma się lekko wygaszać, nie rosnąć: {out:?}");
         }
+    }
+
+    #[test]
+    fn push_stereo_pan_trims_back_to_target_instead_of_growing_to_hard_capacity() {
+        // Regresja dla "prawie sekundowego opóźnienia": gdy wejście trwale
+        // wyprzedza tempem wyjście (nikt nie woła read_stereo_pan wcale, jak
+        // tutaj — skrajny przypadek tego samego zjawiska), bufor bez
+        // aktywnego przycinania rósłby aż do MONO_RING_CAPACITY (~340ms) i
+        // tam utykał. Powinien zamiast tego zatrzymać się blisko
+        // TARGET_RING_LATENCY_SAMPLES (~50ms), NIE przy pełnej pojemności.
+        let analysis = SharedAudioAnalysis::new();
+        let chunk = vec![(0.1, 0.2); 500];
+        for _ in 0..50 {
+            analysis.push_stereo_pan(&chunk); // 50 * 500 = 25 000 próbek wepchniętych, bez ani jednego odczytu
+        }
+
+        let ring_len = analysis.mono_ring.lock().unwrap().len();
+        assert!(
+            ring_len <= RING_TRIM_THRESHOLD_SAMPLES,
+            "bufor nie powinien urosnąć powyżej progu przycinania, ma {ring_len}"
+        );
+        assert!(
+            ring_len < MONO_RING_CAPACITY,
+            "bufor utknął przy pełnej pojemności (~340ms) zamiast się przyciąć, ma {ring_len}"
+        );
     }
 }
