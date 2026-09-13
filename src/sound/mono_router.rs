@@ -177,7 +177,12 @@ fn build_output_stream(
     config: &cpal::SupportedStreamConfig,
     analysis: SharedAudioAnalysis,
 ) -> Result<cpal::Stream> {
-    let stream_config: StreamConfig = config.clone().into();
+    let mut stream_config: StreamConfig = config.clone().into();
+    // Mały bufor = mniejsze opóźnienie między dźwiękiem wejściowym a
+    // usłyszanym cue w słuchawkach — patrz doc-komentarz
+    // `devices::low_latency_buffer_size`, użyty tu dla symetrii z
+    // przechwytywaniem wejściowym.
+    stream_config.buffer_size = crate::sound::devices::low_latency_buffer_size(config.buffer_size());
     let out_channels = stream_config.channels as usize;
     let sample_rate = stream_config.sample_rate.0 as f32;
     let err_fn = |e| eprintln!("[mono_router] output error: {e}");

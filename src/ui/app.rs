@@ -53,6 +53,7 @@ pub struct HearRadarApp {
     /// analogicznego stanu w warstwie audio (`SharedAudioAnalysis`), bo dane
     /// testowe nigdy nie przechodzą przez tamten strumień.
     test_onset_ema: Vec<f32>,
+    test_band_ema: Vec<Vec<f32>>,
     current_channels: usize,
     test_phase: f32,
     test_scenario: TestScenario,
@@ -144,6 +145,7 @@ impl HearRadarApp {
             analysis,
             radar_state: RadarState::new(),
             test_onset_ema: Vec::new(),
+            test_band_ema: Vec::new(),
             current_channels: DEFAULT_TEST_CHANNELS,
             test_phase: 0.0,
             test_seed: 7,
@@ -175,7 +177,14 @@ impl HearRadarApp {
     /// niezależne wskaźniki na radarze co prawdziwy dźwięk.
     fn detect_test_direction_events(&mut self, rms: &[f32], rule_energies: &[Vec<f32>]) -> Vec<devices::DirectionEvent> {
         let sensitivity = self.radar_config.radar_sensitivity;
-        direction::detect_onsets(rms, &mut self.test_onset_ema, sensitivity)
+        direction::detect_onsets(
+            rms,
+            rule_energies,
+            &mut self.test_onset_ema,
+            &mut self.test_band_ema,
+            sensitivity,
+            self.radar_config.direction_contrast_enabled,
+        )
             .into_iter()
             .map(|onset| devices::DirectionEvent {
                 angle_deg: onset.angle_deg,
@@ -396,7 +405,7 @@ impl HearRadarApp {
                         self.analysis.clone(),
                     ) {
                         Ok(s) => self.active_stream = Some(s),
-                        Err(e) => eprintln!("Stream error: {e}"),
+                        Err(e) => crate::dlog!("Stream error: {e}"),
                     }
                 }
             }
@@ -546,7 +555,7 @@ impl HearRadarApp {
                         }
                         Err(e) => {
                             let msg = format!("Nie udało się uruchomić routingu: {e}");
-                            eprintln!("[mono_router] start error: {e}");
+                            crate::dlog!("[mono_router] start error: {e}");
                             self.mono_status = Some(msg);
                         }
                     }
@@ -661,6 +670,19 @@ impl HearRadarApp {
             )
             .changed();
         changed |= ui
+            .checkbox(
+                &mut self.radar_config.direction_contrast_enabled,
+                "🎯 Kontrast międzykanałowy (tłumi tło wspólne dla wszystkich kierunków, 5.1/7.1)",
+            )
+            .on_hover_text(
+                "Odejmuje energię wspólną dla wszystkich kanałów kierunkowych przed \
+                 wykryciem markera, żeby wyraźnie jednostronne zdarzenie (krok, strzał) \
+                 łatwiej przebijało się na tle otoczenia/muzyki słyszalnej wszędzie naraz. \
+                 Bez wpływu przy zwykłym stereo (2.0) — tam L≈R to normalny zapis \
+                 wyśrodkowanego dźwięku, nie oznaka otoczenia.",
+            )
+            .changed();
+        changed |= ui
             .add(
                 egui::Slider::new(&mut self.radar_config.line_thickness, 0.3..=3.0)
                     .text("Grubość linii"),
@@ -719,7 +741,7 @@ impl HearRadarApp {
     fn ui_color_rules_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Kolory wg częstotliwości");
-            if ui.small_button("↺ Domyślne 3 pasma").clicked() {
+            if ui.small_button("↺ Domyślne 5 pasm").clicked() {
                 self.radar_config.color_rules = spectrum::default_color_rules();
                 self.write_radar_config();
             }

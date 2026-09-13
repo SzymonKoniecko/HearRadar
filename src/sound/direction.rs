@@ -237,6 +237,61 @@ const ONSET_EMA_FACTOR: f32 = 0.1;
 /// zamiast pozostać wyraźnie rozdzielona.
 const NEIGHBOR_MAX_ANGLE_DIFF_DEG: f32 = 90.0;
 
+/// Próg mnożnikowy nagłego skoku energii W POJEDYNCZYM PAŚMIE kolorowania
+/// (patrz [`crate::sound::spectrum::ColorRule`]) nad jego WŁASNĄ średnią
+/// kroczącą — niższy niż [`TRANSIENT_RATIO`], bo pojedyncze, węższe pasmo z
+/// natury ma wyższy stosunek sygnał/tło przy realnym zdarzeniu niż całe
+/// szerokopasmowe RMS kanału (nie miesza się z energią spoza swojego zakresu).
+///
+/// To rozwiązuje ten sam problem co `ColorRule::weight` (patrz `spectrum.rs`),
+/// ale dla SAMEGO WYKRYCIA onsetu, nie tylko jego koloru: cichy, ale
+/// charakterystyczny dźwięk (alarm, dzwonek) w jednym paśmie dotąd w ogóle
+/// nie generował markera, bo ginął w porównaniu z szerokopasmowym RMS kanału
+/// zdominowanym przez głośniejsze pasmo (np. bas). Sprawdzając KAŻDE pasmo
+/// osobno przeciw JEGO WŁASNEMU tłu (patrz [`detect_channel_activity`]),
+/// taki dźwięk generuje onset nawet gdy energia szerokopasmowa kanału ledwo
+/// drgnie.
+pub const BAND_TRANSIENT_RATIO: f32 = 2.0;
+
+/// Jak [`ONSET_MIN_ENERGY`], ale dla energii pojedynczego pasma — niższy, bo
+/// jedno wąskie pasmo z natury niesie mniej energii niż cały sygnał
+/// szerokopasmowy tego samego kanału.
+const BAND_ONSET_MIN_ENERGY: f32 = 0.004;
+
+/// Frakcja średniej energii KANAŁÓW KIERUNKOWYCH (bez LFE) odejmowana od
+/// energii każdego z nich (i szerokopasmowo, i per pasmo) przed sprawdzeniem
+/// onsetu — analogia do "contrast" z SoundRadar (podobny, konkurencyjny
+/// projekt, patrz analiza w dokumentacji zmian tego modułu). Włączane
+/// opcjonalnie przez [`crate::sound::devices::RadarConfig::direction_contrast_enabled`].
+///
+/// Matematycznie: gdy WSZYSTKIE kanały kierunkowe rosną RÓWNO (naprawdę
+/// niekierunkowy dźwięk — otoczenie, muzyka w tle), kontrast skaluje w dół
+/// zarówno bieżący odczyt, jak i historyczną średnią kroczącą tego kanału
+/// (zbudowaną w tych samych, wcześniej też jednolitych warunkach) o DOKŁADNIE
+/// ten sam czynnik — więc próg mnożnikowy ([`TRANSIENT_RATIO`]/
+/// [`BAND_TRANSIENT_RATIO`]) wypada identycznie jak bez kontrastu (neutralne,
+/// nie pogarsza wykrywania jednolitych zdarzeń). Ale gdy TYLKO JEDEN kanał
+/// jest głośniejszy niż jego (niezmienieni) sąsiedzi, kontrast odejmuje od
+/// niego dużo MNIEJ (bo średnia wszystkich kanałów ledwo drgnęła), a jego
+/// WŁASNA historyczna średnia (zbudowana z czasów, gdy wszystko było cicho i
+/// równo) jest obniżona kontrastem tak samo jak wtedy — efektywnie obniżając
+/// próg potrzebny, by TEN kanał onsetował, względem dawnego wymogu
+/// przebicia [`TRANSIENT_RATIO`]x WŁASNEJ historii. Innymi słowy: kontrast
+/// nigdy nie pogarsza wykrywania jednolitego "tła", a ułatwia wykrycie
+/// wyraźnie jednostronnego zdarzenia na tle takiego tła.
+const CONTRAST_AMOUNT: f32 = 0.5;
+
+/// Minimalna liczba kanałów KIERUNKOWYCH (bez LFE), od której [`CONTRAST_AMOUNT`]
+/// zaczyna działać. Przy zwykłym stereo (2.0) L≈R to NORMALNY sposób zapisu
+/// wyśrodkowanego/mono dźwięku (dialog, głos), nie oznaka otoczenia — a przy
+/// bardzo cichych sygnałach blisko [`ONSET_MIN_ENERGY`] (stały próg, NIE
+/// skalujący się razem z kontrastem) odjęcie połowy energii mogłoby zgasić
+/// dźwięk, który bez kontrastu jeszcze by przebił próg (dokładnie scenariusz
+/// z testu `detect_onsets_sensitivity_lets_a_too_quiet_jump_cross_the_threshold`).
+/// Surround (5.1/7.1, gdzie ta funkcja jest realnie użyteczna) ma zawsze
+/// więcej niż 2 kanały kierunkowe, więc to nie ogranicza jej praktycznie.
+const MIN_CHANNELS_FOR_CONTRAST: usize = 3;
+
 /// Pojedyncze, niezależne zdarzenie dźwiękowe wykryte na jednym kanale.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChannelOnset {
@@ -263,7 +318,10 @@ pub struct ChannelActivity {
     pub channel_index: usize,
     /// Poziom RMS kanału w tej ramce (0.0..=1.0), nieprzeskalowany `sensitivity`.
     pub energy: f32,
-    /// `energy * sensitivity`, obcięte do 0.0..=1.0 — to porównujemy z progiem onsetu.
+    /// `energy * sensitivity`, obcięte do 0.0..=1.0 — to porównujemy z progiem
+    /// onsetu (szerokopasmowym; per-pasmowe porównanie, patrz
+    /// [`detect_channel_activity`], liczone jest osobno i wpływa tylko na
+    /// `is_onset`, nie na tę wartość).
     pub scaled_energy: f32,
     /// Płynny kąt (patrz [`onset_angle_deg`]) — liczony niezależnie od tego,
     /// czy kanał akurat jest onsetem, żeby logger miał kąt nawet dla
@@ -294,56 +352,147 @@ pub struct ChannelActivity {
 /// dotąd niewystarczające skoki zaczynają przebijać próg — dokładnie tak samo
 /// jak już dziś reguluje to, jak duże/daleko od środka są kropki kanałów w
 /// [`crate::sound::devices::AudioAnalysis`].
-pub fn detect_onsets(channel_rms: &[f32], ema_state: &mut Vec<f32>, sensitivity: f32) -> Vec<ChannelOnset> {
-    detect_channel_activity(channel_rms, ema_state, sensitivity)
-        .into_iter()
-        .filter(|a| a.is_onset)
-        .map(|a| ChannelOnset {
-            channel_index: a.channel_index,
-            energy: a.energy,
-            angle_deg: a.angle_deg,
-        })
-        .collect()
+pub fn detect_onsets(
+    channel_rms: &[f32],
+    channel_band_energies: &[Vec<f32>],
+    ema_state: &mut Vec<f32>,
+    band_ema_state: &mut Vec<Vec<f32>>,
+    sensitivity: f32,
+    contrast_enabled: bool,
+) -> Vec<ChannelOnset> {
+    detect_channel_activity(
+        channel_rms,
+        channel_band_energies,
+        ema_state,
+        band_ema_state,
+        sensitivity,
+        contrast_enabled,
+    )
+    .into_iter()
+    .filter(|a| a.is_onset)
+    .map(|a| ChannelOnset {
+        channel_index: a.channel_index,
+        energy: a.energy,
+        angle_deg: a.angle_deg,
+    })
+    .collect()
+}
+
+/// Średnia wartości zwracanych przez `f` po `indices` — `0.0` dla pustej listy.
+fn mean_of(indices: &[usize], f: impl Fn(usize) -> f32) -> f32 {
+    if indices.is_empty() {
+        return 0.0;
+    }
+    indices.iter().map(|&i| f(i).max(0.0)).sum::<f32>() / indices.len() as f32
 }
 
 /// Jak [`detect_onsets`], ale zwraca stan KAŻDEGO kanału z kierunkiem (patrz
 /// [`ChannelActivity`]), nie tylko tych, które przebiły próg onsetu —
 /// `detect_onsets` jest teraz cienkim filtrem nad tą funkcją, więc oba
 /// warianty zawsze widzą dokładnie te same progi/EMA.
+///
+/// `channel_band_energies[kanał][pasmo]` to energia w każdej regule
+/// kolorowania (patrz [`crate::sound::spectrum::analyze_channel_rule_energies`])
+/// — TA SAMA tablica, którą wywołujący i tak już liczy do pokolorowania
+/// kropek, więc przekazanie jej tutaj nie kosztuje dodatkowej analizy audio
+/// ani buforowania (a więc i dodatkowego opóźnienia). Onset kanału zapala się,
+/// gdy PRZEBIJE próg ALBO szerokopasmowo (jak dawniej), ALBO w KTÓRYMKOLWIEK
+/// pojedynczym paśmie ponad JEGO WŁASNĄ średnią kroczącą (patrz
+/// [`BAND_TRANSIENT_RATIO`]) — dzięki temu cichy, ale charakterystyczny
+/// dźwięk w jednym paśmie (np. alarm w wysokich tonach) generuje marker nawet
+/// gdy energia szerokopasmowa kanału jest zdominowana przez inne, głośniejsze
+/// pasmo (np. bas) i sama w sobie nie przebiłaby progu. `band_ema_state`
+/// (jedna średnia krocząca na kanał×pasmo) jest automatycznie dopasowywany
+/// do liczby kanałów/pasm, tak samo jak `ema_state`. Pusta
+/// `channel_band_energies` (np. w testach, które nie badają tego aspektu)
+/// po prostu wyłącza sprawdzanie per-pasmowe — zachowanie identyczne jak
+/// przed jego dodaniem.
+///
+/// `contrast_enabled` włącza [`CONTRAST_AMOUNT`] (patrz doc-komentarz tam) —
+/// odpowiednik checkboxa `RadarConfig::direction_contrast_enabled` w
+/// ustawieniach. Domyślnie `false` w configu, ale sam parametr tu jest
+/// bezwarunkowy, żeby funkcja została w pełni testowalna niezależnie od UI.
 pub fn detect_channel_activity(
     channel_rms: &[f32],
+    channel_band_energies: &[Vec<f32>],
     ema_state: &mut Vec<f32>,
+    band_ema_state: &mut Vec<Vec<f32>>,
     sensitivity: f32,
+    contrast_enabled: bool,
 ) -> Vec<ChannelActivity> {
     if ema_state.len() != channel_rms.len() {
         *ema_state = vec![0.0; channel_rms.len()];
     }
+    if band_ema_state.len() != channel_rms.len() {
+        *band_ema_state = vec![Vec::new(); channel_rms.len()];
+    }
 
     let layout = channel_layout(channel_rms.len());
+    let directional: Vec<usize> = (0..channel_rms.len())
+        .filter(|&i| layout.get(i).and_then(|role| role.radar_angle_degrees()).is_some())
+        .collect();
+    let contrast = if contrast_enabled && directional.len() >= MIN_CHANNELS_FOR_CONTRAST {
+        CONTRAST_AMOUNT
+    } else {
+        0.0
+    };
+
+    let broadband_mean = mean_of(&directional, |i| channel_rms[i]);
+    let n_bands = channel_band_energies.iter().map(Vec::len).max().unwrap_or(0);
+    let band_means: Vec<f32> = (0..n_bands)
+        .map(|b| {
+            mean_of(&directional, |i| {
+                channel_band_energies.get(i).and_then(|v| v.get(b)).copied().unwrap_or(0.0)
+            })
+        })
+        .collect();
+
     let mut activity = Vec::new();
 
     for (i, &level) in channel_rms.iter().enumerate() {
         let level = level.max(0.0);
-        let scaled = (level * sensitivity).clamp(0.0, 1.0);
         let has_direction = layout
             .get(i)
             .and_then(|role| role.radar_angle_degrees())
             .is_some();
 
         if !has_direction {
+            let scaled = (level * sensitivity).clamp(0.0, 1.0);
             ema_state[i] = ema_state[i] * (1.0 - ONSET_EMA_FACTOR) + scaled * ONSET_EMA_FACTOR;
             continue;
         }
 
+        if band_ema_state[i].len() != n_bands {
+            band_ema_state[i] = vec![0.0; n_bands];
+        }
+
+        let contrasted_level = (level - contrast * broadband_mean).max(0.0);
+        let scaled = (contrasted_level * sensitivity).clamp(0.0, 1.0);
         let prev_ema = ema_state[i];
-        let is_onset = scaled > ONSET_MIN_ENERGY && scaled > prev_ema * TRANSIENT_RATIO + 0.02;
+        let mut is_onset = scaled > ONSET_MIN_ENERGY && scaled > prev_ema * TRANSIENT_RATIO + 0.02;
         ema_state[i] = prev_ema * (1.0 - ONSET_EMA_FACTOR) + scaled * ONSET_EMA_FACTOR;
 
+        if let Some(bands) = channel_band_energies.get(i) {
+            for (b, &band_energy) in bands.iter().enumerate() {
+                let band_mean = band_means.get(b).copied().unwrap_or(0.0);
+                let contrasted_band = (band_energy.max(0.0) - contrast * band_mean).max(0.0);
+                let band_scaled = (contrasted_band * sensitivity).clamp(0.0, 1.0);
+                let prev_band_ema = band_ema_state[i][b];
+                if band_scaled > BAND_ONSET_MIN_ENERGY
+                    && band_scaled > prev_band_ema * BAND_TRANSIENT_RATIO + BAND_ONSET_MIN_ENERGY
+                {
+                    is_onset = true;
+                }
+                band_ema_state[i][b] =
+                    prev_band_ema * (1.0 - ONSET_EMA_FACTOR) + band_scaled * ONSET_EMA_FACTOR;
+            }
+        }
+
         activity.push(ChannelActivity {
-            // Nieskalowane RMS — `sensitivity` wpływa tylko na to, KIEDY
-            // odpala się onset (bramka), nie na to, jaką energię niesie
-            // (o skalowaniu do jasności/odległości markera decyduje
-            // wywołujący, patrz `sound::devices::update_analysis`).
+            // Nieskalowane RMS — `sensitivity` (i ewentualny kontrast) wpływa
+            // tylko na to, KIEDY odpala się onset (bramka), nie na to, jaką
+            // energię niesie (o skalowaniu do jasności/odległości markera
+            // decyduje wywołujący, patrz `sound::devices::update_analysis`).
             channel_index: i,
             energy: level,
             scaled_energy: scaled,
@@ -844,7 +993,8 @@ mod tests {
         // powinien zamiast tego zgłosić DWA niezależne zdarzenia, każde na
         // swoim kanale. [FL, FR, C, LFE, RL, RR, SL, SR]
         let mut ema = vec![0.0; 8];
-        let onsets = detect_onsets(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.3], &mut ema, 1.0);
+        let mut band_ema = Vec::new();
+        let onsets = detect_onsets(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.3], &[], &mut ema, &mut band_ema, 1.0, false);
         let left = onsets.iter().find(|o| o.channel_index == 6).unwrap();
         let right = onsets.iter().find(|o| o.channel_index == 7).unwrap();
         assert_close(left.angle_deg, -90.0, "onset lewego kanału (SL)");
@@ -854,26 +1004,29 @@ mod tests {
     #[test]
     fn detect_onsets_ignores_steady_energy_without_a_sudden_jump() {
         let mut ema = vec![0.0, 0.0];
+        let mut band_ema = Vec::new();
         // Kilka ramek o stałym poziomie — po "rozgrzaniu" średniej kroczącej
         // dalsze ramki o tym samym poziomie nie powinny być onsetami.
         for _ in 0..50 {
-            detect_onsets(&[0.2, 0.2], &mut ema, 1.0);
+            detect_onsets(&[0.2, 0.2], &[], &mut ema, &mut band_ema, 1.0, false);
         }
-        let onsets = detect_onsets(&[0.2, 0.2], &mut ema, 1.0);
+        let onsets = detect_onsets(&[0.2, 0.2], &[], &mut ema, &mut band_ema, 1.0, false);
         assert!(onsets.is_empty(), "stały poziom nie powinien generować onsetów");
     }
 
     #[test]
     fn detect_onsets_silence_yields_nothing() {
         let mut ema = vec![0.0, 0.0];
-        assert!(detect_onsets(&[0.0, 0.0], &mut ema, 1.0).is_empty());
+        let mut band_ema = Vec::new();
+        assert!(detect_onsets(&[0.0, 0.0], &[], &mut ema, &mut band_ema, 1.0, false).is_empty());
     }
 
     #[test]
     fn detect_onsets_skips_lfe_channel() {
         // [FL, FR, C, LFE, RL, RR]
         let mut ema = vec![0.0; 6];
-        let onsets = detect_onsets(&[0.0, 0.0, 0.0, 0.5, 0.0, 0.0], &mut ema, 1.0);
+        let mut band_ema = Vec::new();
+        let onsets = detect_onsets(&[0.0, 0.0, 0.0, 0.5, 0.0, 0.0], &[], &mut ema, &mut band_ema, 1.0, false);
         assert!(
             onsets.iter().all(|o| o.channel_index != 3),
             "LFE nie niesie kierunku, nie powinien generować onsetu"
@@ -883,10 +1036,11 @@ mod tests {
     #[test]
     fn detect_onsets_resizes_ema_state_for_new_channel_count() {
         let mut ema = vec![0.0, 0.0];
-        let _ = detect_onsets(&[0.1, 0.1], &mut ema, 1.0);
+        let mut band_ema = Vec::new();
+        let _ = detect_onsets(&[0.1, 0.1], &[], &mut ema, &mut band_ema, 1.0, false);
         assert_eq!(ema.len(), 2);
         // Zmiana urządzenia -> inna liczba kanałów; nie powinno panikować.
-        let _ = detect_onsets(&[0.0; 6], &mut ema, 1.0);
+        let _ = detect_onsets(&[0.0; 6], &[], &mut ema, &mut band_ema, 1.0, false);
         assert_eq!(ema.len(), 6);
     }
 
@@ -900,18 +1054,151 @@ mod tests {
         // niewystarczającym skokom przebić próg.
         let jump = [0.012, 0.012]; // wyraźnie poniżej ONSET_MIN_ENERGY (0.02)
         let mut ema_low = vec![0.0, 0.0];
+        let mut band_ema_low = Vec::new();
         assert!(
-            detect_onsets(&jump, &mut ema_low, 1.0).is_empty(),
+            detect_onsets(&jump, &[], &mut ema_low, &mut band_ema_low, 1.0, false).is_empty(),
             "przy domyślnej czułości ten poziom nie powinien jeszcze przebić progu"
         );
 
         let mut ema_high = vec![0.0, 0.0];
-        let onsets = detect_onsets(&jump, &mut ema_high, 3.0);
+        let mut band_ema_high = Vec::new();
+        let onsets = detect_onsets(&jump, &[], &mut ema_high, &mut band_ema_high, 3.0, false);
         assert_eq!(
             onsets.len(),
             2,
             "podniesiona czułość powinna pozwolić temu samemu skokowi przebić próg"
         );
+    }
+
+    #[test]
+    fn band_excursion_triggers_onset_even_when_broadband_barely_moves() {
+        // Kanał zdominowany przez stały, głośny bas (pasmo A) — energia
+        // szerokopasmowa (channel_rms) w ogóle się nie zmienia między
+        // "rozgrzaniem" a ramką testową, więc szerokopasmowy próg onsetu
+        // NIGDY by tu nie zadziałał. Ale ciche pasmo B (np. wysoki alarm)
+        // nagle podskakuje daleko ponad SWOJE WŁASNE, dotąd znikome tło —
+        // to powinno samo z siebie wygenerować onset.
+        let mut ema = vec![0.0, 0.0];
+        let mut band_ema = Vec::new();
+        let rms = [0.3, 0.3];
+        let steady_bands = vec![vec![0.3, 0.001], vec![0.3, 0.001]];
+        for _ in 0..50 {
+            detect_onsets(&rms, &steady_bands, &mut ema, &mut band_ema, 1.0, false);
+        }
+        // Potwierdzenie, że po rozgrzaniu ten sam, stały poziom NIE onsetuje
+        // (ani szerokopasmowo, ani per-pasmowo) — punkt odniesienia.
+        assert!(
+            detect_onsets(&rms, &steady_bands, &mut ema, &mut band_ema, 1.0, false).is_empty(),
+            "stały poziom (również per pasmo) nie powinien generować onsetów"
+        );
+
+        // Pasmo B kanału 0 skacze z 0.001 do 0.02 — RMS szerokopasmowy kanału
+        // 0 zostaje BEZ ZMIAN (0.3), więc to wyłącznie pasmowy wyskok.
+        let jump_bands = vec![vec![0.3, 0.02], vec![0.3, 0.001]];
+        let onsets = detect_onsets(&rms, &jump_bands, &mut ema, &mut band_ema, 1.0, false);
+        assert!(
+            onsets.iter().any(|o| o.channel_index == 0),
+            "skok w jednym cichym paśmie powinien wygenerować onset, mimo że RMS szerokopasmowy się nie zmienił"
+        );
+        assert!(
+            onsets.iter().all(|o| o.channel_index != 1),
+            "kanał 1 (bez zmiany w żadnym paśmie) nie powinien onsetować"
+        );
+    }
+
+    #[test]
+    fn empty_band_energies_behaves_exactly_like_before_band_detection_existed() {
+        // Pusta `channel_band_energies` (np. wywołujący nie ma jeszcze danych
+        // per-pasmowych) musi dawać DOKŁADNIE to samo zachowanie co przed
+        // dodaniem sprawdzania per-pasmowego — czysto szerokopasmowe.
+        let mut ema = vec![0.0, 0.0];
+        let mut band_ema = Vec::new();
+        let onsets = detect_onsets(&[0.012, 0.012], &[], &mut ema, &mut band_ema, 1.0, false);
+        assert!(onsets.is_empty(), "poniżej ONSET_MIN_ENERGY nadal nie powinno onsetować");
+    }
+
+    // ---------- kontrast międzykanałowy (contrast_enabled) ----------
+
+    #[test]
+    fn contrast_lets_a_moderate_single_channel_rise_onset_against_a_stable_quiet_crowd() {
+        // 7.1 (8 kanałów), wszystkie 7 kierunkowych "rozgrzane" na stałym,
+        // cichym poziomie 0.1 — dwa NIEZALEŻNE stany (z kontrastem i bez),
+        // każdy rozgrzewany konsekwentnie z tym samym trybem, żeby historyczna
+        // średnia krocząca była uczciwie porównywalna.
+        let quiet = [0.1, 0.1, 0.1, 0.0, 0.1, 0.1, 0.1, 0.1]; // LFE (idx 3) nie ma kierunku
+
+        let mut ema_without = vec![0.0; 8];
+        let mut band_ema_without = Vec::new();
+        let mut ema_with = vec![0.0; 8];
+        let mut band_ema_with = Vec::new();
+        for _ in 0..80 {
+            detect_onsets(&quiet, &[], &mut ema_without, &mut band_ema_without, 1.0, false);
+            detect_onsets(&quiet, &[], &mut ema_with, &mut band_ema_with, 1.0, true);
+        }
+
+        // FrontLeft (idx 0) rośnie do 0.22 — to tylko 2.2x własnej historii
+        // (0.1), czyli PONIŻEJ szerokopasmowego TRANSIENT_RATIO=2.5x, więc bez
+        // kontrastu ten wzrost NIE powinien onsetować. Pozostałe kanały
+        // zostają bez zmian (0.1) — to jest wyraźnie JEDNOSTRONNE zdarzenie,
+        // nie jednolity wzrost tła.
+        let mut bump = quiet;
+        bump[0] = 0.22;
+
+        let onsets_without = detect_onsets(&bump, &[], &mut ema_without, &mut band_ema_without, 1.0, false);
+        assert!(
+            onsets_without.iter().all(|o| o.channel_index != 0),
+            "bez kontrastu wzrost 2.2x własnej historii nie powinien jeszcze przebić progu {TRANSIENT_RATIO}x"
+        );
+
+        let onsets_with = detect_onsets(&bump, &[], &mut ema_with, &mut band_ema_with, 1.0, true);
+        assert!(
+            onsets_with.iter().any(|o| o.channel_index == 0),
+            "z kontrastem to samo zdarzenie powinno przebić próg, bo sąsiedzi zostali bez zmian"
+        );
+    }
+
+    #[test]
+    fn contrast_does_not_change_outcome_when_all_directional_channels_rise_together() {
+        // Kontrast NIE powinien pogarszać wykrywania jednolitego zdarzenia —
+        // gdy WSZYSTKIE kanały kierunkowe rosną RÓWNO (naprawdę niekierunkowy
+        // dźwięk), matematycznie skaluje w dół i historię, i bieżący odczyt o
+        // ten sam czynnik, więc wynik progu mnożnikowego jest identyczny.
+        let uniform_loud = [0.4; 8];
+        let mut ema_a = vec![0.0; 8];
+        let mut band_ema_a = Vec::new();
+        let onsets_without = detect_onsets(&uniform_loud, &[], &mut ema_a, &mut band_ema_a, 1.0, false);
+
+        let mut ema_b = vec![0.0; 8];
+        let mut band_ema_b = Vec::new();
+        let onsets_with = detect_onsets(&uniform_loud, &[], &mut ema_b, &mut band_ema_b, 1.0, true);
+
+        let mut channels_without: Vec<usize> = onsets_without.iter().map(|o| o.channel_index).collect();
+        let mut channels_with: Vec<usize> = onsets_with.iter().map(|o| o.channel_index).collect();
+        channels_without.sort_unstable();
+        channels_with.sort_unstable();
+        assert_eq!(
+            channels_without, channels_with,
+            "jednolity wzrost na wszystkich kanałach powinien dać te same onsety z kontrastem i bez"
+        );
+    }
+
+    #[test]
+    fn contrast_is_a_no_op_for_plain_stereo() {
+        // 2.0 ma tylko 2 kanały kierunkowe — poniżej MIN_CHANNELS_FOR_CONTRAST,
+        // więc `contrast_enabled=true` nie powinno nic zmienić względem
+        // `false` (patrz doc-komentarz `MIN_CHANNELS_FOR_CONTRAST`: przy
+        // stereo L≈R to normalny zapis wyśrodkowanego dźwięku, nie otoczenie).
+        let jump = [0.012, 0.012];
+        let mut ema_without = vec![0.0, 0.0];
+        let mut band_ema_without = Vec::new();
+        let without = detect_onsets(&jump, &[], &mut ema_without, &mut band_ema_without, 3.0, false);
+
+        let mut ema_with = vec![0.0, 0.0];
+        let mut band_ema_with = Vec::new();
+        let with = detect_onsets(&jump, &[], &mut ema_with, &mut band_ema_with, 3.0, true);
+
+        assert_eq!(without.len(), with.len(), "stereo powinno ignorować contrast_enabled");
+        assert_eq!(ema_without, ema_with, "EMA stereo nie powinno się różnić z/bez kontrastu");
     }
 
     #[test]

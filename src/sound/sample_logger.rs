@@ -7,11 +7,29 @@
 //! configu, patrz [`crate::config_store::config_dir`]) zamiast doklejać do
 //! jednego, rosnącego bez końca pliku — dzięki temu każda sesja logowania da
 //! się analizować osobno.
+//!
+//! [`SampleLogger::log_sample`] jest wołane z callbacku audio
+//! (`sound::devices::update_analysis`), do kilku razy na ramkę (jeden raz na
+//! słyszalny kanał) — zapis CSV z jawnym `flush()` na tym wątku miałby ten sam
+//! problem co niegdyś `crate::dlog!` (patrz `debug_log`): potrafi się
+//! zablokować na tyle długo, żeby wywołać słyszalne przycięcie w dźwięku
+//! przekierowanym przez `mono_router`. Dlatego, tak samo jak tam, faktyczny
+//! zapis pliku dzieje się na OSOBNYM wątku roboczym — `log_sample` na wątku
+//! audio robi tylko tanie, nieblokujące wysłanie już złożonego wiersza przez
+//! kanał.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
+
+enum LoggerCommand {
+    Enable,
+    Disable,
+    Row(SampleRow),
+}
 
 const FILE_PREFIX: &str = "sample_log_";
 const FILE_SUFFIX: &str = ".csv";
@@ -48,45 +66,75 @@ pub struct SampleRow {
 
 #[derive(Debug)]
 pub struct SampleLogger {
-    file: Mutex<Option<File>>,
+    /// Odzwierciedla stan NATYCHMIAST po `set_enabled` (patrz tam) — czytane
+    /// z wątku audio na każdą ramkę, więc musi być tanie i nieblokujące;
+    /// faktyczne otwarcie/zamknięcie pliku dogania to asynchronicznie na
+    /// wątku roboczym (patrz [`LoggerCommand`]).
+    enabled: AtomicBool,
+    tx: Mutex<Sender<LoggerCommand>>,
 }
 
 impl SampleLogger {
     pub fn new() -> Self {
-        Self { file: Mutex::new(None) }
+        let (tx, rx) = mpsc::channel::<LoggerCommand>();
+        // Jedyny wątek, który kiedykolwiek dotyka pliku CSV — audio tylko
+        // wysyła gotowe wiersze/polecenia przez kanał (patrz `log_sample`/
+        // `set_enabled`), bez czekania na zapis/flush na dysk.
+        std::thread::spawn(move || {
+            let mut file: Option<File> = None;
+            for cmd in rx {
+                match cmd {
+                    LoggerCommand::Enable => file = open_next_log_file(),
+                    LoggerCommand::Disable => file = None,
+                    LoggerCommand::Row(row) => {
+                        let Some(f) = file.as_mut() else { continue };
+                        let (r, g, b) = row.color;
+                        let line = format!(
+                            "{},{},{:.4},{:.4},{:.1},{:.4},{},{},{},#{r:02x}{g:02x}{b:02x},{r},{g},{b}\n",
+                            row.unix_ts_ms,
+                            row.channel_index,
+                            row.rms,
+                            row.scaled_energy,
+                            row.angle_deg,
+                            row.sensitivity,
+                            row.marker_spawned,
+                            row.rule_index.map(|i| i.to_string()).unwrap_or_default(),
+                            row.rule_label.as_deref().unwrap_or("").replace(',', ";"),
+                        );
+                        let _ = f.write_all(line.as_bytes());
+                        let _ = f.flush();
+                    }
+                }
+            }
+        });
+        Self { enabled: AtomicBool::new(false), tx: Mutex::new(tx) }
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.file.lock().map(|g| g.is_some()).unwrap_or(false)
+        self.enabled.load(Ordering::Relaxed)
     }
 
     /// Włącza/wyłącza logowanie. Włączenie ZAWSZE otwiera świeży plik —
     /// nawet jeśli logger był już włączony — żeby kolejne kliknięcie
     /// checkboxa w UI zawsze dawało nową, czystą sesję logu do analizy.
+    /// Samo otwarcie/zamknięcie pliku dzieje się na wątku roboczym (patrz
+    /// [`SampleLogger::new`]); `enabled` (czytane przez [`is_enabled`])
+    /// ustawiane jest tu, od razu, więc UI odzwierciedla stan natychmiast.
     pub fn set_enabled(&self, enabled: bool) {
-        let Ok(mut guard) = self.file.lock() else { return };
-        *guard = if enabled { open_next_log_file() } else { None };
+        self.enabled.store(enabled, Ordering::Relaxed);
+        let Ok(tx) = self.tx.lock() else { return };
+        let _ = tx.send(if enabled { LoggerCommand::Enable } else { LoggerCommand::Disable });
     }
 
-    /// Dopisuje jedną próbkę do bieżącego pliku (no-op, gdy logger wyłączony).
-    pub fn log_sample(&self, row: &SampleRow) {
-        let Ok(mut guard) = self.file.lock() else { return };
-        let Some(file) = guard.as_mut() else { return };
-        let (r, g, b) = row.color;
-        let line = format!(
-            "{},{},{:.4},{:.4},{:.1},{:.4},{},{},{},#{r:02x}{g:02x}{b:02x},{r},{g},{b}\n",
-            row.unix_ts_ms,
-            row.channel_index,
-            row.rms,
-            row.scaled_energy,
-            row.angle_deg,
-            row.sensitivity,
-            row.marker_spawned,
-            row.rule_index.map(|i| i.to_string()).unwrap_or_default(),
-            row.rule_label.as_deref().unwrap_or("").replace(',', ";"),
-        );
-        let _ = file.write_all(line.as_bytes());
-        let _ = file.flush();
+    /// Wysyła jedną próbkę do zapisania przez wątek roboczy (no-op, gdy
+    /// logger wyłączony). Tanie, nieblokujące — bezpieczne do wołania z
+    /// wątku czasu rzeczywistego audio (patrz doc-komentarz modułu).
+    pub fn log_sample(&self, row: SampleRow) {
+        if !self.is_enabled() {
+            return;
+        }
+        let Ok(tx) = self.tx.lock() else { return };
+        let _ = tx.send(LoggerCommand::Row(row));
     }
 }
 

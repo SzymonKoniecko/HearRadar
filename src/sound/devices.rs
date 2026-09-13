@@ -86,6 +86,22 @@ pub struct RadarConfig {
     /// pliku configu (sprzed tego pola) włącza nową funkcję zamiast ją wyciszyć.
     #[serde(default)]
     pub mono_cue_style: MonoCueStyle,
+    /// Włącza odejmowanie energii wspólnej dla wszystkich kanałów kierunkowych
+    /// przed sprawdzeniem onsetu (patrz [`crate::sound::direction::CONTRAST_AMOUNT`]
+    /// i doc-komentarz [`crate::sound::direction::detect_channel_activity`]) —
+    /// tłumi dźwięk obecny mniej więcej RÓWNO na wszystkich kanałach naraz
+    /// (otoczenie, muzyka w tle), dzięki czemu wyraźnie JEDNOSTRONNE zdarzenie
+    /// na tle takiego szumu łatwiej przebija próg onsetu, nawet gdy samo w
+    /// sobie nie jest dość głośne względem WŁASNEJ historii. Działa tylko
+    /// przy >2 kanałach kierunkowych (5.1/7.1) — przy zwykłym stereo L≈R to
+    /// normalny zapis wyśrodkowanego dźwięku (dialog), nie oznaka otoczenia,
+    /// a przy bardzo cichych sygnałach blisko progu ciszy odejmowanie
+    /// mogłoby zgasić dźwięk, który bez kontrastu jeszcze by przebił próg.
+    /// Domyślnie wyłączone (`#[serde(default)]`) — nowa, opcjonalna poprawka,
+    /// włączana checkboxem w ustawieniach, żeby dało się ją porównać na
+    /// żywym audio i wyłączyć, gdyby gdzieś zaszkodziła.
+    #[serde(default)]
+    pub direction_contrast_enabled: bool,
 }
 
 fn default_overlay_click_through() -> bool {
@@ -118,6 +134,7 @@ impl Default for RadarConfig {
             edge_glow_enabled: false,
             line_thickness: default_line_thickness(),
             mono_cue_style: MonoCueStyle::default(),
+            direction_contrast_enabled: false,
         }
     }
 }
@@ -283,6 +300,11 @@ pub struct SharedAudioAnalysis {
     /// (jeden callback cpal na ramkę) — stąd trzymany tu, obok `mono_ring`,
     /// zamiast jako zmienna lokalna.
     onset_ema: Arc<Mutex<Vec<f32>>>,
+    /// Jak [`Self::onset_ema`], ale per kanał×pasmo kolorowania — zasila
+    /// sprawdzanie per-pasmowe w [`direction::detect_channel_activity`]
+    /// (patrz doc-komentarz tam), dzięki któremu cichy dźwięk w jednym paśmie
+    /// generuje onset, nawet gdy energia szerokopasmowa kanału go nie widzi.
+    band_ema: Arc<Mutex<Vec<Vec<f32>>>>,
     /// Logger próbek klasyfikacji koloru do ręcznej analizy configu — patrz
     /// [`crate::sound::sample_logger`]. Wyłączony domyślnie; włączany
     /// checkboxem w UI (`ui::app`).
@@ -302,6 +324,7 @@ impl Default for SharedAudioAnalysis {
             mono_ring: Arc::new(Mutex::new(VecDeque::with_capacity(MONO_RING_CAPACITY))),
             last_pan: Arc::new(Mutex::new((0.0, 0.0))),
             onset_ema: Arc::new(Mutex::new(Vec::new())),
+            band_ema: Arc::new(Mutex::new(Vec::new())),
             sample_logger: Arc::new(sample_logger::SampleLogger::new()),
         }
     }
@@ -523,6 +546,36 @@ pub fn fetch_physical_output_devices() -> Result<Vec<SoundDevice>> {
     Ok(devices)
 }
 
+/// Preferowany rozmiar bufora audio w klatkach — mniejszy bufor oznacza
+/// mniejsze opóźnienie między dźwiękiem w grze a reakcją radaru/cue w
+/// słuchawkach (patrz `crate::sound::mono_router`, który używa tej samej
+/// funkcji dla strumienia wyjściowego), kosztem nieco większego ryzyka
+/// przycięć (underrun) na wolniejszym sprzęcie — wejście i wyjście to dwa
+/// NIEZALEŻNE zegary sprzętowe (patrz doc-komentarz `SharedAudioAnalysis::mono_ring`),
+/// więc im mniejszy bufor, tym mniej zapasu na ich chwilowe rozjechanie.
+///
+/// UWAGA: pierwotnie `256` (~5,3 ms przy 48 kHz) — po zgłoszeniu słyszalnych
+/// "przycięć" w dźwięku przekierowanym przez `mono_router` podniesione do
+/// `480` (~10 ms), bezpieczniejszej, powszechnie używanej wartości dla trybu
+/// "niskie opóźnienie" na zwykłym WASAPI w trybie współdzielonym (bez
+/// wyłączności na urządzenie) — wciąż wyraźnie poniżej typowego domyślnego
+/// bufora systemowego, ale z większym zapasem na wahania harmonogramowania OS.
+pub(crate) const PREFERRED_BUFFER_FRAMES: u32 = 480;
+
+/// Wybiera stały, mały rozmiar bufora ([`PREFERRED_BUFFER_FRAMES`]), jeśli
+/// urządzenie faktycznie deklaruje obsługiwany zakres — część sterowników
+/// (typowo WASAPI w trybie współdzielonym) zgłasza `Unknown` i wtedy
+/// zostajemy przy `BufferSize::Default` wybieranym przez system, żeby nie
+/// zażądać wartości spoza tego, co urządzenie faktycznie obsługuje.
+pub(crate) fn low_latency_buffer_size(supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    match *supported {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            cpal::BufferSize::Fixed(PREFERRED_BUFFER_FRAMES.clamp(min, max))
+        }
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+    }
+}
+
 pub fn fetch_audio_from_device(
     target_device_name: &str,
     analysis: SharedAudioAnalysis,
@@ -570,7 +623,8 @@ pub fn fetch_audio_from_device(
             .or_else(|_| target_device.default_output_config())?
     };
 
-    let config: StreamConfig = default_config.clone().into();
+    let mut config: StreamConfig = default_config.clone().into();
+    config.buffer_size = low_latency_buffer_size(default_config.buffer_size());
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0 as f32;
     let err_fn = |e| eprintln!("Stream error: {e}");
@@ -652,10 +706,16 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
     // Reguły kolorowania i czułość mogą się zmienić w dowolnym momencie z
     // panelu ustawień (UI), więc czytamy je świeżo przy każdej ramce zamiast
     // zakładać stałe wartości.
-    let (rules, sensitivity) = analysis
+    let (rules, sensitivity, contrast_enabled) = analysis
         .lock()
-        .map(|g| (g.radar_config.color_rules.clone(), g.radar_config.radar_sensitivity))
-        .unwrap_or_else(|_| (spectrum::default_color_rules(), default_radar_sensitivity()));
+        .map(|g| {
+            (
+                g.radar_config.color_rules.clone(),
+                g.radar_config.radar_sensitivity,
+                g.radar_config.direction_contrast_enabled,
+            )
+        })
+        .unwrap_or_else(|_| (spectrum::default_color_rules(), default_radar_sensitivity(), false));
     let rule_energies = spectrum::analyze_channel_rule_energies(samples, channels, sample_rate, &rules);
 
     // Niezależne zdarzenia kierunku: KAŻDY nagły skok energii na KAŻDYM
@@ -674,7 +734,15 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
     // nie wygenerował markera (patrz doc-komentarz `direction::ChannelActivity`).
     let channel_activity: Vec<direction::ChannelActivity> = {
         let mut ema_guard = analysis.onset_ema.lock().unwrap_or_else(|e| e.into_inner());
-        direction::detect_channel_activity(&stats.rms, &mut ema_guard, sensitivity)
+        let mut band_ema_guard = analysis.band_ema.lock().unwrap_or_else(|e| e.into_inner());
+        direction::detect_channel_activity(
+            &stats.rms,
+            &rule_energies,
+            &mut ema_guard,
+            &mut band_ema_guard,
+            sensitivity,
+            contrast_enabled,
+        )
     };
 
     let direction_events: Vec<DirectionEvent> = channel_activity
@@ -708,7 +776,7 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
             let energies = rule_energies.get(a.channel_index).map(Vec::as_slice).unwrap_or(&[]);
             let rule_index = spectrum::dominant_rule_index(energies);
             let rule_label = rule_index.and_then(|i| rules.get(i)).and_then(|r| r.label.clone());
-            analysis.sample_logger.log_sample(&sample_logger::SampleRow {
+            analysis.sample_logger.log_sample(sample_logger::SampleRow {
                 unix_ts_ms,
                 channel_index: a.channel_index,
                 rms: a.energy,
