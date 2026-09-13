@@ -16,7 +16,7 @@ use std::sync::Mutex;
 const FILE_PREFIX: &str = "sample_log_";
 const FILE_SUFFIX: &str = ".csv";
 const CSV_HEADER: &str =
-    "unix_ts_ms,channel_index,rms,scaled_energy,marker_spawned,rule_index,rule_label,color_hex,color_r,color_g,color_b\n";
+    "unix_ts_ms,channel_index,rms,scaled_energy,angle_deg,sensitivity,marker_spawned,rule_index,rule_label,color_hex,color_r,color_g,color_b\n";
 
 /// Jedna sklasyfikowana próbka (jeden kanał, jedna ramka analizy) do zapisu.
 pub struct SampleRow {
@@ -24,6 +24,16 @@ pub struct SampleRow {
     pub channel_index: usize,
     pub rms: f32,
     pub scaled_energy: f32,
+    /// Płynny kąt kierunku (patrz [`crate::sound::direction::onset_angle_deg`])
+    /// liczony dla TEJ próbki niezależnie od tego, czy przebiła próg onsetu —
+    /// bez tego z logu nie da się odtworzyć, z jakiego kierunku dźwięk
+    /// faktycznie przyszedł, tylko sam poziom i kolor.
+    pub angle_deg: f32,
+    /// Wartość suwaka "Czułość radaru" w chwili próbki — wpływa zarówno na
+    /// `scaled_energy`, jak i na próg onsetu, więc bez niej `marker_spawned`
+    /// nie da się zinterpretować offline (ta sama `rms` przy innej czułości
+    /// mogłaby, albo nie mogłaby, wygenerować marker).
+    pub sensitivity: f32,
     /// Czy ta próbka realnie wygenerowała marker na radarze (przebiła próg
     /// onsetu) — `false` przy słyszalnym, ale niezaklasyfikowanym dźwięku.
     pub marker_spawned: bool,
@@ -64,11 +74,13 @@ impl SampleLogger {
         let Some(file) = guard.as_mut() else { return };
         let (r, g, b) = row.color;
         let line = format!(
-            "{},{},{:.4},{:.4},{},{},{},#{r:02x}{g:02x}{b:02x},{r},{g},{b}\n",
+            "{},{},{:.4},{:.4},{:.1},{:.4},{},{},{},#{r:02x}{g:02x}{b:02x},{r},{g},{b}\n",
             row.unix_ts_ms,
             row.channel_index,
             row.rms,
             row.scaled_energy,
+            row.angle_deg,
+            row.sensitivity,
             row.marker_spawned,
             row.rule_index.map(|i| i.to_string()).unwrap_or_default(),
             row.rule_label.as_deref().unwrap_or("").replace(',', ";"),

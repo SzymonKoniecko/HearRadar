@@ -713,6 +713,8 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
                 channel_index: a.channel_index,
                 rms: a.energy,
                 scaled_energy: a.scaled_energy,
+                angle_deg: a.angle_deg,
+                sensitivity,
                 marker_spawned: a.is_onset,
                 rule_index,
                 rule_label,
