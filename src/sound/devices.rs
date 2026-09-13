@@ -78,14 +78,36 @@ pub struct RadarConfig {
     /// pola) nie wyzerowało linii do niewidocznych.
     #[serde(default = "default_line_thickness")]
     pub line_thickness: f32,
-    /// Jak oznaczyć dźwięk z przeciwnej strony niż wybrane ucho w trybie
-    /// jednousznym (`MonoEar::Left`/`Right`), żeby dało się po samym
-    /// brzmieniu poznać, że był z drugiej strony — patrz
-    /// [`MonoCueStyle`]/`mono_router::fill_output_f32`. `#[serde(default)]`
-    /// korzysta z `#[default]` wariantu enuma, więc wczytanie starszego
-    /// pliku configu (sprzed tego pola) włącza nową funkcję zamiast ją wyciszyć.
-    #[serde(default)]
-    pub mono_cue_style: MonoCueStyle,
+    /// Rysowanie kropek kanałów (ślad energii każdego głośnika, z zanikiem
+    /// w czasie) — NIEZALEŻNE od niezależnych wskaźników kierunku (onsety,
+    /// patrz `ui::radar_egui::DirectionMarker`), które rysują się zawsze.
+    /// Wyłączenie zostawia samą tarczę + markery, bez "szumu" tła kropek.
+    /// `#[serde(default = ...)]` na `true`, żeby wczytanie starszego pliku
+    /// konfiguracji (sprzed tego pola) zachowało dotychczasowy wygląd.
+    #[serde(default = "default_show_channel_dots")]
+    pub show_channel_dots: bool,
+    /// Styl efektu (patrz [`MonoCueStyle`]/`mono_router::apply_cue`) nakładany
+    /// na składową POCHODZĄCĄ z LEWEGO kanału źródłowego, ZAWSZE — niezależnie
+    /// od tego, które ucho (`MonoEar::Left`/`Right`) faktycznie gra. Razem z
+    /// [`Self::right_cue_style`] (osobny styl dla prawej składowej) pozwala w
+    /// JEDNYM, fizycznym uchu odróżnić po samym brzmieniu, czy dźwięk
+    /// pochodził z lewego czy prawego kanału — bez tego (dawne zachowanie,
+    /// jedno pole `mono_cue_style`) tylko strona PRZECIWNA do granego ucha
+    /// dostawała efekt, a własna strona zawsze grała surowo, co dawało tylko
+    /// dwie możliwe tekstury (surowo / jeden efekt) zamiast dwóch NIEZALEŻNYCH.
+    /// Domyślnie `Off` (surowo) — zachowuje dawne zachowanie trybu `Left`
+    /// (własna, lewa strona zawsze grała bez zmian), patrz `mono_router::fill_output_f32`.
+    #[serde(default = "default_left_cue_style")]
+    pub left_cue_style: MonoCueStyle,
+    /// Jak [`Self::left_cue_style`], ale dla składowej z PRAWEGO kanału
+    /// źródłowego. Domyślnie [`MonoCueStyle::Buzz`] (dawny domyślny wariant
+    /// enuma) — zachowuje dawne zachowanie trybu `Left` (strona przeciwna,
+    /// czyli prawa, dostawała `Buzz`). Uwaga: w trybie `MonoEar::Right`
+    /// domyślne wartości są ODWROTNE względem dawnego zachowania (dawniej to
+    /// LEWA strona była tam "przeciwna" i dostawała efekt) — kto korzysta z
+    /// ucha Prawego, powinien zamienić te dwa style miejscami w ustawieniach.
+    #[serde(default = "default_right_cue_style")]
+    pub right_cue_style: MonoCueStyle,
     /// Włącza odejmowanie energii wspólnej dla wszystkich kanałów kierunkowych
     /// przed sprawdzeniem onsetu (patrz [`crate::sound::direction::CONTRAST_AMOUNT`]
     /// i doc-komentarz [`crate::sound::direction::detect_channel_activity`]) —
@@ -120,6 +142,14 @@ fn default_line_thickness() -> f32 {
     1.0
 }
 
+fn default_left_cue_style() -> MonoCueStyle {
+    MonoCueStyle::Off
+}
+
+fn default_right_cue_style() -> MonoCueStyle {
+    MonoCueStyle::Buzz
+}
+
 impl Default for RadarConfig {
     fn default() -> Self {
         Self {
@@ -137,7 +167,9 @@ impl Default for RadarConfig {
             radar_sensitivity: default_radar_sensitivity(),
             edge_glow_enabled: false,
             line_thickness: default_line_thickness(),
-            mono_cue_style: MonoCueStyle::default(),
+            show_channel_dots: default_show_channel_dots(),
+            left_cue_style: default_left_cue_style(),
+            right_cue_style: default_right_cue_style(),
             direction_contrast_enabled: false,
         }
     }
@@ -200,6 +232,31 @@ pub enum MonoCueStyle {
     /// Mocniejszy filtr dolnoprzepustowy niż `Muffled` (niższe odcięcie) —
     /// strona przeciwna brzmi wyraźnie ciemniej/głucho.
     Dark,
+    /// Redukcja efektywnej częstotliwości próbkowania (sample-and-hold) +
+    /// kwantyzacja do garści poziomów — cyfrowy, chropowaty "chrzęst",
+    /// jakościowo inny niż filtry (Muffled/Dark/Bright) czy modulacja
+    /// amplitudy (Buzz/Squeaky/Pulse). Patrz `mono_router::bitcrush_step`.
+    Bitcrush,
+    /// PRAWDZIWA modulacja pierścieniowa: mnożenie sygnału przez nośną falę
+    /// sinusoidalną BEZPOŚREDNIO (nie jako obwiednię jak `Buzz`/`Squeaky`,
+    /// które mimo nazwy w kodzie są technicznie tremolo) — daje inharmoniczne
+    /// wstęgi boczne, metaliczne/"kosmiczne" brzmienie. Patrz
+    /// `mono_router::ring_mod_step`.
+    RingMod,
+    /// Modulowane, krótkie opóźnienie (kilka ms, oscylujące wolno) zamiast
+    /// filtra czy modulacji głośności — moduluje WYSOKOŚĆ dźwięku, dając
+    /// efekt "pływania"/wibrata. Patrz `mono_router::vibrato_step`.
+    Vibrato,
+    /// Wyraźne, pojedyncze powtórzenie (echo) z opóźnieniem ~120ms i lekkim
+    /// sprzężeniem zwrotnym — wrażenie odległości/przestrzeni zamiast barwy
+    /// czy rytmu głośności. Patrz `mono_router::echo_step`.
+    Echo,
+    /// Rytmiczny wzorzec "stuk-stuk-...-cisza" (dwa krótkie stuknięcia,
+    /// dłuższa przerwa) zamiast prostego bramkowania 0/1 jak `Pulse` —
+    /// badania nad earconami wskazują, że rozpoznawalność wzorców
+    /// rytmicznych jest silniejsza niż samej wysokości dźwięku. Patrz
+    /// `mono_router::double_tap_step`.
+    DoubleTap,
 }
 
 impl MonoCueStyle {
@@ -211,6 +268,11 @@ impl MonoCueStyle {
         Self::Muffled,
         Self::Bright,
         Self::Dark,
+        Self::Bitcrush,
+        Self::RingMod,
+        Self::Vibrato,
+        Self::Echo,
+        Self::DoubleTap,
     ];
 
     pub fn label(self) -> &'static str {
@@ -222,6 +284,11 @@ impl MonoCueStyle {
             Self::Muffled => "Stłumiony",
             Self::Bright => "Jasny",
             Self::Dark => "Ciemny",
+            Self::Bitcrush => "Chrzęst cyfrowy",
+            Self::RingMod => "Metaliczny",
+            Self::Vibrato => "Wibrato",
+            Self::Echo => "Echo",
+            Self::DoubleTap => "Podwójne stuknięcie",
         }
     }
 }
@@ -300,6 +367,17 @@ const RING_TRIM_THRESHOLD_SAMPLES: usize = TARGET_RING_LATENCY_SAMPLES * 3;
 /// [`SharedAudioAnalysis::push_stereo_pan`] — bez tego logowalibyśmy co
 /// callback (co ~10ms), zalewając `debug.log`.
 static PUSH_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Licznik do przerzedzenia logów `[ch]`/`[analysis]` w [`update_analysis`] —
+/// wcześniej logowane BEZWARUNKOWO co callback audio (~10ms, ~100x/s), co
+/// realnie narosło do dziesiątek tysięcy linii w kilka minut i było powodem,
+/// dla którego `debug_log::init()` zostało tymczasowo wyłączone w `main.rs`.
+/// Ta sama częstotliwość co [`PUSH_LOG_COUNTER`] (~co 2s przy 480 klatkach/48kHz).
+static ANALYSIS_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Co który callback logować [`ANALYSIS_LOG_COUNTER`]/[`PUSH_LOG_COUNTER`] —
+/// ~2s przy 480 klatkach/48kHz (480/48000 * 200 ≈ 2s).
+const DIAGNOSTIC_LOG_EVERY_N_CALLBACKS: u64 = 200;
 
 #[derive(Debug, Clone)]
 pub struct SharedAudioAnalysis {
@@ -398,7 +476,7 @@ impl SharedAudioAnalysis {
                 );
             }
             let n = PUSH_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-            if n % 200 == 0 {
+            if n % DIAGNOSTIC_LOG_EVERY_N_CALLBACKS == 0 {
                 crate::dlog!("[mono_ring] depth={} (~{:.0}ms @48kHz)", ring.len(), ring.len() as f32 / 48.0);
             }
         }
@@ -841,14 +919,20 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         }
     }
 
-    let labels = ["L", "R", "C", "LFE", "RL", "RR", "SL", "SR"];
-    let ch_str: Vec<String> = stats.rms.iter().enumerate().map(|(i, rms)| {
-        let label = labels.get(i).copied().unwrap_or("?");
-        let pct = (rms.clamp(0.0, 1.0) * 100.0).round() as u32;
-        format!("{label}:{pct}")
-    }).collect();
-    crate::dlog!("[ch] {} | onsets={}", ch_str.join(" "), direction_events.len());
-    crate::dlog!("[analysis] rms={:?}", &stats.rms);
+    // Przerzedzone do ~co 2s (patrz [`ANALYSIS_LOG_COUNTER`]) — bezwarunkowe
+    // logowanie co callback (~100x/s) narosło kiedyś do dziesiątek tysięcy
+    // linii w kilka minut.
+    let analysis_n = ANALYSIS_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if analysis_n % DIAGNOSTIC_LOG_EVERY_N_CALLBACKS == 0 {
+        let labels = ["L", "R", "C", "LFE", "RL", "RR", "SL", "SR"];
+        let ch_str: Vec<String> = stats.rms.iter().enumerate().map(|(i, rms)| {
+            let label = labels.get(i).copied().unwrap_or("?");
+            let pct = (rms.clamp(0.0, 1.0) * 100.0).round() as u32;
+            format!("{label}:{pct}")
+        }).collect();
+        crate::dlog!("[ch] {} | onsets={}", ch_str.join(" "), direction_events.len());
+        crate::dlog!("[analysis] rms={:?}", &stats.rms);
+    }
     // Pozycja (kąt na tarczy) i intensywność każdego wskaźnika kierunku —
     // dokładnie to, co dostaje `RadarState::update` i zamienia na osobny,
     // gasnący marker na radarze (patrz `ui::radar_egui::DirectionMarker`).
@@ -930,6 +1014,34 @@ fn channel_pan_weights(role: direction::ChannelRole) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mono_cue_style_all_lists_every_variant_with_a_unique_non_empty_label() {
+        // 7 dawnych + 5 nowych (Bitcrush/RingMod/Vibrato/Echo/DoubleTap) —
+        // regresja przeciw "dodałem wariant do enuma, zapomniałem dopisać go
+        // do ALL" (wtedy nie pojawiłby się w ogóle w pickerze UI).
+        assert_eq!(MonoCueStyle::ALL.len(), 12, "spodziewano się dokładnie 12 stylów w ALL");
+        let labels: Vec<&str> = MonoCueStyle::ALL.iter().map(|s| s.label()).collect();
+        assert!(labels.iter().all(|l| !l.is_empty()), "żaden styl nie powinien mieć pustej etykiety: {labels:?}");
+        for i in 0..labels.len() {
+            for j in (i + 1)..labels.len() {
+                assert_ne!(labels[i], labels[j], "etykiety stylów muszą być unikalne (żeby dało się je odróżnić w UI)");
+            }
+        }
+    }
+
+    #[test]
+    fn radar_config_round_trips_new_cue_styles_through_json() {
+        // Regresja: nowe warianty enuma (Bitcrush/RingMod/Vibrato/Echo/
+        // DoubleTap) muszą się poprawnie (de)serializować jako pola
+        // `left_cue_style`/`right_cue_style` configu, tak samo jak dawne.
+        for &style in MonoCueStyle::ALL {
+            let cfg = RadarConfig { left_cue_style: style, right_cue_style: style, ..RadarConfig::default() };
+            let json = serde_json::to_string(&cfg).expect("serializacja");
+            let back: RadarConfig = serde_json::from_str(&json).expect("deserializacja");
+            assert_eq!(cfg, back, "round-trip JSON powinien zachować styl {style:?}");
+        }
+    }
 
     #[test]
     fn test_device_helpers() {

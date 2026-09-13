@@ -487,26 +487,41 @@ impl HearRadarApp {
             }
         });
 
-        // Efekt na stronie przeciwnej do granego ucha (patrz
-        // `mono_router::apply_cue`) — bez tego w trybie jednousznym
-        // (Lewe/Prawe) cała informacja "z której strony był dźwięk" ginie,
-        // bo obie strony grają identycznie w jednej słuchawce.
+        // Niezależne style dla lewej i prawej składowej źródłowej (patrz
+        // `mono_router::apply_cue`/`fill_output_f32`) — obie zawsze dostają
+        // WŁASNY efekt, zmiksowane w to samo, jedno ucho w trybie jednousznym
+        // (Lewe/Prawe), żeby po samym brzmieniu dało się rozróżnić, skąd
+        // dźwięk pochodził, zamiast tracić całą informację L/R.
         ui.horizontal_wrapped(|ui| {
-            ui.label("Wskazówka dla strony przeciwnej (tryb jednouszny):");
+            ui.label("Styl lewej składowej:");
             for style in MonoCueStyle::ALL {
                 let style = *style;
                 if ui
-                    .selectable_label(self.radar_config.mono_cue_style == style, style.label())
+                    .selectable_label(self.radar_config.left_cue_style == style, style.label())
                     .clicked()
                 {
-                    self.radar_config.mono_cue_style = style;
+                    self.radar_config.left_cue_style = style;
+                    self.write_radar_config();
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Styl prawej składowej:");
+            for style in MonoCueStyle::ALL {
+                let style = *style;
+                if ui
+                    .selectable_label(self.radar_config.right_cue_style == style, style.label())
+                    .clicked()
+                {
+                    self.radar_config.right_cue_style = style;
                     self.write_radar_config();
                 }
             }
         });
         ui.weak(
-            "Dotyczy tylko ucha Lewe/Prawe: strona przeciwna dostaje wybrany efekt zamiast grać \
-             identycznie jak swoja, żeby po brzmieniu poznać, że dźwięk był z drugiej strony.",
+            "Dotyczy tylko ucha Lewe/Prawe: obie składowe (lewa i prawa) dostają WŁASNY wybrany \
+             efekt naraz, zmiksowane w graną słuchawkę — dzięki dwóm różnym stylom po samym \
+             brzmieniu poznasz, z której strony pochodził dźwięk, nawet słuchając jednym uchem.",
         );
 
         // Wzmocnienie sygnału mono na wyjściu — odpowiednik `INTENSITY_SCALE`

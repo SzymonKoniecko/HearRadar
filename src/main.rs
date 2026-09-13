@@ -7,12 +7,15 @@ use sound::devices::SharedAudioAnalysis;
 use ui::HearRadarApp;
 
 fn main() {
-    // Zapis do pliku wyłączony (patrz `debug_log::init`) — narósł do dziesiątek
-    // tysięcy linii w kilka minut i nie był już potrzebny. `dlog!` w
-    // `sound::devices`/`mono_router` bez wywołania `init()` samoistnie cichnie
-    // do samego `println!` na konsolę (patrz `debug_log::log_line`) — odkomentuj
-    // poniższe wywołanie, żeby wrócić do dublowania logów do `config/debug.log`.
-    // debug_log::init();
+    // Dubluje logi diagnostyczne (patrz `dlog!` w `sound::devices`/`mono_router`)
+    // do pliku `config/debug.log` — patrz `debug_log::init`. Był tu wcześniej
+    // wyłączony, bo `[ch]`/`[analysis]` logowane bezwarunkowo co callback audio
+    // (~100x/s) narosły do dziesiątek tysięcy linii w kilka minut; te dwa logi
+    // są teraz przerzedzone do ~co 2s (patrz `devices::ANALYSIS_LOG_COUNTER`),
+    // więc plik znowu rośnie w rozsądnym tempie. Bez wywołania `init()` `dlog!`
+    // jest CAŁKOWICIE ciche (żaden `println!` — patrz doc-komentarz
+    // `debug_log`), więc bez tej linii nie ma żadnej diagnostyki, nawet na konsoli.
+    debug_log::init();
 
     let analysis = SharedAudioAnalysis::new();
 

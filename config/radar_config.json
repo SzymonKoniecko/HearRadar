@@ -69,6 +69,8 @@
   "radar_sensitivity": 9.5,
   "edge_glow_enabled": false,
   "line_thickness": 1.0,
-  "mono_cue_style": "Off",
+  "show_channel_dots": true,
+  "left_cue_style": "Bright",
+  "right_cue_style": "Bright",
   "direction_contrast_enabled": true
 }

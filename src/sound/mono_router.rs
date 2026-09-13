@@ -90,19 +90,93 @@ const BRIGHT_HIGHPASS_CUTOFF_HZ: f32 = 800.0;
 /// przesterowania przy typowych, niegłośnych sygnałach z radaru.
 const BRIGHT_BOOST_GAIN: f32 = 1.5;
 
+/// Co ile próbek [`MonoCueStyle::Bitcrush`] "trzyma" ostatnią skwantowaną
+/// wartość (sample-and-hold) — obniża EFEKTYWNĄ częstotliwość próbkowania
+/// bez faktycznego resamplingu. 6 przy typowych 48kHz daje ~8kHz, wyraźnie
+/// słyszalne jako cyfrowa chropowatość, ale wciąż rozpoznawalne jako to samo
+/// źródło dźwięku.
+const BITCRUSH_HOLD_SAMPLES: u32 = 6;
+
+/// Liczba poziomów kwantyzacji amplitudy dla [`MonoCueStyle::Bitcrush`] —
+/// niżej niż normalne 16/24-bit audio, żeby "schodki" były słyszalne jako
+/// chrzęst, nie tylko cichy szum kwantyzacji.
+const BITCRUSH_LEVELS: f32 = 12.0;
+
+/// Częstotliwość (Hz) nośnej dla [`MonoCueStyle::RingMod`] — PRAWDZIWA
+/// modulacja pierścieniowa (mnożenie przez falę nośną wprost, bez
+/// przesunięcia DC jak w [`am_modulate`]), więc nawet niska nośna daje
+/// wyraźnie metaliczne, inharmoniczne brzmienie odróżnialne od
+/// `Buzz`/`Squeaky` (które są technicznie tremolo).
+const TRUE_RING_MOD_HZ: f32 = 350.0;
+
+/// Częstotliwość (Hz) LFO modulującego opóźnienie w [`MonoCueStyle::Vibrato`]
+/// — na tyle wolno, żeby brzmiało jak "pływanie" wysokości, nie drganie.
+const VIBRATO_RATE_HZ: f32 = 5.0;
+
+/// Środkowe opóźnienie (w próbkach) linii opóźniającej dla `Vibrato` —
+/// LFO waha się wokół tej wartości o [`VIBRATO_DEPTH_SAMPLES`] w każdą stronę.
+const VIBRATO_CENTER_SAMPLES: f32 = 100.0;
+
+/// Amplituda wahania opóźnienia (w próbkach) dla `Vibrato` — przy 48kHz
+/// ~1.7ms, dość by dało się usłyszeć zmianę wysokości, za mało by brzmiało
+/// jak echo.
+const VIBRATO_DEPTH_SAMPLES: f32 = 80.0;
+
+/// Rozmiar bufora kołowego linii opóźniającej dla `Vibrato` — musi z zapasem
+/// pomieścić `VIBRATO_CENTER_SAMPLES + VIBRATO_DEPTH_SAMPLES`.
+const VIBRATO_BUF_LEN: usize = 512;
+
+/// Opóźnienie (ms) pojedynczego, wyraźnego powtórzenia dla [`MonoCueStyle::Echo`]
+/// — na tyle długie, by brzmiało jak osobne echo, nie pogrubienie dźwięku
+/// (to byłby raczej efekt typu chorus przy krótszych opóźnieniach).
+const ECHO_DELAY_MS: f32 = 120.0;
+
+/// Sprzężenie zwrotne echa (0.0 = pojedyncze powtórzenie, bliżej 1.0 = wiele
+/// zanikających powtórzeń) — umiarkowane, żeby echo było wyraźne, ale nie
+/// zamieniało się w nieskończenie dzwoniący pogłos.
+const ECHO_FEEDBACK: f32 = 0.35;
+
+/// Udział sygnału opóźnionego w miksie wyjściowym `Echo` (0.0 = tylko suchy
+/// sygnał, 1.0 = tylko echo) — na tyle wysoki, żeby echo było łatwo słyszalne
+/// obok oryginału.
+const ECHO_WET: f32 = 0.6;
+
+/// Maksymalny rozmiar bufora kołowego dla `Echo` — z zapasem na
+/// [`ECHO_DELAY_MS`] przy częstotliwościach próbkowania wyższych niż typowe
+/// 48kHz (np. 96kHz).
+const ECHO_BUF_LEN_CAP: usize = 16_384;
+
+/// Częstotliwość (Hz) pełnego cyklu wzorca "stuk-stuk-cisza" dla
+/// [`MonoCueStyle::DoubleTap`].
+const DOUBLE_TAP_HZ: f32 = 3.0;
+
 /// Stan efektu DSP nakładanego na stronę przeciwną (patrz
 /// [`apply_cue`]/[`fill_output_f32`]), trzymany przez wywołującego MIĘDZY
 /// kolejnymi wywołaniami callbacku wyjściowego — inaczej faza oscylatora
 /// (`phase`) i stan filtra (`lp`) resetowałyby się co bufor, dając trzaski na
-/// granicach zamiast płynnego efektu.
-#[derive(Debug, Default, Clone, Copy)]
+/// granicach zamiast płynnego efektu. Bez `Copy` (ma `Vec` w środku, patrz
+/// `delay_buf`) — nigdzie nie polegamy na kopiowaniu tego stanu, tylko na
+/// przekazywaniu `&mut` między kolejnymi wywołaniami.
+#[derive(Debug, Default, Clone)]
 struct CueState {
-    /// Faza oscylatora (0.0..=1.0) dla `Buzz`/`Squeaky`/`Pulse`.
+    /// Faza oscylatora (0.0..=1.0) dla `Buzz`/`Squeaky`/`Pulse`/`RingMod`/
+    /// `Vibrato`/`DoubleTap`.
     phase: f32,
     /// Stan filtra dolnoprzepustowego jednobiegunowego dla
     /// `Muffled`/`Dark`/`Bright` (ten ostatni używa go pośrednio, przez
-    /// [`highpass_component`]).
+    /// dopełnienie filtra).
     lp: f32,
+    /// Ostatnia skwantowana wartość dla `Bitcrush` (patrz [`bitcrush_step`]).
+    hold_value: f32,
+    /// Licznik próbek od ostatniej aktualizacji `hold_value` dla `Bitcrush`.
+    hold_counter: u32,
+    /// Bufor kołowy linii opóźniającej — współdzielony przez `Vibrato` i
+    /// `Echo` (nigdy nie działają jednocześnie na tym samym stanie, bo jeden
+    /// `CueState` obsługuje w danej chwili DOKŁADNIE jeden wybrany styl).
+    /// Alokowany/przycinany leniwie przy pierwszym użyciu danego stylu.
+    delay_buf: Vec<f32>,
+    /// Pozycja zapisu w `delay_buf`.
+    delay_pos: usize,
 }
 
 /// Jeden krok oscylatora modulacji amplitudy: przesuwa `state.phase` o
@@ -129,6 +203,99 @@ fn one_pole_lowpass_step(sample: f32, sample_rate: f32, cutoff_hz: f32, lp: &mut
     let alpha = dt / (rc + dt);
     *lp += alpha * (sample - *lp);
     *lp
+}
+
+/// Sample-and-hold + kwantyzacja do garści poziomów — patrz doc-komentarz
+/// [`BITCRUSH_HOLD_SAMPLES`]/[`BITCRUSH_LEVELS`].
+#[inline]
+fn bitcrush_step(sample: f32, hold_value: &mut f32, hold_counter: &mut u32) -> f32 {
+    if *hold_counter == 0 {
+        *hold_value = (sample * BITCRUSH_LEVELS).round() / BITCRUSH_LEVELS;
+    }
+    *hold_counter = (*hold_counter + 1) % BITCRUSH_HOLD_SAMPLES.max(1);
+    *hold_value
+}
+
+/// PRAWDZIWA modulacja pierścieniowa: mnożenie sygnału przez falę nośną
+/// wprost (w przeciwieństwie do [`am_modulate`], które moduluje obwiednię w
+/// zakresie dodatnim) — nośna schodzi też poniżej zera, więc wynik
+/// odwraca fazę części cyklu, dając inharmoniczne wstęgi boczne zamiast
+/// prostego "brzęczenia" amplitudy.
+#[inline]
+fn ring_mod_step(sample: f32, sample_rate: f32, phase: &mut f32) -> f32 {
+    *phase = (*phase + TRUE_RING_MOD_HZ / sample_rate).fract();
+    sample * (*phase * std::f32::consts::TAU).sin()
+}
+
+/// Odczyt/zapis liniowo interpolowanej (ułamkowej) linii opóźniającej —
+/// wspólny mechanizm dla [`vibrato_step`] (opóźnienie modulowane LFO) i
+/// [`echo_step`] (stałe opóźnienie + sprzężenie zwrotne, dopisywane przez
+/// wywołującego do `write_value`). Zmiana `len` (np. przy przełączeniu stylu
+/// na tym samym `CueState`) resetuje bufor — nie ma sensu zachowywać starej
+/// historii przy zupełnie innej długości linii.
+#[inline]
+fn delay_line_step(buf: &mut Vec<f32>, pos: &mut usize, len: usize, write_value: f32, read_offset: f32) -> f32 {
+    let len = len.max(1);
+    if buf.len() != len {
+        *buf = vec![0.0; len];
+        *pos = 0;
+    }
+    let read_pos = (*pos as f32 - read_offset).rem_euclid(len as f32);
+    let idx0 = read_pos.floor() as usize % len;
+    let idx1 = (idx0 + 1) % len;
+    let frac = read_pos.fract();
+    let delayed = buf[idx0] * (1.0 - frac) + buf[idx1] * frac;
+    buf[*pos] = write_value;
+    *pos = (*pos + 1) % len;
+    delayed
+}
+
+/// Modulowane, krótkie opóźnienie — patrz doc-komentarz
+/// [`VIBRATO_RATE_HZ`]/[`VIBRATO_CENTER_SAMPLES`]/[`VIBRATO_DEPTH_SAMPLES`].
+/// Zapisuje SUCHY sygnał (bez sprzężenia zwrotnego, w przeciwieństwie do
+/// [`echo_step`]) — czysta modulacja wysokości, nie powtórzenia.
+#[inline]
+fn vibrato_step(sample: f32, phase: &mut f32, sample_rate: f32, buf: &mut Vec<f32>, pos: &mut usize) -> f32 {
+    *phase = (*phase + VIBRATO_RATE_HZ / sample_rate).fract();
+    let offset = VIBRATO_CENTER_SAMPLES + VIBRATO_DEPTH_SAMPLES * (*phase * std::f32::consts::TAU).sin();
+    delay_line_step(buf, pos, VIBRATO_BUF_LEN, sample, offset)
+}
+
+/// Wyraźne, pojedyncze (z lekkim sprzężeniem) echo — patrz doc-komentarz
+/// [`ECHO_DELAY_MS`]/[`ECHO_FEEDBACK`]/[`ECHO_WET`]. Stałe, CAŁKOWITE
+/// opóźnienie (bez modulacji jak w [`vibrato_step`]), więc zwykły
+/// bufor kołowy bez interpolacji ułamkowej wystarczy i jest prostszy.
+#[inline]
+fn echo_step(sample: f32, sample_rate: f32, buf: &mut Vec<f32>, pos: &mut usize) -> f32 {
+    let len = (((ECHO_DELAY_MS / 1000.0) * sample_rate).round() as usize).clamp(1, ECHO_BUF_LEN_CAP);
+    if buf.len() != len {
+        *buf = vec![0.0; len];
+        *pos = 0;
+    }
+    let delayed = buf[*pos];
+    // Sprzężenie zwrotne: to, co zapisujemy, zawiera już część poprzedniego
+    // echa, więc kolejne powtórzenia same z siebie cichną geometrycznie.
+    buf[*pos] = sample + delayed * ECHO_FEEDBACK;
+    *pos = (*pos + 1) % len;
+    sample * (1.0 - ECHO_WET) + delayed * ECHO_WET
+}
+
+/// Rytmiczny wzorzec "stuk-stuk-...-cisza" — patrz doc-komentarz
+/// [`DOUBLE_TAP_HZ`]. Bramkowanie 0/1, jak `Pulse`, ale z bardziej złożonym
+/// wzorcem w jednym cyklu zamiast prostego 50/50.
+#[inline]
+fn double_tap_step(sample: f32, phase: &mut f32, sample_rate: f32) -> f32 {
+    *phase = (*phase + DOUBLE_TAP_HZ / sample_rate).fract();
+    let gate = if *phase < 0.12 {
+        1.0
+    } else if *phase < 0.24 {
+        0.0
+    } else if *phase < 0.36 {
+        1.0
+    } else {
+        0.0
+    };
+    sample * gate
 }
 
 /// Nakłada efekt `style` na próbkę ze strony przeciwnej do granego ucha —
@@ -159,6 +326,13 @@ fn apply_cue(style: MonoCueStyle, sample: f32, sample_rate: f32, state: &mut Cue
             let high = sample - low;
             sample + high * BRIGHT_BOOST_GAIN
         }
+        MonoCueStyle::Bitcrush => bitcrush_step(sample, &mut state.hold_value, &mut state.hold_counter),
+        MonoCueStyle::RingMod => ring_mod_step(sample, sample_rate, &mut state.phase),
+        MonoCueStyle::Vibrato => {
+            vibrato_step(sample, &mut state.phase, sample_rate, &mut state.delay_buf, &mut state.delay_pos)
+        }
+        MonoCueStyle::Echo => echo_step(sample, sample_rate, &mut state.delay_buf, &mut state.delay_pos),
+        MonoCueStyle::DoubleTap => double_tap_step(sample, &mut state.phase, sample_rate),
     }
 }
 
@@ -195,30 +369,38 @@ fn build_output_stream(
     // trzaskały na granicy buforów.
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
-            let mut cue_state = CueState::default();
+            let mut left_state = CueState::default();
+            let mut right_state = CueState::default();
             device.build_output_stream(
                 &stream_config,
                 move |out: &mut [f32], _| {
                     let frames = out.len() / out_channels.max(1);
                     let pan = analysis.read_stereo_pan(frames);
-                    let (ear, gain, cue_style) = read_ear_and_gain(&analysis);
-                    fill_output_f32(out, &pan, out_channels, ear, gain, cue_style, sample_rate, &mut cue_state);
+                    let (ear, gain, left_style, right_style) = read_ear_and_gain(&analysis);
+                    fill_output_f32(
+                        out, &pan, out_channels, ear, gain, left_style, right_style, sample_rate,
+                        &mut left_state, &mut right_state,
+                    );
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::I16 => {
-            let mut cue_state = CueState::default();
+            let mut left_state = CueState::default();
+            let mut right_state = CueState::default();
             device.build_output_stream(
                 &stream_config,
                 move |out: &mut [i16], _| {
                     let frames = out.len() / out_channels.max(1);
                     let pan = analysis.read_stereo_pan(frames);
-                    let (ear, gain, cue_style) = read_ear_and_gain(&analysis);
+                    let (ear, gain, left_style, right_style) = read_ear_and_gain(&analysis);
                     // Konwersja f32 → i16
                     let mut tmp = vec![0.0f32; out.len()];
-                    fill_output_f32(&mut tmp, &pan, out_channels, ear, gain, cue_style, sample_rate, &mut cue_state);
+                    fill_output_f32(
+                        &mut tmp, &pan, out_channels, ear, gain, left_style, right_style, sample_rate,
+                        &mut left_state, &mut right_state,
+                    );
                     for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
                         *dst = (src * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                     }
@@ -228,15 +410,19 @@ fn build_output_stream(
             )?
         }
         SampleFormat::U16 => {
-            let mut cue_state = CueState::default();
+            let mut left_state = CueState::default();
+            let mut right_state = CueState::default();
             device.build_output_stream(
                 &stream_config,
                 move |out: &mut [u16], _| {
                     let frames = out.len() / out_channels.max(1);
                     let pan = analysis.read_stereo_pan(frames);
-                    let (ear, gain, cue_style) = read_ear_and_gain(&analysis);
+                    let (ear, gain, left_style, right_style) = read_ear_and_gain(&analysis);
                     let mut tmp = vec![0.0f32; out.len()];
-                    fill_output_f32(&mut tmp, &pan, out_channels, ear, gain, cue_style, sample_rate, &mut cue_state);
+                    fill_output_f32(
+                        &mut tmp, &pan, out_channels, ear, gain, left_style, right_style, sample_rate,
+                        &mut left_state, &mut right_state,
+                    );
                     for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
                         // f32 (-1..1) → u16 (0..65535), środek = 32768
                         *dst = ((src * 0.5 + 0.5) * u16::MAX as f32)
@@ -287,15 +473,22 @@ fn soft_limit(x: f32) -> f32 {
     x.signum() * compressed
 }
 
-/// Czyta `mono_ear`, `radar_config.mono_boost_db` i
-/// `radar_config.mono_cue_style` jednym lockiem i od razu zamienia dB na
+/// Czyta `mono_ear`, `radar_config.mono_boost_db`, `radar_config.left_cue_style`
+/// i `radar_config.right_cue_style` jednym lockiem i od razu zamienia dB na
 /// mnożnik — wołane raz na każdą ramkę callbacku wyjściowego.
-fn read_ear_and_gain(analysis: &SharedAudioAnalysis) -> (MonoEar, f32, MonoCueStyle) {
-    let (ear, boost_db, cue_style) = analysis
+fn read_ear_and_gain(analysis: &SharedAudioAnalysis) -> (MonoEar, f32, MonoCueStyle, MonoCueStyle) {
+    let (ear, boost_db, left_style, right_style) = analysis
         .lock()
-        .map(|g| (g.mono_ear, g.radar_config.mono_boost_db, g.radar_config.mono_cue_style))
-        .unwrap_or((MonoEar::Off, 0.0, MonoCueStyle::Off));
-    (ear, db_to_linear(boost_db), cue_style)
+        .map(|g| {
+            (
+                g.mono_ear,
+                g.radar_config.mono_boost_db,
+                g.radar_config.left_cue_style,
+                g.radar_config.right_cue_style,
+            )
+        })
+        .unwrap_or((MonoEar::Off, 0.0, MonoCueStyle::Off, MonoCueStyle::Off));
+    (ear, db_to_linear(boost_db), left_style, right_style)
 }
 
 // ── Wypełnianie bufora wyjściowego ───────────────────────────────────────────
@@ -308,15 +501,18 @@ fn read_ear_and_gain(analysis: &SharedAudioAnalysis) -> (MonoEar, f32, MonoCueSt
 /// łańcuchu. Kanały poza `out_channels` są zerowane.
 ///
 /// `ear` decyduje który kanał stereo dostaje sygnał — w trybach jednousznych
-/// (`Left`/`Right`) strona PRZECIWNA do granego ucha nie jest po prostu
-/// domiksowywana "na płasko": dostaje efekt wg `cue_style` (patrz
-/// [`apply_cue`]/[`MonoCueStyle`], `cue_state` trzymany przez wywołującego
-/// między callbackami), żeby dało się usłyszeć w jednej słuchawce, że dźwięk
-/// oryginalnie był z drugiej strony — bez tego cała informacja L/R ginęłaby
-/// w trybie jednousznym. `MonoCueStyle::Off` (checkbox/wybór w UI,
-/// `RadarConfig::mono_cue_style`) wraca do starego zachowania: strona
-/// przeciwna gra na pełnej głośności, tak samo jak swoja, bez żadnego
-/// oznaczenia.
+/// (`Left`/`Right`) OBIE składowe źródłowe (lewa i prawa) dostają WŁASNY
+/// efekt (`left_style`/`right_style`, patrz [`apply_cue`]/[`MonoCueStyle`],
+/// `left_state`/`right_state` trzymane przez wywołującego między
+/// callbackami — muszą być NIEZALEŻNE, bo każdy styl ma swoją fazę
+/// oscylatora/stan filtra), zanim zostaną zmiksowane w jedno, fizyczne ucho.
+/// Dzięki temu w JEDNYM uchu dają się rozróżnić po samym brzmieniu DWIE
+/// niezależne tekstury — skąd dźwięk pochodził — zamiast dawnego schematu
+/// "własna strona zawsze surowo + strona przeciwna jeden wspólny efekt".
+/// `MonoCueStyle::Off` dla danej strony wraca do starego, surowego brzmienia
+/// TEJ strony. `MonoEar::Both` gra płaską sumę bez żadnego efektu (jak dawniej) —
+/// ta funkcja jest pomyślana pod tryb jednouszny, gdzie liczy się rozróżnienie
+/// pochodzenia w jednej słuchawce, nie pod pełne stereo.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn fill_output_f32(
@@ -325,9 +521,11 @@ fn fill_output_f32(
     out_channels: usize,
     ear: MonoEar,
     gain: f32,
-    cue_style: MonoCueStyle,
+    left_style: MonoCueStyle,
+    right_style: MonoCueStyle,
     sample_rate: f32,
-    cue_state: &mut CueState,
+    left_state: &mut CueState,
+    right_state: &mut CueState,
 ) {
     let ch = out_channels.max(1);
     for (frame_idx, frame) in out.chunks_exact_mut(ch).enumerate() {
@@ -339,17 +537,20 @@ fn fill_output_f32(
         match ear {
             MonoEar::Off => { /* cisza */ }
             MonoEar::Left => {
-                let opposite = apply_cue(cue_style, right, sample_rate, cue_state);
-                frame[0] = soft_limit((left + opposite) * gain);
+                let l = apply_cue(left_style, left, sample_rate, left_state);
+                let r = apply_cue(right_style, right, sample_rate, right_state);
+                frame[0] = soft_limit((l + r) * gain);
             }
             MonoEar::Right if ch >= 2 => {
-                let opposite = apply_cue(cue_style, left, sample_rate, cue_state);
-                frame[1] = soft_limit((right + opposite) * gain);
+                let l = apply_cue(left_style, left, sample_rate, left_state);
+                let r = apply_cue(right_style, right, sample_rate, right_state);
+                frame[1] = soft_limit((l + r) * gain);
             }
             MonoEar::Right => {
                 // mono device fallback
-                let opposite = apply_cue(cue_style, left, sample_rate, cue_state);
-                frame[0] = soft_limit((right + opposite) * gain);
+                let l = apply_cue(left_style, left, sample_rate, left_state);
+                let r = apply_cue(right_style, right, sample_rate, right_state);
+                frame[0] = soft_limit((l + r) * gain);
             }
             MonoEar::Both => {
                 // Oba uszy już słyszą osobno lewą/prawą stronę (stereo
@@ -409,22 +610,46 @@ mod tests {
 
     /// Kilka klatek stałej pary `(left, right)`, z domyślnym stylem `Buzz`
     /// (wystarczająco klatek, żeby oscylator zdążył przejść przez pełny
-    /// cykl i test złapał zarówno szczyt, jak i dolinę fali).
+    /// cykl i test złapał zarówno szczyt, jak i dolinę fali). Odpowiednik
+    /// dawnego zachowania trybu `Left`: lewa (własna) strona surowo
+    /// (`left_style = Off`), prawa (przeciwna) ze stylem `Buzz`.
     fn run_frames(pan: &(f32, f32), n: usize, out_channels: usize, ear: MonoEar) -> Vec<f32> {
         run_frames_with_style(pan, n, out_channels, ear, MonoCueStyle::Buzz)
     }
 
+    /// Jak [`run_frames`], ale z wybranym stylem dla PRAWEJ składowej —
+    /// lewa zostaje surowa (`Off`), co odtwarza dawne zachowanie trybu
+    /// `Left` (własna strona zawsze surowo, przeciwna z jednym stylem) dla
+    /// wszystkich testów napisanych pod tamten, jednostylowy model.
     fn run_frames_with_style(
         pan: &(f32, f32),
         n: usize,
         out_channels: usize,
         ear: MonoEar,
-        cue_style: MonoCueStyle,
+        right_style: MonoCueStyle,
+    ) -> Vec<f32> {
+        run_frames_with_styles(pan, n, out_channels, ear, MonoCueStyle::Off, right_style)
+    }
+
+    /// Jak [`run_frames_with_style`], ale z NIEZALEŻNYMI stylami dla obu
+    /// składowych źródłowych — do testowania nowej funkcji (styl A dla
+    /// lewej, styl B dla prawej, zmiksowane w jedno ucho).
+    fn run_frames_with_styles(
+        pan: &(f32, f32),
+        n: usize,
+        out_channels: usize,
+        ear: MonoEar,
+        left_style: MonoCueStyle,
+        right_style: MonoCueStyle,
     ) -> Vec<f32> {
         let pan_frames = vec![*pan; n];
         let mut out = vec![0.0f32; n * out_channels];
-        let mut cue_state = CueState::default();
-        fill_output_f32(&mut out, &pan_frames, out_channels, ear, 1.0, cue_style, 48_000.0, &mut cue_state);
+        let mut left_state = CueState::default();
+        let mut right_state = CueState::default();
+        fill_output_f32(
+            &mut out, &pan_frames, out_channels, ear, 1.0, left_style, right_style, 48_000.0,
+            &mut left_state, &mut right_state,
+        );
         out
     }
 
@@ -638,14 +863,367 @@ mod tests {
         // klatce, gdzie suma przekraczała próg); teraz ma się płynnie wyginać.
         let pan_frames = vec![(0.35, 0.35); 32];
         let mut out = vec![0.0f32; pan_frames.len() * 2];
-        let mut cue_state = CueState::default();
+        let mut left_state = CueState::default();
+        let mut right_state = CueState::default();
         let boosted_gain = db_to_linear(6.0); // ~2.0x, so (0.35+0.35)*2.0 ≈ 1.4 — over the old ±1.0 clamp
-        fill_output_f32(&mut out, &pan_frames, 2, MonoEar::Left, boosted_gain, MonoCueStyle::Off, 48_000.0, &mut cue_state);
+        fill_output_f32(
+            &mut out, &pan_frames, 2, MonoEar::Left, boosted_gain, MonoCueStyle::Off, MonoCueStyle::Off,
+            48_000.0, &mut left_state, &mut right_state,
+        );
         let left_channel: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
         assert!(left_channel.iter().all(|&s| s <= 1.0 && s >= -1.0), "limiter nie może przekroczyć zakresu wyjścia");
         assert!(
             left_channel.iter().any(|&s| s < 1.0),
             "przy miękkim dogięciu przesterowany sygnał NIE powinien lądować dokładnie na płaskim 1.0 co klatkę: {left_channel:?}"
         );
+    }
+
+    #[test]
+    fn left_and_right_source_components_can_have_independent_styles_at_once() {
+        // Sedno nowej funkcji: w dawnym modelu tylko JEDNA strona (przeciwna
+        // do granego ucha) dostawała efekt, druga zawsze grała surowo — więc
+        // zmiana stylu OBU stron naraz (przy stałym prawym) nie mogła nic
+        // zmienić w wyniku. Teraz obie strony źródłowe są stylowane
+        // niezależnie i jednocześnie, więc zmiana samego LEWEGO stylu (przy
+        // niezmienionym prawym) MUSI zmienić zmiksowany wynik w jednym uchu.
+        let pan = (0.5, 0.5);
+        let left_off = run_frames_with_styles(&pan, 256, 2, MonoEar::Left, MonoCueStyle::Off, MonoCueStyle::Buzz);
+        let left_squeaky =
+            run_frames_with_styles(&pan, 256, 2, MonoEar::Left, MonoCueStyle::Squeaky, MonoCueStyle::Buzz);
+
+        let extract = |out: &[f32]| -> Vec<f32> { out.chunks_exact(2).map(|f| f[0]).collect() };
+        let a = extract(&left_off);
+        let b = extract(&left_squeaky);
+
+        assert!(
+            a.iter().zip(b.iter()).any(|(&x, &y)| (x - y).abs() > 0.05),
+            "zmiana stylu lewej składowej powinna zauważalnie zmienić zmiksowany wynik w uchu Left, nawet przy tym samym stylu prawej"
+        );
+    }
+
+    #[test]
+    fn default_cue_styles_preserve_old_left_ear_behavior() {
+        // Regresja: dawny pojedynczy `mono_cue_style` (domyślnie Buzz)
+        // stylował tylko stronę PRZECIWNĄ w trybie Left, własna (lewa)
+        // zawsze grała surowo. Nowe domyślne wartości
+        // (`left_cue_style=Off`, `right_cue_style=Buzz`) muszą to odtwarzać
+        // dokładnie, żeby istniejący config bez tych pól (stary JSON) dał
+        // identyczne brzmienie po wczytaniu.
+        use crate::sound::devices::RadarConfig;
+        let cfg = RadarConfig::default();
+        assert_eq!(cfg.left_cue_style, MonoCueStyle::Off, "domyślnie własna (lewa) strona ma grać surowo");
+        assert_eq!(cfg.right_cue_style, MonoCueStyle::Buzz, "domyślnie przeciwna (prawa) strona ma dostać dawny domyślny styl");
+    }
+
+    // ---------- pięć nowych stylów: Bitcrush / RingMod / Vibrato / Echo / DoubleTap ----------
+
+    #[test]
+    fn bitcrush_holds_value_constant_for_several_samples_then_updates() {
+        let mut state = CueState::default();
+        let mut out = Vec::new();
+        for i in 0..(BITCRUSH_HOLD_SAMPLES as usize * 3) {
+            // Sygnał rosnący liniowo — jeśli Bitcrush faktycznie "trzyma"
+            // wartość, kolejne próbki w obrębie jednego okresu trzymania
+            // muszą być IDENTYCZNE, mimo że wejście się cały czas zmienia.
+            let input = i as f32 * 0.01;
+            out.push(apply_cue(MonoCueStyle::Bitcrush, input, 48_000.0, &mut state));
+        }
+        assert_eq!(
+            out[0], out[1],
+            "w obrębie jednego okna trzymania wyjście nie powinno się zmieniać mimo zmieniającego się wejścia"
+        );
+        assert!(
+            out.iter().any(|&s| (s - out[0]).abs() > 1e-6),
+            "po kilku oknach trzymania wartość MUSI się w końcu zmienić: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ring_mod_flips_sign_of_a_constant_positive_input_unlike_am_modulate() {
+        // Kluczowa różnica względem Buzz/Squeaky (am_modulate, obwiednia
+        // zawsze >= 0): prawdziwa modulacja pierścieniowa mnoży przez nośną
+        // przechodzącą też przez wartości ujemne, więc stały, dodatni sygnał
+        // MUSI okresowo zmieniać znak.
+        let mut state = CueState::default();
+        let mut saw_negative = false;
+        let mut saw_positive = false;
+        for _ in 0..2000 {
+            let out = apply_cue(MonoCueStyle::RingMod, 0.7, 48_000.0, &mut state);
+            if out < -0.1 {
+                saw_negative = true;
+            }
+            if out > 0.1 {
+                saw_positive = true;
+            }
+        }
+        assert!(saw_negative, "prawdziwy ring-mod powinien okresowo dawać wartości ujemne dla stałego, dodatniego wejścia");
+        assert!(saw_positive, "i wciąż też wartości dodatnie w innej fazie cyklu");
+    }
+
+    #[test]
+    fn vibrato_delays_a_step_input_instead_of_reacting_instantly() {
+        let mut state = CueState::default();
+        let mut out = 0.0;
+        for _ in 0..20 {
+            out = apply_cue(MonoCueStyle::Vibrato, 0.7, 48_000.0, &mut state);
+        }
+        assert_eq!(out, 0.0, "po zaledwie 20 próbkach linia opóźniająca (~100 próbek) wciąż powinna zwracać ciszę z bufora");
+        for _ in 0..300 {
+            out = apply_cue(MonoCueStyle::Vibrato, 0.7, 48_000.0, &mut state);
+        }
+        assert!((out - 0.7).abs() < 0.1, "po wystarczającej liczbie próbek opóźniony sygnał powinien dogonić stałe wejście: {out}");
+    }
+
+    #[test]
+    fn echo_repeats_an_impulse_after_the_configured_delay() {
+        let sample_rate = 48_000.0;
+        let delay_samples = ((ECHO_DELAY_MS / 1000.0) * sample_rate).round() as usize;
+        let mut state = CueState::default();
+        let mut out = vec![0.0f32; delay_samples + 10];
+        out[0] = apply_cue(MonoCueStyle::Echo, 1.0, sample_rate, &mut state); // impuls
+        for sample in out.iter_mut().skip(1) {
+            *sample = apply_cue(MonoCueStyle::Echo, 0.0, sample_rate, &mut state);
+        }
+        assert!(out[1].abs() < 0.01, "zaraz po impulsie, przed opóźnieniem, nie powinno być jeszcze echa: {}", out[1]);
+        assert!(
+            out[delay_samples].abs() > 0.1,
+            "echo powinno wyraźnie pojawić się dokładnie po skonfigurowanym opóźnieniu: {}",
+            out[delay_samples]
+        );
+    }
+
+    #[test]
+    fn double_tap_gates_exactly_twice_per_cycle_unlike_plain_pulse() {
+        let sample_rate = 48_000.0;
+        let mut state = CueState::default();
+        // 90% jednego cyklu — z zapasem PRZED granicą zawinięcia fazy
+        // (`fract()`), gdzie skumulowany błąd zmiennoprzecinkowy potrafi
+        // przełączyć bramkę o próbkę wcześniej/później niż matematycznie
+        // dokładny punkt. Oba "stuknięcia" (przy fazie ~0 i ~0.24) mieszczą
+        // się z dużym zapasem w tym oknie.
+        let samples_per_cycle = ((sample_rate / DOUBLE_TAP_HZ) * 0.9) as usize;
+        let mut prev = 0.0f32;
+        let mut rising_edges = 0;
+        for _ in 0..samples_per_cycle {
+            let out = apply_cue(MonoCueStyle::DoubleTap, 1.0, sample_rate, &mut state);
+            if out > 0.5 && prev <= 0.5 {
+                rising_edges += 1;
+            }
+            prev = out;
+        }
+        assert_eq!(rising_edges, 2, "DoubleTap powinien dać dokładnie dwa 'stuknięcia' na pełny cykl, było: {rising_edges}");
+    }
+
+    // ---------- pięć nowych stylów — poziom integracyjny (przez fill_output_f32) ----------
+
+    #[test]
+    fn every_new_style_produces_a_finite_in_range_signal_through_the_full_pipeline() {
+        // Nie testuje CHARAKTERU efektu (to już robią testy `apply_cue`
+        // wyżej) — sprawdza, że każdy nowy styl, przepuszczony przez CAŁY
+        // łańcuch (miks obu stron + gain + soft_limit), zawsze zostaje w
+        // zakresie wyjścia i nigdy nie daje NaN/nieskończoności (np. przez
+        // dzielenie przez zero w liniach opóźniających przy degenerowanych
+        // parametrach).
+        let new_styles = [
+            MonoCueStyle::Bitcrush,
+            MonoCueStyle::RingMod,
+            MonoCueStyle::Vibrato,
+            MonoCueStyle::Echo,
+            MonoCueStyle::DoubleTap,
+        ];
+        for &style in &new_styles {
+            let out = run_frames_with_styles(&(0.6, 0.6), 4_000, 2, MonoEar::Left, style, style);
+            assert!(
+                out.iter().all(|s| s.is_finite() && (-1.0..=1.0).contains(s)),
+                "styl {style:?} dał próbkę spoza zakresu albo NaN/inf: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_styles_never_silence_a_nonzero_opposite_side_like_the_old_off_would() {
+        // Regresja dla sedna funkcji cue: dźwięk ze strony przeciwnej nie
+        // może zniknąć całkowicie pod żadnym nowym stylem — inaczej
+        // informacja "z której strony był dźwięk" ginie tak samo, jak przed
+        // dodaniem `apply_cue` w ogóle.
+        let new_styles = [
+            MonoCueStyle::Bitcrush,
+            MonoCueStyle::RingMod,
+            MonoCueStyle::Vibrato,
+            MonoCueStyle::Echo,
+            MonoCueStyle::DoubleTap,
+        ];
+        for &style in &new_styles {
+            // Wystarczająco dużo klatek, żeby linie opóźniające (Vibrato,
+            // Echo) zdążyły się wypełnić i zacząć zwracać realny sygnał.
+            let out = run_frames_with_style(&(0.0, 0.7), 12_000, 2, MonoEar::Left, style);
+            let left_channel: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
+            assert!(
+                left_channel.iter().any(|&s| s.abs() > 1e-6),
+                "styl {style:?} nie może całkowicie wyciszyć sygnału z przeciwnej strony"
+            );
+        }
+    }
+
+    #[test]
+    fn two_new_styles_combine_independently_in_left_and_right_components() {
+        // Jak `left_and_right_source_components_can_have_independent_styles_at_once`,
+        // ale dla PARY nowych stylów naraz (Vibrato + RingMod) — potwierdza,
+        // że niezależność działa też dla stylów z osobnym stanem (bufor
+        // opóźniający), nie tylko dla starych, prostszych (Buzz).
+        let pan = (0.5, 0.5);
+        let a = run_frames_with_styles(&pan, 4_000, 2, MonoEar::Left, MonoCueStyle::Vibrato, MonoCueStyle::RingMod);
+        let b = run_frames_with_styles(&pan, 4_000, 2, MonoEar::Left, MonoCueStyle::Off, MonoCueStyle::RingMod);
+
+        let extract = |out: &[f32]| -> Vec<f32> { out.chunks_exact(2).map(|f| f[0]).collect() };
+        let a = extract(&a);
+        let b = extract(&b);
+        assert!(
+            a.iter().zip(b.iter()).any(|(&x, &y)| (x - y).abs() > 0.05),
+            "zmiana lewego stylu na Vibrato (przy tym samym RingMod po prawej) powinna zmienić zmiksowany wynik"
+        );
+    }
+
+    #[test]
+    fn echo_feedback_does_not_blow_up_output_even_with_boosted_gain() {
+        // Echo ma sprzężenie zwrotne (`ECHO_FEEDBACK`) — teoretyczne ryzyko
+        // narastającej energii w pętli. Przy rozsądnym boost (+6dB) i długim
+        // przebiegu (kilka pełnych opóźnień echa) wyjście MUSI zostać
+        // ograniczone przez `soft_limit`, nie eksplodować.
+        let sample_rate = 48_000.0;
+        let delay_samples = ((ECHO_DELAY_MS / 1000.0) * sample_rate).round() as usize;
+        let boosted_gain = db_to_linear(6.0);
+        let pan_frames = vec![(0.6, 0.6); delay_samples * 5];
+        let mut out = vec![0.0f32; pan_frames.len() * 2];
+        let mut left_state = CueState::default();
+        let mut right_state = CueState::default();
+        fill_output_f32(
+            &mut out, &pan_frames, 2, MonoEar::Left, boosted_gain, MonoCueStyle::Off, MonoCueStyle::Echo,
+            sample_rate, &mut left_state, &mut right_state,
+        );
+        assert!(
+            out.iter().all(|&s| s.is_finite() && s <= 1.0 && s >= -1.0),
+            "Echo ze sprzężeniem zwrotnym i podbitym gainem nie może wyjść poza zakres wyjścia"
+        );
+    }
+
+    // ---------- realny sygnał (ton) przetwarzany przez efekty — sprawdzenie wyniku ----------
+
+    /// Czysty ton sinusoidalny — realistyczniejszy sygnał wejściowy niż stała
+    /// wartość/skok używane w testach `apply_cue` wyżej, do sprawdzenia, jak
+    /// efekt naprawdę zmienia "dźwięk", a nie tylko syntetyczny sygnał testowy.
+    fn sine_wave(freq_hz: f32, n: usize, sample_rate: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| (std::f32::consts::TAU * freq_hz * i as f32 / sample_rate).sin() * 0.6)
+            .collect()
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt()
+    }
+
+    fn count_zero_crossings(samples: &[f32]) -> usize {
+        samples.windows(2).filter(|w| w[0] != 0.0 && w[0].signum() != w[1].signum()).count()
+    }
+
+    #[test]
+    fn bitcrush_processing_a_real_tone_reduces_the_number_of_distinct_output_levels() {
+        let sample_rate = 48_000.0;
+        let tone = sine_wave(440.0, 2_000, sample_rate);
+        let mut state = CueState::default();
+        let processed: Vec<f32> =
+            tone.iter().map(|&s| apply_cue(MonoCueStyle::Bitcrush, s, sample_rate, &mut state)).collect();
+
+        let distinct_input: std::collections::BTreeSet<i32> =
+            tone.iter().map(|&s| (s * 1000.0).round() as i32).collect();
+        let distinct_output: std::collections::BTreeSet<i32> =
+            processed.iter().map(|&s| (s * 1000.0).round() as i32).collect();
+        assert!(
+            distinct_output.len() < distinct_input.len(),
+            "Bitcrush na realnym tonie 440Hz powinien wyraźnie zmniejszyć liczbę różnych poziomów sygnału: \
+             wejście={} różnych wartości, wyjście={}",
+            distinct_input.len(),
+            distinct_output.len()
+        );
+    }
+
+    #[test]
+    fn ring_mod_processing_a_real_tone_measurably_changes_its_zero_crossing_rate() {
+        // Prawdziwy ring-mod przesuwa widmo (suma/różnica częstotliwości
+        // wejścia i nośnej) — w przeciwieństwie do zwykłego wzmocnienia czy
+        // filtra, MUSI to zmienić tempo przejść sygnału przez zero.
+        let sample_rate = 48_000.0;
+        let tone = sine_wave(440.0, 4_800, sample_rate); // 100 ms
+        let mut state = CueState::default();
+        let processed: Vec<f32> =
+            tone.iter().map(|&s| apply_cue(MonoCueStyle::RingMod, s, sample_rate, &mut state)).collect();
+
+        let raw_crossings = count_zero_crossings(&tone);
+        let processed_crossings = count_zero_crossings(&processed);
+        assert_ne!(
+            raw_crossings, processed_crossings,
+            "ring-mod na realnym tonie 440Hz powinien zmienić widmo (a więc i liczbę przejść przez zero): \
+             wejście={raw_crossings}, wyjście={processed_crossings}"
+        );
+    }
+
+    #[test]
+    fn echo_processing_a_real_tone_burst_leaves_an_audible_tail_after_it_ends() {
+        let sample_rate = 48_000.0;
+        let burst = sine_wave(440.0, 2_000, sample_rate); // ~42 ms "strzał" dźwięku
+        let delay_samples = ((ECHO_DELAY_MS / 1000.0) * sample_rate).round() as usize;
+
+        let mut state = CueState::default();
+        for &s in &burst {
+            apply_cue(MonoCueStyle::Echo, s, sample_rate, &mut state);
+        }
+        // Cisza po "strzale" — jedyne, co powinno być słyszalne w tym oknie,
+        // to samo echo dogania oryginalny dźwięk, który już dawno ucichł.
+        let tail: Vec<f32> = (0..delay_samples + 500)
+            .map(|_| apply_cue(MonoCueStyle::Echo, 0.0, sample_rate, &mut state))
+            .collect();
+
+        let window_start = delay_samples.saturating_sub(200);
+        let window_end = (delay_samples + 200).min(tail.len());
+        let echo_window_rms = rms(&tail[window_start..window_end]);
+        assert!(
+            echo_window_rms > 0.05,
+            "echo powinno dać wyraźnie słyszalny 'ogon' długo po zakończeniu oryginalnego dźwięku: rms={echo_window_rms:.4}"
+        );
+    }
+
+    #[test]
+    fn every_style_processes_a_real_tone_into_a_non_silent_non_exploding_output() {
+        // Test "całościowy": prawdziwy ton przez WSZYSTKIE 12 stylów naraz —
+        // żaden nie powinien go ani wyciszyć do prawie zera (informacja by
+        // zginęła), ani wielokrotnie wzmocnić (przesterowanie).
+        let sample_rate = 48_000.0;
+        let tone = sine_wave(440.0, 4_800, sample_rate);
+        let input_rms = rms(&tone);
+
+        for &style in MonoCueStyle::ALL {
+            let mut state = CueState::default();
+            let processed: Vec<f32> =
+                tone.iter().map(|&s| apply_cue(style, s, sample_rate, &mut state)).collect();
+            let out_rms = rms(&processed);
+            assert!(out_rms.is_finite(), "styl {style:?} dał niefinite RMS");
+
+            // Pulse/DoubleTap CELOWO wyciszają część czasu (bramkowanie 0/1),
+            // więc ich RMS naturalnie spada wyraźniej niż reszty rodziny.
+            let min_ratio = match style {
+                MonoCueStyle::Pulse | MonoCueStyle::DoubleTap => 0.05,
+                _ => 0.15,
+            };
+            assert!(
+                out_rms > input_rms * min_ratio,
+                "styl {style:?} nie powinien wyciszać realnego tonu niemal do zera: \
+                 rms wejścia={input_rms:.4} rms wyjścia={out_rms:.4}"
+            );
+            assert!(
+                out_rms < input_rms * 3.0,
+                "styl {style:?} nie powinien wielokrotnie wzmacniać sygnału ponad wejście: \
+                 rms wejścia={input_rms:.4} rms wyjścia={out_rms:.4}"
+            );
+        }
     }
 }
