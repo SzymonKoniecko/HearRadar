@@ -1,0 +1,74 @@
+{
+  "anchor_x": 0.52,
+  "anchor_y": 1.0,
+  "radius": 125.0,
+  "bg_alpha": 0.0,
+  "fg_alpha": 1.0,
+  "show_labels": false,
+  "high_contrast": false,
+  "decay_secs": 2.5,
+  "color_rules": [
+    {
+      "freq_min": 0.0,
+      "freq_max": 100.0,
+      "color": [
+        200,
+        40,
+        40
+      ],
+      "label": "Sub-bas",
+      "weight": 1.0
+    },
+    {
+      "freq_min": 100.0,
+      "freq_max": 500.0,
+      "color": [
+        255,
+        90,
+        90
+      ],
+      "label": "Bas",
+      "weight": 1.0
+    },
+    {
+      "freq_min": 500.0,
+      "freq_max": 2000.0,
+      "color": [
+        0,
+        220,
+        220
+      ],
+      "label": "Średnie (mowa)",
+      "weight": 1.5
+    },
+    {
+      "freq_min": 2000.0,
+      "freq_max": 6000.0,
+      "color": [
+        255,
+        150,
+        60
+      ],
+      "label": "Wysoko-średnie",
+      "weight": 3.0
+    },
+    {
+      "freq_min": 6000.0,
+      "freq_max": 20000.0,
+      "color": [
+        255,
+        220,
+        90
+      ],
+      "label": "Wysokie",
+      "weight": 5.0
+    }
+  ],
+  "overlay_click_through": true,
+  "mono_boost_db": 0.0,
+  "radar_sensitivity": 9.5,
+  "edge_glow_enabled": false,
+  "line_thickness": 1.0,
+  "mono_cue_style": "Off",
+  "direction_contrast_enabled": true
+}

@@ -170,25 +170,22 @@ impl RadarCanvas for SkiaCanvas<'_> {
         else {
             return;
         };
-        // Antyaliasing wyłączony celowo: to jedyny kształt tu rysowany, który
-        // NIE idzie przez `hairline_safe_width` (patrz ten komentarz) — a
-        // `PixmapMut::fill_rect` z `paint.anti_alias = true` i transformacją
-        // tożsamościową ZAWSZE trafia w tę samą buggy'ą ścieżkę skanlinii
-        // `scan::hairline_aa`, niezależnie od szerokości prostokąta (nie tylko
-        // "hairline" grubości). Pasek LFE (`draw_lfe_indicator`) rysuje
-        // prostokąt, którego szerokość płynnie zmienia się z poziomem sygnału
-        // — co klatkę przechodzi więc przez całe spektrum szerokości
-        // subpikselowych, w tym przez tę samą degenerującą się do zera
-        // szerokość kolumny pikseli, która wywołała `debug_assert!(false)`
-        // przy kropce. Prostokąty są tu zawsze osiowo wyrównane, więc AA na
-        // ich krawędziach i tak nic nie daje wizualnie — wyłączenie go
-        // przełącza tiny-skia na prosty, całkowitoliczbowy `blit_rect`, który
-        // tego kodu wcale nie dotyka.
-        let mut paint = skia_paint(color);
-        paint.anti_alias = false;
+        let paint = skia_paint(color);
+        // `PixmapMut::fill_rect` with AA and an identity transform (both true
+        // here) routes through tiny-skia's `scan::hairline_aa::fill_dot8`,
+        // which has a `debug_assert!(false)` that fires whenever a thin rect
+        // (e.g. a sub-pixel-wide meter bar, like the LFE level indicator)
+        // rounds to a zero-width inner pixel span in fixed point — the same
+        // class of bug as `hairline_safe_width` above, but in the fill path
+        // rather than the stroke path. Filling the rect as a path instead
+        // goes through the ordinary (unaffected) path scan converter, same
+        // as `circle_filled`/`triangle_filled` below.
+        let mut pb = PathBuilder::new();
+        pb.push_rect(sk_rect);
+        let Some(path) = pb.finish() else { return };
         self.pixmap
             .borrow_mut()
-            .fill_rect(sk_rect, &paint, Transform::identity(), None);
+            .fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
     }
 
     fn triangle_filled(&self, points: [Pos2; 3], color: Color32) {

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sound::direction::{self, analyze_channels};
+use crate::sound::sample_logger;
 use crate::sound::spectrum::{self, ColorRule};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -77,14 +78,30 @@ pub struct RadarConfig {
     /// pola) nie wyzerowało linii do niewidocznych.
     #[serde(default = "default_line_thickness")]
     pub line_thickness: f32,
-    /// Rysowanie kropek kanałów (ślad energii każdego głośnika, z zanikiem
-    /// w czasie) — NIEZALEŻNE od niezależnych wskaźników kierunku (onsety,
-    /// patrz `ui::radar_egui::DirectionMarker`), które rysują się zawsze.
-    /// Wyłączenie zostawia samą tarczę + markery, bez "szumu" tła kropek.
-    /// `#[serde(default = ...)]` na `true`, żeby wczytanie starszego pliku
-    /// konfiguracji (sprzed tego pola) zachowało dotychczasowy wygląd.
-    #[serde(default = "default_show_channel_dots")]
-    pub show_channel_dots: bool,
+    /// Jak oznaczyć dźwięk z przeciwnej strony niż wybrane ucho w trybie
+    /// jednousznym (`MonoEar::Left`/`Right`), żeby dało się po samym
+    /// brzmieniu poznać, że był z drugiej strony — patrz
+    /// [`MonoCueStyle`]/`mono_router::fill_output_f32`. `#[serde(default)]`
+    /// korzysta z `#[default]` wariantu enuma, więc wczytanie starszego
+    /// pliku configu (sprzed tego pola) włącza nową funkcję zamiast ją wyciszyć.
+    #[serde(default)]
+    pub mono_cue_style: MonoCueStyle,
+    /// Włącza odejmowanie energii wspólnej dla wszystkich kanałów kierunkowych
+    /// przed sprawdzeniem onsetu (patrz [`crate::sound::direction::CONTRAST_AMOUNT`]
+    /// i doc-komentarz [`crate::sound::direction::detect_channel_activity`]) —
+    /// tłumi dźwięk obecny mniej więcej RÓWNO na wszystkich kanałach naraz
+    /// (otoczenie, muzyka w tle), dzięki czemu wyraźnie JEDNOSTRONNE zdarzenie
+    /// na tle takiego szumu łatwiej przebija próg onsetu, nawet gdy samo w
+    /// sobie nie jest dość głośne względem WŁASNEJ historii. Działa tylko
+    /// przy >2 kanałach kierunkowych (5.1/7.1) — przy zwykłym stereo L≈R to
+    /// normalny zapis wyśrodkowanego dźwięku (dialog), nie oznaka otoczenia,
+    /// a przy bardzo cichych sygnałach blisko progu ciszy odejmowanie
+    /// mogłoby zgasić dźwięk, który bez kontrastu jeszcze by przebił próg.
+    /// Domyślnie wyłączone (`#[serde(default)]`) — nowa, opcjonalna poprawka,
+    /// włączana checkboxem w ustawieniach, żeby dało się ją porównać na
+    /// żywym audio i wyłączyć, gdyby gdzieś zaszkodziła.
+    #[serde(default)]
+    pub direction_contrast_enabled: bool,
 }
 
 fn default_overlay_click_through() -> bool {
@@ -120,7 +137,8 @@ impl Default for RadarConfig {
             radar_sensitivity: default_radar_sensitivity(),
             edge_glow_enabled: false,
             line_thickness: default_line_thickness(),
-            show_channel_dots: default_show_channel_dots(),
+            mono_cue_style: MonoCueStyle::default(),
+            direction_contrast_enabled: false,
         }
     }
 }
@@ -148,6 +166,62 @@ impl MonoEar {
             Self::Left  => "← Lewe ucho",
             Self::Right => "→ Prawe ucho",
             Self::Both  => "↔ Oba",
+        }
+    }
+}
+
+/// Sposób oznaczenia w słuchawce dźwięku z PRZECIWNEJ strony niż aktualnie
+/// grane ucho w trybie jednousznym (`MonoEar::Left`/`Right`) — bez tego cała
+/// informacja L/R ginęłaby, bo obie strony grałyby identycznie w jednym
+/// kanale. Każdy wariant to inny, tani obliczeniowo efekt DSP w czasie
+/// rzeczywistym (patrz `mono_router::apply_cue`), do wyboru wg tego, co komu
+/// łatwiej rozróżnić na ucho.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum MonoCueStyle {
+    /// Strona przeciwna gra niezmieniona, tak samo jak swoja — brak wskazówki
+    /// (zachowanie sprzed dodania tej funkcji).
+    Off,
+    /// Ring modulation ~45 Hz — wyraźne, niskie "brzęczenie".
+    #[default]
+    Buzz,
+    /// Ring modulation ~220 Hz — ten sam mechanizm co `Buzz`, ale szybciej,
+    /// więc brzmi wyżej/"piskliwiej".
+    Squeaky,
+    /// Rytmiczne wyciszanie/odciszanie (~8 Hz) zamiast płynnej fali —
+    /// dźwięk "mruga" zamiast brzęczeć.
+    Pulse,
+    /// Filtr dolnoprzepustowy — strona przeciwna brzmi stłumiona, "zza
+    /// ściany", bez zmiany rytmu głośności (w odróżnieniu od pozostałych
+    /// wariantów, które modulują amplitudę).
+    Muffled,
+    /// Podbicie wysokich tonów (dopełnienie filtra z `Muffled`) — strona
+    /// przeciwna brzmi jaśniej/cieńciej, bez zmiany rytmu głośności.
+    Bright,
+    /// Mocniejszy filtr dolnoprzepustowy niż `Muffled` (niższe odcięcie) —
+    /// strona przeciwna brzmi wyraźnie ciemniej/głucho.
+    Dark,
+}
+
+impl MonoCueStyle {
+    pub const ALL: &'static [Self] = &[
+        Self::Off,
+        Self::Buzz,
+        Self::Squeaky,
+        Self::Pulse,
+        Self::Muffled,
+        Self::Bright,
+        Self::Dark,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Wyłączone",
+            Self::Buzz => "Brzęczenie",
+            Self::Squeaky => "Bardziej piskliwy",
+            Self::Pulse => "Pulsowanie",
+            Self::Muffled => "Stłumiony",
+            Self::Bright => "Jasny",
+            Self::Dark => "Ciemny",
         }
     }
 }
@@ -198,31 +272,72 @@ pub struct AudioAnalysis {
 }
 
 /// Pojemność bufora kołowego próbek mono — ~340ms przy 48kHz, zaokrąglone
-/// w górę do potęgi dwójki. Wystarczająco dużo, żeby przeżyć chwilowe
-/// wahania tempa callbacków wejścia/wyjścia bez przepełnienia.
+/// w górę do potęgi dwójki. To TWARDY limit pamięci (nigdy nie rośnie ponad
+/// to), NIE docelowe opóźnienie — patrz [`RING_TRIM_THRESHOLD_SAMPLES`] niżej,
+/// który utrzymuje faktyczną głębokość bufora dużo niżej na co dzień.
 const MONO_RING_CAPACITY: usize = 16_384;
+
+/// Docelowa głębokość bufora kołowego w próbkach, do której [`SharedAudioAnalysis::push_stereo_pan`]
+/// aktywnie przycina, gdy przekroczy [`RING_TRIM_THRESHOLD_SAMPLES`] — margines
+/// na drobne (rzędu pojedynczej ramki audio) wahania tempa callbacków, nie na
+/// trwały dryf zegarów. ~50ms przy 48kHz.
+const TARGET_RING_LATENCY_SAMPLES: usize = 2_400;
+
+/// Próg, po przekroczeniu którego bufor jest od razu przycinany z powrotem do
+/// [`TARGET_RING_LATENCY_SAMPLES`], zamiast czekać, aż urośnie do
+/// [`MONO_RING_CAPACITY`]. Wejście i wyjście to dwa NIEZALEŻNE zegary
+/// sprzętowe (patrz doc-komentarz [`SharedAudioAnalysis::mono_ring`]) — gdy
+/// wejście choćby ułamek procenta wyprzedza tempem wyjście, bufor bez tego
+/// progu monotonicznie rośnie i UTYKA na twardym limicie (~340ms), więc
+/// KAŻDA odtworzona próbka jest odtąd trwale spóźniona o tyle. Przycinanie
+/// dużo wcześniej, przy przekroczeniu tego niższego progu, utrzymuje
+/// opóźnienie blisko `TARGET_RING_LATENCY_SAMPLES` bez względu na kierunek
+/// dryfu. ~150ms przy 48kHz — trzykrotność celu, żeby nie przycinać przy
+/// zwykłym, chwilowym jitterze.
+const RING_TRIM_THRESHOLD_SAMPLES: usize = TARGET_RING_LATENCY_SAMPLES * 3;
+
+/// Licznik do przerzedzenia diagnostycznego logu głębokości `mono_ring` w
+/// [`SharedAudioAnalysis::push_stereo_pan`] — bez tego logowalibyśmy co
+/// callback (co ~10ms), zalewając `debug.log`.
+static PUSH_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct SharedAudioAnalysis {
     inner: Arc<Mutex<AudioAnalysis>>,
-    /// Bufor kołowy próbek mono, już zmiksowanych ze wszystkich kanałów —
-    /// zasilany przez TEN SAM strumień wejściowy, który karmi radar
-    /// (`update_analysis`), i czytany przez `mono_router` przy odtwarzaniu.
-    /// Miks do mono dzieje się więc dopiero na samym końcu łańcucha, tuż
-    /// przed wyjściem — radar cały czas dostaje pełne dane per-kanał. Wcześniej
-    /// `mono_router` otwierał WŁASNY, niezależny strumień wejściowy na
-    /// nazwie urządzenia z tej samej listy co radar — na Windows ta lista
-    /// zawiera nazwy urządzeń WYJŚCIOWYCH (do przechwytywania pętlą zwrotną
-    /// WASAPI, patrz `fetch_output_devices`), a `mono_router` szukał ich
-    /// tylko wśród `host.input_devices()`, więc lookup zawsze się nie
-    /// powodził i routing w ogóle nie startował (błąd widoczny tylko w
-    /// konsoli, niewidoczny w UI).
-    mono_ring: Arc<Mutex<VecDeque<f32>>>,
+    /// Bufor kołowy próbek "ważonego mono" — KAŻDA para to `(left_weight,
+    /// right_weight)`, czyli ile energii danej ramki pochodzi z kanałów
+    /// lewej, a ile z prawej strony (patrz [`downmix_to_stereo_pan`]),
+    /// zamiast jednego płaskiego uśrednienia wszystkich kanałów. Dzięki temu
+    /// `mono_router` może w trybie jednousznym oznaczyć dźwięk z przeciwnej
+    /// strony efektem (ring modulation), zamiast bezpowrotnie tracić
+    /// informację L/R już na etapie miksu. Zasilany przez TEN SAM strumień
+    /// wejściowy, który karmi radar (`update_analysis`), i czytany przez
+    /// `mono_router` przy odtwarzaniu. Wcześniej `mono_router` otwierał
+    /// WŁASNY, niezależny strumień wejściowy na nazwie urządzenia z tej samej
+    /// listy co radar — na Windows ta lista zawiera nazwy urządzeń
+    /// WYJŚCIOWYCH (do przechwytywania pętlą zwrotną WASAPI, patrz
+    /// `fetch_output_devices`), a `mono_router` szukał ich tylko wśród
+    /// `host.input_devices()`, więc lookup zawsze się nie powodził i routing
+    /// w ogóle nie startował (błąd widoczny tylko w konsoli, niewidoczny w UI).
+    mono_ring: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    /// Ostatnia próbka realnie zdjęta z `mono_ring` przez [`Self::read_stereo_pan`]
+    /// — trzymana, żeby przy podkręceniu bufora (patrz tam) powtórzyć ją
+    /// zamiast wstawiać twarde zero.
+    last_pan: Arc<Mutex<(f32, f32)>>,
     /// Stan średniej kroczącej per kanał dla [`crate::sound::direction::detect_onsets`],
     /// który musi przetrwać między kolejnymi wywołaniami `update_analysis`
     /// (jeden callback cpal na ramkę) — stąd trzymany tu, obok `mono_ring`,
     /// zamiast jako zmienna lokalna.
     onset_ema: Arc<Mutex<Vec<f32>>>,
+    /// Jak [`Self::onset_ema`], ale per kanał×pasmo kolorowania — zasila
+    /// sprawdzanie per-pasmowe w [`direction::detect_channel_activity`]
+    /// (patrz doc-komentarz tam), dzięki któremu cichy dźwięk w jednym paśmie
+    /// generuje onset, nawet gdy energia szerokopasmowa kanału go nie widzi.
+    band_ema: Arc<Mutex<Vec<Vec<f32>>>>,
+    /// Logger próbek klasyfikacji koloru do ręcznej analizy configu — patrz
+    /// [`crate::sound::sample_logger`]. Wyłączony domyślnie; włączany
+    /// checkboxem w UI (`ui::app`).
+    sample_logger: Arc<sample_logger::SampleLogger>,
 }
 
 impl PartialEq for SharedAudioAnalysis {
@@ -236,7 +351,10 @@ impl Default for SharedAudioAnalysis {
         Self {
             inner: Arc::new(Mutex::new(AudioAnalysis::default())),
             mono_ring: Arc::new(Mutex::new(VecDeque::with_capacity(MONO_RING_CAPACITY))),
+            last_pan: Arc::new(Mutex::new((0.0, 0.0))),
             onset_ema: Arc::new(Mutex::new(Vec::new())),
+            band_ema: Arc::new(Mutex::new(Vec::new())),
+            sample_logger: Arc::new(sample_logger::SampleLogger::new()),
         }
     }
 }
@@ -250,11 +368,17 @@ impl SharedAudioAnalysis {
         self.inner.lock()
     }
 
-    /// Dopisuje próbki mono (już zmiksowane) do bufora kołowego czytanego
-    /// przez strumień wyjściowy `mono_router`. Najstarsze próbki są
-    /// odrzucane, gdy bufor jest pełny — routing ma pokazywać "teraz", nie
-    /// gonić zaległości.
-    pub(crate) fn push_mono(&self, samples: &[f32]) {
+    /// Dopisuje próbki "ważonego mono" (`(left_weight, right_weight)`, patrz
+    /// [`downmix_to_stereo_pan`]) do bufora kołowego czytanego przez strumień
+    /// wyjściowy `mono_router`. Najstarsze próbki są odrzucane, gdy bufor
+    /// jest pełny — routing ma pokazywać "teraz", nie gonić zaległości.
+    ///
+    /// Dodatkowo: gdy bufor urośnie ponad [`RING_TRIM_THRESHOLD_SAMPLES`]
+    /// (bo wejście trwale wyprzedza tempem wyjście — patrz doc-komentarz
+    /// tam), od razu przycina go z powrotem do [`TARGET_RING_LATENCY_SAMPLES`]
+    /// zamiast czekać na twardy limit [`MONO_RING_CAPACITY`] — bez tego
+    /// opóźnienie odtwarzanego dźwięku trwale rosło do ~340ms i tam zostawało.
+    pub(crate) fn push_stereo_pan(&self, samples: &[(f32, f32)]) {
         if let Ok(mut ring) = self.mono_ring.lock() {
             for &s in samples {
                 if ring.len() >= MONO_RING_CAPACITY {
@@ -262,22 +386,73 @@ impl SharedAudioAnalysis {
                 }
                 ring.push_back(s);
             }
+            if ring.len() > RING_TRIM_THRESHOLD_SAMPLES {
+                let excess = ring.len() - TARGET_RING_LATENCY_SAMPLES;
+                for _ in 0..excess {
+                    ring.pop_front();
+                }
+                crate::dlog!(
+                    "[mono_ring] przycięto {excess} próbek (wejście trwale wyprzedzało wyjście) -> {} (~{:.0}ms @48kHz)",
+                    ring.len(),
+                    ring.len() as f32 / 48.0
+                );
+            }
+            let n = PUSH_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            if n % 200 == 0 {
+                crate::dlog!("[mono_ring] depth={} (~{:.0}ms @48kHz)", ring.len(), ring.len() as f32 / 48.0);
+            }
         }
     }
 
-    /// Czyta dokładnie `count` próbek mono. Brakujące miejsce (bufor pusty,
-    /// bo przechwytywanie jeszcze nie działa albo dopiero wystartowało)
-    /// wypełnia ciszą, zamiast blokować/zacinać strumień wyjściowy.
-    pub(crate) fn read_mono(&self, count: usize) -> Vec<f32> {
+    /// Czyta dokładnie `count` próbek "ważonego mono". Wejście i wyjście to
+    /// dwa NIEZALEŻNE zegary sprzętowe (osobne urządzenia audio) — nawet przy
+    /// tej samej nominalnej częstotliwości próbkowania powoli się rozjeżdżają,
+    /// więc bufor kołowy co jakiś czas na chwilę wysycha (podkręcanie), zanim
+    /// dogoni go kolejna porcja z wejścia. Wcześniej brakujące miejsce
+    /// wypełnialiśmy twardym zerem — nagła cisza-w-środku-sygnału słyszalna
+    /// jako pojedyncza ścinka/trzask co parę sekund. Zamiast tego powtarzamy
+    /// (`last_pan`) ostatnią realnie odczytaną próbkę, lekko wygaszając ją co
+    /// klatkę — jedna-dwie powtórzone próbki są niesłyszalne (zero-order
+    /// hold), a przy dłuższym zaniku (przechwytywanie faktycznie stoi) i tak
+    /// płynnie spada do ciszy zamiast zapętlać się w nieskończoność.
+    pub(crate) fn read_stereo_pan(&self, count: usize) -> Vec<(f32, f32)> {
+        const HOLD_DECAY: f32 = 0.999;
         let mut out = Vec::with_capacity(count);
+        let mut last = self.last_pan.lock().map(|g| *g).unwrap_or((0.0, 0.0));
         if let Ok(mut ring) = self.mono_ring.lock() {
             for _ in 0..count {
-                out.push(ring.pop_front().unwrap_or(0.0));
+                let sample = match ring.pop_front() {
+                    Some(s) => {
+                        last = s;
+                        s
+                    }
+                    None => {
+                        last = (last.0 * HOLD_DECAY, last.1 * HOLD_DECAY);
+                        last
+                    }
+                };
+                out.push(sample);
             }
         } else {
-            out.resize(count, 0.0);
+            out.resize(count, (0.0, 0.0));
+        }
+        if let Ok(mut guard) = self.last_pan.lock() {
+            *guard = last;
         }
         out
+    }
+
+    /// Czy logger próbek (`sample_logger::SampleLogger`) jest aktualnie
+    /// włączony — odczytywane przez checkbox w UI, żeby odzwierciedlić stan
+    /// nawet po tym, jak zapis pliku faktycznie się nie powiódł.
+    pub fn sample_logging_enabled(&self) -> bool {
+        self.sample_logger.is_enabled()
+    }
+
+    /// Włącza/wyłącza logger próbek. Włączenie ZAWSZE zaczyna nowy plik —
+    /// patrz [`sample_logger::SampleLogger::set_enabled`].
+    pub fn set_sample_logging_enabled(&self, enabled: bool) {
+        self.sample_logger.set_enabled(enabled);
     }
 }
 
@@ -421,6 +596,36 @@ pub fn fetch_physical_output_devices() -> Result<Vec<SoundDevice>> {
     Ok(devices)
 }
 
+/// Preferowany rozmiar bufora audio w klatkach — mniejszy bufor oznacza
+/// mniejsze opóźnienie między dźwiękiem w grze a reakcją radaru/cue w
+/// słuchawkach (patrz `crate::sound::mono_router`, który używa tej samej
+/// funkcji dla strumienia wyjściowego), kosztem nieco większego ryzyka
+/// przycięć (underrun) na wolniejszym sprzęcie — wejście i wyjście to dwa
+/// NIEZALEŻNE zegary sprzętowe (patrz doc-komentarz `SharedAudioAnalysis::mono_ring`),
+/// więc im mniejszy bufor, tym mniej zapasu na ich chwilowe rozjechanie.
+///
+/// UWAGA: pierwotnie `256` (~5,3 ms przy 48 kHz) — po zgłoszeniu słyszalnych
+/// "przycięć" w dźwięku przekierowanym przez `mono_router` podniesione do
+/// `480` (~10 ms), bezpieczniejszej, powszechnie używanej wartości dla trybu
+/// "niskie opóźnienie" na zwykłym WASAPI w trybie współdzielonym (bez
+/// wyłączności na urządzenie) — wciąż wyraźnie poniżej typowego domyślnego
+/// bufora systemowego, ale z większym zapasem na wahania harmonogramowania OS.
+pub(crate) const PREFERRED_BUFFER_FRAMES: u32 = 480;
+
+/// Wybiera stały, mały rozmiar bufora ([`PREFERRED_BUFFER_FRAMES`]), jeśli
+/// urządzenie faktycznie deklaruje obsługiwany zakres — część sterowników
+/// (typowo WASAPI w trybie współdzielonym) zgłasza `Unknown` i wtedy
+/// zostajemy przy `BufferSize::Default` wybieranym przez system, żeby nie
+/// zażądać wartości spoza tego, co urządzenie faktycznie obsługuje.
+pub(crate) fn low_latency_buffer_size(supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    match *supported {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            cpal::BufferSize::Fixed(PREFERRED_BUFFER_FRAMES.clamp(min, max))
+        }
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+    }
+}
+
 pub fn fetch_audio_from_device(
     target_device_name: &str,
     analysis: SharedAudioAnalysis,
@@ -468,10 +673,11 @@ pub fn fetch_audio_from_device(
             .or_else(|_| target_device.default_output_config())?
     };
 
-    let config: StreamConfig = default_config.clone().into();
+    let mut config: StreamConfig = default_config.clone().into();
+    config.buffer_size = low_latency_buffer_size(default_config.buffer_size());
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0 as f32;
-    let err_fn = |e| eprintln!("Stream error: {e}");
+    let err_fn = |e| crate::dlog!("Stream error: {e}");
 
     crate::dlog!(
         "[audio] stream start: device={:?} format={:?} rate={}Hz channels={}",
@@ -550,10 +756,16 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
     // Reguły kolorowania i czułość mogą się zmienić w dowolnym momencie z
     // panelu ustawień (UI), więc czytamy je świeżo przy każdej ramce zamiast
     // zakładać stałe wartości.
-    let (rules, sensitivity) = analysis
+    let (rules, sensitivity, contrast_enabled) = analysis
         .lock()
-        .map(|g| (g.radar_config.color_rules.clone(), g.radar_config.radar_sensitivity))
-        .unwrap_or_else(|_| (spectrum::default_color_rules(), default_radar_sensitivity()));
+        .map(|g| {
+            (
+                g.radar_config.color_rules.clone(),
+                g.radar_config.radar_sensitivity,
+                g.radar_config.direction_contrast_enabled,
+            )
+        })
+        .unwrap_or_else(|_| (spectrum::default_color_rules(), default_radar_sensitivity(), false));
     let rule_energies = spectrum::analyze_channel_rule_energies(samples, channels, sample_rate, &rules);
 
     // Niezależne zdarzenia kierunku: KAŻDY nagły skok energii na KAŻDYM
@@ -565,20 +777,69 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
     // (patrz log diagnostyczny), detekcja odpalała się raz na starcie i
     // prawie nigdy więcej, niezależnie od tego, jak wysoko user podniósłby
     // suwak.
-    let direction_events: Vec<DirectionEvent> = {
+    // Stan KAŻDEGO kanału z kierunkiem (nie tylko tych, które przebiły próg
+    // onsetu) — `direction_events` niżej filtruje z tego tylko onsety
+    // (identycznie jak dawne `detect_onsets`), a logger próbek (niżej) widzi
+    // WSZYSTKIE, żeby dało się złapać dźwięk, który był słyszalny, ale nigdy
+    // nie wygenerował markera (patrz doc-komentarz `direction::ChannelActivity`).
+    let channel_activity: Vec<direction::ChannelActivity> = {
         let mut ema_guard = analysis.onset_ema.lock().unwrap_or_else(|e| e.into_inner());
-        direction::detect_onsets(&stats.rms, &mut ema_guard, sensitivity)
-            .into_iter()
-            .map(|onset| DirectionEvent {
-                angle_deg: onset.angle_deg,
-                intensity: (onset.energy * sensitivity).clamp(0.0, 1.0),
-                color_rgb: spectrum::resolve_color(
-                    &rules,
-                    rule_energies.get(onset.channel_index).map(Vec::as_slice).unwrap_or(&[]),
-                ),
-            })
-            .collect()
+        let mut band_ema_guard = analysis.band_ema.lock().unwrap_or_else(|e| e.into_inner());
+        direction::detect_channel_activity(
+            &stats.rms,
+            &rule_energies,
+            &mut ema_guard,
+            &mut band_ema_guard,
+            sensitivity,
+            contrast_enabled,
+        )
     };
+
+    let direction_events: Vec<DirectionEvent> = channel_activity
+        .iter()
+        .filter(|a| a.is_onset)
+        .map(|onset| DirectionEvent {
+            angle_deg: onset.angle_deg,
+            intensity: (onset.energy * sensitivity).clamp(0.0, 1.0),
+            color_rgb: spectrum::resolve_color(
+                &rules,
+                rule_energies.get(onset.channel_index).map(Vec::as_slice).unwrap_or(&[]),
+            ),
+        })
+        .collect();
+
+    // Logger próbek do ręcznego dostrajania `color_rules` — patrz
+    // `sample_logger`. Sprawdzamy `is_enabled()` najpierw, żeby przy
+    // wyłączonym loggerze nie liczyć nic dodatkowego co ramkę audio.
+    // Próg 0.01 to ten sam floor co przy spawnowaniu `ChannelDot`
+    // (patrz `ui::radar_egui::RadarState::update`) — poniżej niego kanał
+    // uznajemy za ciszę, niewartą logowania.
+    if analysis.sample_logger.is_enabled() {
+        let unix_ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        for a in &channel_activity {
+            if a.scaled_energy < 0.01 {
+                continue;
+            }
+            let energies = rule_energies.get(a.channel_index).map(Vec::as_slice).unwrap_or(&[]);
+            let rule_index = spectrum::dominant_rule_index(energies);
+            let rule_label = rule_index.and_then(|i| rules.get(i)).and_then(|r| r.label.clone());
+            analysis.sample_logger.log_sample(sample_logger::SampleRow {
+                unix_ts_ms,
+                channel_index: a.channel_index,
+                rms: a.energy,
+                scaled_energy: a.scaled_energy,
+                angle_deg: a.angle_deg,
+                sensitivity,
+                marker_spawned: a.is_onset,
+                rule_index,
+                rule_label,
+                color: spectrum::resolve_color(&rules, energies),
+            });
+        }
+    }
 
     let labels = ["L", "R", "C", "LFE", "RL", "RR", "SL", "SR"];
     let ch_str: Vec<String> = stats.rms.iter().enumerate().map(|(i, rms)| {
@@ -612,24 +873,58 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         lock.active_direction_events = direction_events;
     }
 
-    // Miks do mono na sam koniec — dopiero tu, dla ewentualnego odtwarzania
-    // przez `mono_router`. Radar powyżej już dostał pełne dane per-kanał,
-    // więc to nie zastępuje ich, tylko dokłada osobny strumień do wyjścia.
-    analysis.push_mono(&downmix_to_mono(samples, channels));
+    // Miks do "ważonego mono" na sam koniec — dopiero tu, dla ewentualnego
+    // odtwarzania przez `mono_router`. Radar powyżej już dostał pełne dane
+    // per-kanał, więc to nie zastępuje ich, tylko dokłada osobny strumień do
+    // wyjścia.
+    analysis.push_stereo_pan(&downmix_to_stereo_pan(samples, channels));
 }
 
-/// Zinterlacowane próbki `channels`-kanałowe → próbki mono (uśrednione).
-fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
+/// Rozdziela zinterlacowane próbki na dwa "ważone" miksy mono: `(left,
+/// right)`, gdzie każdy to udział energii kanałów danej strony w tej ramce
+/// (patrz [`channel_pan_weights`]) — w przeciwieństwie do dawnego, płaskiego
+/// uśrednienia WSZYSTKICH kanałów, tu informacja L/R przeżywa aż do
+/// `mono_router`, który (w trybie jednousznym) może nią oznaczyć dźwięk z
+/// przeciwnej strony efektem (ring modulation), zamiast go bezpowrotnie
+/// zlewać z resztą.
+fn downmix_to_stereo_pan(interleaved: &[f32], channels: usize) -> Vec<(f32, f32)> {
     if channels == 0 {
         return Vec::new();
     }
     if channels == 1 {
-        return interleaved.to_vec();
+        // Mono źródło: brak informacji o stronie, więc dzielimy po równo.
+        return interleaved.iter().map(|&s| (s * 0.5, s * 0.5)).collect();
     }
+    let layout = direction::channel_layout(channels);
+    let weights: Vec<(f32, f32)> = (0..channels)
+        .map(|i| layout.get(i).copied().map(channel_pan_weights).unwrap_or((0.5, 0.5)))
+        .collect();
     interleaved
         .chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .map(|frame| {
+            let mut left = 0.0f32;
+            let mut right = 0.0f32;
+            for (i, &s) in frame.iter().enumerate() {
+                let (wl, wr) = weights[i];
+                left += s * wl;
+                right += s * wr;
+            }
+            (left / channels as f32, right / channels as f32)
+        })
         .collect()
+}
+
+/// Waga `(lewa, prawa)` pojedynczego kanału przy miksowaniu do "ważonego
+/// mono": pełne `1.0` po swojej stronie dla kanałów jednoznacznie bocznych,
+/// po połowie dla środka/LFE (brak wyraźnej strony, więc trafiają w obie
+/// bez efektu ring modulation w `mono_router`).
+fn channel_pan_weights(role: direction::ChannelRole) -> (f32, f32) {
+    use direction::ChannelRole::*;
+    match role {
+        FrontLeft | RearLeft | SideLeft => (1.0, 0.0),
+        FrontRight | RearRight | SideRight => (0.0, 1.0),
+        Center | Lfe => (0.5, 0.5),
+    }
 }
 
 #[cfg(test)]
@@ -647,5 +942,82 @@ mod tests {
         };
         assert_eq!(dev.get_device_direction(), "Input");
         assert_eq!(dev.get_default_status(), "No");
+    }
+
+    #[test]
+    fn downmix_to_stereo_pan_keeps_left_and_right_separate_for_plain_stereo() {
+        // L=1.0, R=0.5 przez 2 ramki.
+        let interleaved = [1.0, 0.5, 1.0, 0.5];
+        let pan = downmix_to_stereo_pan(&interleaved, 2);
+        assert_eq!(pan, vec![(0.5, 0.25), (0.5, 0.25)]);
+    }
+
+    #[test]
+    fn downmix_to_stereo_pan_sums_back_to_the_old_flat_mono_average() {
+        // (left + right) musi się zgadzać z dawnym płaskim `sum(channels)/channels`
+        // dla KAŻDEGO układu kanałów, bo `mono_router::MonoEar::Both` na tym polega.
+        let interleaved = [1.0, 0.5, 0.2, -0.4, -0.1, 0.3];
+        for &channels in &[1usize, 2, 6] {
+            let pan = downmix_to_stereo_pan(&interleaved[..channels.min(interleaved.len())], channels);
+            if let Some(&(l, r)) = pan.first() {
+                let expected: f32 = interleaved[..channels].iter().sum::<f32>() / channels as f32;
+                assert!((l + r - expected).abs() < 1e-6, "channels={channels}");
+            }
+        }
+    }
+
+    #[test]
+    fn downmix_to_stereo_pan_center_and_lfe_split_evenly() {
+        // 5.1: FrontLeft, FrontRight, Center, Lfe, RearLeft, RearRight — tylko Center głośny.
+        let interleaved = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+        let pan = downmix_to_stereo_pan(&interleaved, 6);
+        let (l, r) = pan[0];
+        assert!((l - r).abs() < 1e-6, "Center powinien trafić po równo w obie strony: {pan:?}");
+        assert!(l > 0.0);
+    }
+
+    #[test]
+    fn read_stereo_pan_holds_last_sample_on_underrun_instead_of_hard_zero() {
+        // Regresja dla "co parę sekund pojedyncza ścinka dźwięku": gdy wejście
+        // i wyjście (dwa niezależne zegary audio) rozjadą się na tyle, że
+        // bufor na chwilę wyschnie, odczyt NIE może wstawić twardego zera —
+        // to słychać jako trzask. Ma powtórzyć (z lekkim wygaszeniem) ostatnią
+        // realną próbkę.
+        let analysis = SharedAudioAnalysis::new();
+        analysis.push_stereo_pan(&[(0.6, 0.4), (0.6, 0.4)]);
+        // Prosimy o więcej próbek niż jest w buforze — reszta to "podkręcanie".
+        let out = analysis.read_stereo_pan(5);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], (0.6, 0.4));
+        assert_eq!(out[1], (0.6, 0.4));
+        for &(l, r) in &out[2..] {
+            assert!(l > 0.0 && r > 0.0, "podkręcanie ma powtarzać ostatnią próbkę, nie wstawiać ciszy: {out:?}");
+            assert!(l <= 0.6 && r <= 0.4, "powtórzona próbka ma się lekko wygaszać, nie rosnąć: {out:?}");
+        }
+    }
+
+    #[test]
+    fn push_stereo_pan_trims_back_to_target_instead_of_growing_to_hard_capacity() {
+        // Regresja dla "prawie sekundowego opóźnienia": gdy wejście trwale
+        // wyprzedza tempem wyjście (nikt nie woła read_stereo_pan wcale, jak
+        // tutaj — skrajny przypadek tego samego zjawiska), bufor bez
+        // aktywnego przycinania rósłby aż do MONO_RING_CAPACITY (~340ms) i
+        // tam utykał. Powinien zamiast tego zatrzymać się blisko
+        // TARGET_RING_LATENCY_SAMPLES (~50ms), NIE przy pełnej pojemności.
+        let analysis = SharedAudioAnalysis::new();
+        let chunk = vec![(0.1, 0.2); 500];
+        for _ in 0..50 {
+            analysis.push_stereo_pan(&chunk); // 50 * 500 = 25 000 próbek wepchniętych, bez ani jednego odczytu
+        }
+
+        let ring_len = analysis.mono_ring.lock().unwrap().len();
+        assert!(
+            ring_len <= RING_TRIM_THRESHOLD_SAMPLES,
+            "bufor nie powinien urosnąć powyżej progu przycinania, ma {ring_len}"
+        );
+        assert!(
+            ring_len < MONO_RING_CAPACITY,
+            "bufor utknął przy pełnej pojemności (~340ms) zamiast się przyciąć, ma {ring_len}"
+        );
     }
 }

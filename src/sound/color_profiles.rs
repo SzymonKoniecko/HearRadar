@@ -21,8 +21,8 @@ pub struct ColorProfile {
 pub fn built_in_profiles() -> &'static [ColorProfile] {
     &[
         ColorProfile {
-            name: "Domyślny (3 pasma)",
-            description: "Ogólny podział bas/średnie/wysokie — bezpieczny punkt startowy dla dowolnej gry.",
+            name: "Domyślny (5 pasm)",
+            description: "Ogólny podział sub-bas/bas/średnie/wysoko-średnie/wysokie — bezpieczny punkt startowy dla dowolnej gry.",
             build: default_profile,
         },
         ColorProfile {

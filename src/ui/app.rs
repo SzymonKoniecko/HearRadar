@@ -11,7 +11,7 @@
 
 use crate::config_store;
 use crate::sound::color_profiles;
-use crate::sound::devices::{self, MonoEar, RadarConfig, SharedAudioAnalysis, SoundDevice};
+use crate::sound::devices::{self, MonoCueStyle, MonoEar, RadarConfig, SharedAudioAnalysis, SoundDevice};
 use crate::sound::direction;
 use crate::sound::mono_router::{self, MonoRouter};
 use crate::sound::spectrum;
@@ -53,6 +53,7 @@ pub struct HearRadarApp {
     /// analogicznego stanu w warstwie audio (`SharedAudioAnalysis`), bo dane
     /// testowe nigdy nie przechodzą przez tamten strumień.
     test_onset_ema: Vec<f32>,
+    test_band_ema: Vec<Vec<f32>>,
     current_channels: usize,
     test_phase: f32,
     test_scenario: TestScenario,
@@ -144,6 +145,7 @@ impl HearRadarApp {
             analysis,
             radar_state: RadarState::new(),
             test_onset_ema: Vec::new(),
+            test_band_ema: Vec::new(),
             current_channels: DEFAULT_TEST_CHANNELS,
             test_phase: 0.0,
             test_seed: 7,
@@ -175,7 +177,14 @@ impl HearRadarApp {
     /// niezależne wskaźniki na radarze co prawdziwy dźwięk.
     fn detect_test_direction_events(&mut self, rms: &[f32], rule_energies: &[Vec<f32>]) -> Vec<devices::DirectionEvent> {
         let sensitivity = self.radar_config.radar_sensitivity;
-        direction::detect_onsets(rms, &mut self.test_onset_ema, sensitivity)
+        direction::detect_onsets(
+            rms,
+            rule_energies,
+            &mut self.test_onset_ema,
+            &mut self.test_band_ema,
+            sensitivity,
+            self.radar_config.direction_contrast_enabled,
+        )
             .into_iter()
             .map(|onset| devices::DirectionEvent {
                 angle_deg: onset.angle_deg,
@@ -396,7 +405,7 @@ impl HearRadarApp {
                         self.analysis.clone(),
                     ) {
                         Ok(s) => self.active_stream = Some(s),
-                        Err(e) => eprintln!("Stream error: {e}"),
+                        Err(e) => crate::dlog!("Stream error: {e}"),
                     }
                 }
             }
@@ -478,6 +487,28 @@ impl HearRadarApp {
             }
         });
 
+        // Efekt na stronie przeciwnej do granego ucha (patrz
+        // `mono_router::apply_cue`) — bez tego w trybie jednousznym
+        // (Lewe/Prawe) cała informacja "z której strony był dźwięk" ginie,
+        // bo obie strony grają identycznie w jednej słuchawce.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Wskazówka dla strony przeciwnej (tryb jednouszny):");
+            for style in MonoCueStyle::ALL {
+                let style = *style;
+                if ui
+                    .selectable_label(self.radar_config.mono_cue_style == style, style.label())
+                    .clicked()
+                {
+                    self.radar_config.mono_cue_style = style;
+                    self.write_radar_config();
+                }
+            }
+        });
+        ui.weak(
+            "Dotyczy tylko ucha Lewe/Prawe: strona przeciwna dostaje wybrany efekt zamiast grać \
+             identycznie jak swoja, żeby po brzmieniu poznać, że dźwięk był z drugiej strony.",
+        );
+
         // Wzmocnienie sygnału mono na wyjściu — odpowiednik `INTENSITY_SCALE`
         // z `sound::direction` (tam sztywny mnożnik dla WYŚWIETLANIA na
         // radarze), tylko tu regulowalny przez użytkownika i wpływający na
@@ -524,7 +555,7 @@ impl HearRadarApp {
                         }
                         Err(e) => {
                             let msg = format!("Nie udało się uruchomić routingu: {e}");
-                            eprintln!("[mono_router] start error: {e}");
+                            crate::dlog!("[mono_router] start error: {e}");
                             self.mono_status = Some(msg);
                         }
                     }
@@ -639,6 +670,19 @@ impl HearRadarApp {
             )
             .changed();
         changed |= ui
+            .checkbox(
+                &mut self.radar_config.direction_contrast_enabled,
+                "🎯 Kontrast międzykanałowy (tłumi tło wspólne dla wszystkich kierunków, 5.1/7.1)",
+            )
+            .on_hover_text(
+                "Odejmuje energię wspólną dla wszystkich kanałów kierunkowych przed \
+                 wykryciem markera, żeby wyraźnie jednostronne zdarzenie (krok, strzał) \
+                 łatwiej przebijało się na tle otoczenia/muzyki słyszalnej wszędzie naraz. \
+                 Bez wpływu przy zwykłym stereo (2.0) — tam L≈R to normalny zapis \
+                 wyśrodkowanego dźwięku, nie oznaka otoczenia.",
+            )
+            .changed();
+        changed |= ui
             .add(
                 egui::Slider::new(&mut self.radar_config.line_thickness, 0.3..=3.0)
                     .text("Grubość linii"),
@@ -703,7 +747,7 @@ impl HearRadarApp {
     fn ui_color_rules_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Kolory wg częstotliwości");
-            if ui.small_button("↺ Domyślne 3 pasma").clicked() {
+            if ui.small_button("↺ Domyślne 5 pasm").clicked() {
                 self.radar_config.color_rules = spectrum::default_color_rules();
                 self.write_radar_config();
             }
@@ -718,11 +762,12 @@ impl HearRadarApp {
         let mut remove_index: Option<usize> = None;
 
         egui::Grid::new("color_rules_grid")
-            .num_columns(5)
+            .num_columns(6)
             .striped(true)
             .show(ui, |ui| {
                 ui.label("Hz min");
                 ui.label("Hz max");
+                ui.label("Waga");
                 ui.label("Kolor");
                 ui.label("Sytuacja (opis)");
                 ui.label("");
@@ -743,6 +788,19 @@ impl HearRadarApp {
                                 .speed(10.0)
                                 .range(0.0..=20_000.0)
                                 .suffix(" Hz"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut rule.weight)
+                                .speed(0.1)
+                                .range(0.1..=20.0)
+                                .suffix("×"),
+                        )
+                        .on_hover_text(
+                            "Mnożnik energii tej reguły przed porównaniem dominacji. \
+                             Zwiększ, jeśli to pasmo powinno wygrywać częściej niż wynika \
+                             z surowej energii (np. wysokie tony alarmów giną pod basem).",
                         )
                         .changed();
                     changed |= ui.color_edit_button_srgb(&mut rule.color).changed();
@@ -796,7 +854,30 @@ impl HearRadarApp {
 
         ui.add_space(6.0);
         ui.separator();
+        self.ui_sample_logging_toggle(ui);
+
+        ui.add_space(6.0);
+        ui.separator();
         self.ui_config_persistence(ui);
+    }
+
+    /// Checkbox włączający/wyłączający logger próbek (`sound::sample_logger`)
+    /// do ręcznej analizy, który z każdej ramki audio zapisuje realny kolor
+    /// (albo brak markera) każdego słyszalnego kanału do pliku CSV w
+    /// katalogu configu — patrz doc-komentarz modułu `sample_logger`. Każde
+    /// włączenie startuje NOWY plik, więc kolejne sesje nagrywania da się
+    /// porównywać osobno.
+    fn ui_sample_logging_toggle(&mut self, ui: &mut egui::Ui) {
+        let mut enabled = self.analysis.sample_logging_enabled();
+        if ui
+            .checkbox(&mut enabled, "Loguj próbki kolorów do CSV (do ręcznej analizy configu)")
+            .changed()
+        {
+            self.analysis.set_sample_logging_enabled(enabled);
+        }
+        if enabled {
+            ui.weak("Zapisuje do config/sample_log_NNNN.csv — kolejny plik przy każdym włączeniu.");
+        }
     }
 
     /// Rozwijana lista gotowych profili kolorów pod konkretne style gier
@@ -938,7 +1019,7 @@ impl HearRadarApp {
             match crate::ui::overlay_win::WinOverlay::new() {
                 Ok(overlay) => self.win_overlay = Some(overlay),
                 Err(err) => {
-                    eprintln!("nie udało się utworzyć natywnego okna overlay: {err}");
+                    crate::dlog!("nie udało się utworzyć natywnego okna overlay: {err}");
                     self.overlay_open = false;
                     return;
                 }

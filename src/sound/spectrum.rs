@@ -1,18 +1,21 @@
-//! Szybki, przybliżony podział energii kanału na 3 pasma częstotliwości
-//! (niskie/średnie/wysokie) — bez FFT, jednobiegunowymi filtrami IIR.
+//! Szybki, przybliżony podział energii kanału na kilka pasm częstotliwości
+//! (sub-bas / bas / średnie / wysoko-średnie / wysokie) — bez FFT,
+//! jednobiegunowymi filtrami IIR.
 //!
 //! Filtr resetuje swój stan na początku każdego bufora audio (ok. 10-20 ms),
 //! więc to nie jest precyzyjna analiza widmowa, tylko szybki, poglądowy
-//! podział wystarczający do kolorowania kropek radaru wg "typu" dźwięku
-//! (bas / środek / wysokie tony). Wystarczy to dla krótkich ramek, bo stan
-//! przejściowy filtra jednobiegunowego zanika w ciągu kilku milisekund.
+//! podział wystarczający do kolorowania kropek radaru wg "typu" dźwięku.
+//! Wystarczy to dla krótkich ramek, bo stan przejściowy filtra
+//! jednobiegunowego zanika w ciągu kilku milisekund.
 
 use std::f32::consts::TAU;
 
-/// Progi domyślnych 3 pasm ([`default_color_rules`]) — zachowane jako stałe,
-/// żeby dawne "low/mid/high" zostały udokumentowane w jednym miejscu.
-const LOW_CUTOFF_HZ: f32 = 200.0;
-const HIGH_CUTOFF_HZ: f32 = 2000.0;
+/// Progi domyślnych 5 pasm ([`default_color_rules`]) — zachowane jako stałe,
+/// żeby granice zostały udokumentowane w jednym miejscu.
+const SUB_BASS_CUTOFF_HZ: f32 = 100.0;
+const BASS_CUTOFF_HZ: f32 = 500.0;
+const MID_CUTOFF_HZ: f32 = 2000.0;
+const PRESENCE_CUTOFF_HZ: f32 = 6000.0;
 
 fn one_pole_lowpass(input: &[f32], sample_rate: f32, cutoff_hz: f32) -> Vec<f32> {
     let dt = 1.0 / sample_rate;
@@ -61,8 +64,12 @@ fn band_energy(channel_samples: &[f32], sample_rate: f32, freq_min: f32, freq_ma
 //
 // Dowolna liczba reguł zdefiniowanych przez użytkownika: każda reguła to
 // zakres częstotliwości + kolor, edytowalne w panelu ustawień radaru.
-// [`default_color_rules`] odtwarza dawny sztywny podział na 3 pasma
-// (niskie/średnie/wysokie), ale to tylko jeden z możliwych zestawów reguł.
+// [`default_color_rules`] odtwarza domyślny podział na 5 pasm, ale to tylko
+// jeden z możliwych zestawów reguł.
+
+fn default_weight() -> f32 {
+    1.0
+}
 
 /// Jedna reguła kolorowania kropki: zakres częstotliwości `[freq_min, freq_max)`
 /// Hz i przypisany jej kolor RGB. Użytkownik może mieć ich dowolnie wiele —
@@ -77,36 +84,66 @@ pub struct ColorRule {
     pub color: [u8; 3],
     #[serde(default)]
     pub label: Option<String>,
+    /// Mnożnik energii tej reguły przed porównaniem dominacji (patrz
+    /// [`dominant_rule_index`]). Domyślnie `1.0`. Większość naturalnych
+    /// dźwięków (kroki, mowa, szum otoczenia) ma znacznie więcej energii w
+    /// niskich/średnich pasmach niż w wysokich, więc przy porównaniu surowej
+    /// energii RMS pasmo wysokie prawie nigdy nie wygrywa — nawet gdy realnie
+    /// słychać w nim coś istotnego (alarm, dzwonek, tłukące się szkło).
+    /// `weight` pozwala to skompensować bez zmiany granic pasma. Pole ma
+    /// `#[serde(default)]`, żeby wczytanie starszego pliku konfiguracji
+    /// (sprzed dodania tego pola) dało neutralne `1.0`, nie `0.0`.
+    #[serde(default = "default_weight")]
+    pub weight: f32,
 }
 
 impl ColorRule {
     pub fn new(freq_min: f32, freq_max: f32, color: [u8; 3]) -> Self {
-        Self { freq_min, freq_max, color, label: None }
+        Self { freq_min, freq_max, color, label: None, weight: default_weight() }
     }
 
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
         self
     }
+
+    pub fn with_weight(mut self, weight: f32) -> Self {
+        self.weight = weight;
+        self
+    }
 }
 
-/// Domyślne reguły — dokładnie te same 3 sztywne pasma (Low/Mid/High), więc
-/// domyślne zachowanie/kolory radaru się nie zmieniają, dopóki użytkownik
-/// nie zacznie edytować listy w ustawieniach.
+/// Domyślne reguły — 5 pasm zamiast dawnych sztywnych 3, z wagą rosnącą wraz
+/// z częstotliwością. W trzech niezależnych nagraniach testowych
+/// (`sample_log_0001..0003`) dawne pasmo "Wysokie" (2000-20000 Hz, waga 1.0)
+/// wygrywało porównanie energii w raptem 0,5-1,5% ramek — naturalne dźwięki
+/// mają zwykle opadające widmo (więcej energii nisko niż wysoko), więc bez
+/// korekty wysokie tony (alarmy, dzwonki, tłukące się szkło) prawie nigdy nie
+/// przebijały się na kolor radaru mimo realnej obecności. Przy podziale na 5
+/// węższych pasm ta sama korekta jest rozłożona stopniowo zamiast jednego
+/// skoku wagi na granicy 2000 Hz — patrz doc-komentarz [`ColorRule::weight`].
 pub fn default_color_rules() -> Vec<ColorRule> {
     vec![
-        ColorRule::new(0.0, LOW_CUTOFF_HZ, [255, 90, 90]).with_label("Niskie (bas)"),
-        ColorRule::new(LOW_CUTOFF_HZ, HIGH_CUTOFF_HZ, [0, 220, 220]).with_label("Średnie"),
-        ColorRule::new(HIGH_CUTOFF_HZ, 20_000.0, [255, 220, 90]).with_label("Wysokie"),
+        ColorRule::new(0.0, SUB_BASS_CUTOFF_HZ, [200, 40, 40]).with_label("Sub-bas"),
+        ColorRule::new(SUB_BASS_CUTOFF_HZ, BASS_CUTOFF_HZ, [255, 90, 90]).with_label("Bas"),
+        ColorRule::new(BASS_CUTOFF_HZ, MID_CUTOFF_HZ, [0, 220, 220])
+            .with_label("Średnie (mowa)")
+            .with_weight(1.5),
+        ColorRule::new(MID_CUTOFF_HZ, PRESENCE_CUTOFF_HZ, [255, 150, 60])
+            .with_label("Wysoko-średnie")
+            .with_weight(3.0),
+        ColorRule::new(PRESENCE_CUTOFF_HZ, 20_000.0, [255, 220, 90])
+            .with_label("Wysokie")
+            .with_weight(5.0),
     ]
 }
 
 /// Energia (RMS) jednego kanału w każdej z podanych reguł, w tej samej
-/// kolejności co `rules`.
+/// kolejności co `rules`, przemnożona przez `rule.weight` każdej reguły.
 fn rule_energies(channel_samples: &[f32], sample_rate: f32, rules: &[ColorRule]) -> Vec<f32> {
     rules
         .iter()
-        .map(|r| band_energy(channel_samples, sample_rate, r.freq_min, r.freq_max))
+        .map(|r| band_energy(channel_samples, sample_rate, r.freq_min, r.freq_max) * r.weight)
         .collect()
 }
 
@@ -170,7 +207,7 @@ mod tests {
     #[test]
     fn low_tone_dominates_the_low_default_rule() {
         let sample_rate = 48_000.0;
-        let freq = 60.0; // wyraźnie w domyślnym paśmie "low" (0-200 Hz)
+        let freq = 60.0; // wyraźnie w domyślnym paśmie "Sub-bas" (0-100 Hz)
         let samples: Vec<f32> = (0..4800)
             .map(|i| (i as f32 / sample_rate * TAU * freq).sin())
             .collect();
@@ -181,12 +218,12 @@ mod tests {
     #[test]
     fn high_tone_dominates_the_high_default_rule() {
         let sample_rate = 48_000.0;
-        let freq = 8000.0; // wyraźnie w domyślnym paśmie "high" (2-20 kHz)
+        let freq = 8000.0; // wyraźnie w domyślnym paśmie "Wysokie" (6-20 kHz)
         let samples: Vec<f32> = (0..4800)
             .map(|i| (i as f32 / sample_rate * TAU * freq).sin())
             .collect();
         let energies = rule_energies(&samples, sample_rate, &default_color_rules());
-        assert_eq!(dominant_rule_index(&energies), Some(2));
+        assert_eq!(dominant_rule_index(&energies), Some(4));
     }
 
     #[test]
@@ -220,7 +257,7 @@ mod tests {
         let per_channel = analyze_channel_rule_energies(&samples, 2, sample_rate, &rules);
         assert_eq!(per_channel.len(), 2);
         assert_eq!(dominant_rule_index(&per_channel[0]), Some(0));
-        assert_eq!(dominant_rule_index(&per_channel[1]), Some(2));
+        assert_eq!(dominant_rule_index(&per_channel[1]), Some(4));
     }
 
     // ---------- reguły kolorowania o dowolnej liczbie/zakresach ----------
@@ -253,6 +290,67 @@ mod tests {
     }
 
     #[test]
+    fn weight_lets_a_quieter_high_band_win_over_a_louder_low_band() {
+        let sample_rate = 48_000.0;
+        // Ton niski o dużej amplitudzie + ton wysoki o mniejszej amplitudzie,
+        // zmiksowane w jednym sygnale — jak realny dźwięk z opadającym widmem.
+        let samples: Vec<f32> = (0..4800)
+            .map(|i| {
+                let t = i as f32 / sample_rate;
+                0.8 * (t * TAU * 60.0).sin() + 0.2 * (t * TAU * 8000.0).sin()
+            })
+            .collect();
+
+        let unweighted = vec![
+            ColorRule::new(0.0, 200.0, [0, 0, 0]),
+            ColorRule::new(2000.0, 20_000.0, [0, 0, 0]),
+        ];
+        let energies = rule_energies(&samples, sample_rate, &unweighted);
+        assert_eq!(
+            dominant_rule_index(&energies),
+            Some(0),
+            "bez wagi cichszy wysoki ton nie powinien wygrywać"
+        );
+
+        let weighted = vec![
+            ColorRule::new(0.0, 200.0, [0, 0, 0]),
+            ColorRule::new(2000.0, 20_000.0, [0, 0, 0]).with_weight(10.0),
+        ];
+        let energies = rule_energies(&samples, sample_rate, &weighted);
+        assert_eq!(
+            dominant_rule_index(&energies),
+            Some(1),
+            "z wystarczającą wagą wysoki ton powinien wygrać mimo mniejszej surowej energii"
+        );
+    }
+
+    #[test]
+    fn color_rule_new_defaults_weight_to_one() {
+        assert_eq!(ColorRule::new(0.0, 100.0, [0, 0, 0]).weight, 1.0);
+    }
+
+    #[test]
+    fn default_color_rules_boosts_weight_progressively_with_frequency() {
+        let rules = default_color_rules();
+        let weights: Vec<f32> = rules.iter().map(|r| r.weight).collect();
+        assert_eq!(weights, vec![1.0, 1.0, 1.5, 3.0, 5.0]);
+        for pair in weights.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "waga powinna rosnąć (albo zostać taka sama) wraz z częstotliwością pasma"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_weight_field_in_saved_json_defaults_to_one() {
+        // Symuluje plik zapisany przed dodaniem pola `weight` do `ColorRule`.
+        let json = r#"{"freq_min":0.0,"freq_max":200.0,"color":[255,90,90]}"#;
+        let rule: ColorRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.weight, 1.0);
+    }
+
+    #[test]
     fn analyze_channel_rule_energies_matches_channel_and_rule_count() {
         let sample_rate = 48_000.0;
         let rules = default_color_rules();
@@ -265,10 +363,13 @@ mod tests {
     }
 
     #[test]
-    fn default_color_rules_has_three_rules_covering_full_audible_range() {
+    fn default_color_rules_has_at_least_five_rules_covering_full_audible_range_without_gaps() {
         let rules = default_color_rules();
-        assert_eq!(rules.len(), 3);
+        assert!(rules.len() >= 5, "oczekiwano co najmniej 5 pasm domyślnych");
         assert_eq!(rules[0].freq_min, 0.0);
         assert_eq!(rules.last().unwrap().freq_max, 20_000.0);
+        for pair in rules.windows(2) {
+            assert_eq!(pair[0].freq_max, pair[1].freq_min, "luka/nakładka między domyślnymi pasmami");
+        }
     }
 }
