@@ -734,11 +734,12 @@ impl HearRadarApp {
         let mut remove_index: Option<usize> = None;
 
         egui::Grid::new("color_rules_grid")
-            .num_columns(5)
+            .num_columns(6)
             .striped(true)
             .show(ui, |ui| {
                 ui.label("Hz min");
                 ui.label("Hz max");
+                ui.label("Waga");
                 ui.label("Kolor");
                 ui.label("Sytuacja (opis)");
                 ui.label("");
@@ -759,6 +760,19 @@ impl HearRadarApp {
                                 .speed(10.0)
                                 .range(0.0..=20_000.0)
                                 .suffix(" Hz"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut rule.weight)
+                                .speed(0.1)
+                                .range(0.1..=20.0)
+                                .suffix("×"),
+                        )
+                        .on_hover_text(
+                            "Mnożnik energii tej reguły przed porównaniem dominacji. \
+                             Zwiększ, jeśli to pasmo powinno wygrywać częściej niż wynika \
+                             z surowej energii (np. wysokie tony alarmów giną pod basem).",
                         )
                         .changed();
                     changed |= ui.color_edit_button_srgb(&mut rule.color).changed();

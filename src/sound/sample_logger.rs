@@ -1,6 +1,6 @@
 //! Logger próbek klasyfikacji koloru do ręcznej analizy — pozwala zebrać,
 //! jakie kolory (albo brak markera w ogóle) dostają realne dźwięki z gry, żeby
-//! offline (w Excelu/arkuszu) dostroić granice [`crate::sound::spectrum::ColorRule`]
+//! offline (w Excelu/arkuszu) dostroić granice i wagi [`crate::sound::spectrum::ColorRule`]
 //! w configu. Włączane checkboxem w [`crate::ui::app::HearRadarApp::ui_color_rules_panel`].
 //!
 //! Każde włączenie loggera otwiera NOWY plik CSV (kolejny numer w katalogu

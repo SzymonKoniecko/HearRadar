@@ -1,0 +1,51 @@
+{
+  "anchor_x": 0.52,
+  "anchor_y": 1.0,
+  "radius": 125.0,
+  "bg_alpha": 0.82,
+  "fg_alpha": 1.0,
+  "show_labels": false,
+  "high_contrast": false,
+  "decay_secs": 2.5,
+  "color_rules": [
+    {
+      "freq_min": 0.0,
+      "freq_max": 200.0,
+      "color": [
+        255,
+        90,
+        90
+      ],
+      "label": "Niskie (bas)",
+      "weight": 1.0
+    },
+    {
+      "freq_min": 200.0,
+      "freq_max": 2000.0,
+      "color": [
+        0,
+        220,
+        220
+      ],
+      "label": "Średnie",
+      "weight": 1.0
+    },
+    {
+      "freq_min": 2000.0,
+      "freq_max": 20000.0,
+      "color": [
+        255,
+        220,
+        90
+      ],
+      "label": "Wysokie",
+      "weight": 1.0
+    }
+  ],
+  "overlay_click_through": true,
+  "mono_boost_db": 3.0,
+  "radar_sensitivity": 8.0,
+  "edge_glow_enabled": false,
+  "line_thickness": 1.0,
+  "mono_cue_style": "Squeaky"
+}
