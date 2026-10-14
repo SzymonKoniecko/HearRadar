@@ -11,6 +11,43 @@ use crate::sound::direction::{self, analyze_channels};
 use crate::sound::sample_logger;
 use crate::sound::spectrum::{self, ColorRule};
 
+/// Tryb wyświetlania wizualizacji audio na overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VisualizationMode {
+    /// Tylko radar ze strzałkami kierunków.
+    OnlyRadar,
+    /// Tylko słupki stereo L/R.
+    OnlyBars,
+    /// Zarówno radar jak i słupki stereo.
+    Both,
+    /// Nic nie wyświetlaj (overlay wyłączony).
+    None,
+}
+
+impl VisualizationMode {
+    pub const ALL: &'static [Self] = &[
+        Self::OnlyRadar,
+        Self::OnlyBars,
+        Self::Both,
+        Self::None,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OnlyRadar => "◉ Tylko radar",
+            Self::OnlyBars => "≡ Tylko słupki L/R",
+            Self::Both => "◉≡ Radar + słupki",
+            Self::None => "⊘ Nic",
+        }
+    }
+}
+
+impl Default for VisualizationMode {
+    fn default() -> Self {
+        Self::Both
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RadarConfig {
     /// Pozycja X środka radaru jako ułamek szerokości okna (0.0 = lewo, 1.0 = prawo).
@@ -102,6 +139,9 @@ pub struct RadarConfig {
     /// żywym audio i wyłączyć, gdyby gdzieś zaszkodziła.
     #[serde(default)]
     pub direction_contrast_enabled: bool,
+    /// Tryb wyświetlania: radar, słupki L/R, oba razem, albo nic.
+    #[serde(default)]
+    pub visualization_mode: VisualizationMode,
 }
 
 fn default_overlay_click_through() -> bool {
@@ -139,6 +179,7 @@ impl Default for RadarConfig {
             line_thickness: default_line_thickness(),
             mono_cue_style: MonoCueStyle::default(),
             direction_contrast_enabled: false,
+            visualization_mode: VisualizationMode::default(),
         }
     }
 }
@@ -624,6 +665,101 @@ pub(crate) fn low_latency_buffer_size(supported: &cpal::SupportedBufferSize) -> 
         }
         cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
     }
+}
+
+/// Szuka i zwraca nazwę urządzenia "Stereo Mix" (WASAPI loopback) na Windowsie.
+/// Jeśli nie znaleziono, zwraca None. To urządzenie pozwala nasłuchiwać dźwięku
+/// bezpośrednio z gry zamiast z mikrofonu systemowego.
+pub fn find_stereo_mix_device() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let host = cpal::default_host();
+        if let Ok(mut devices) = host.output_devices() {
+            if let Some(device) = devices.find(|d| {
+                d.name()
+                    .map(|name| {
+                        name.contains("Stereo Mix")
+                            || name.contains("Mix - What U Hear")
+                            || name.contains("Loopback")
+                    })
+                    .unwrap_or(false)
+            }) {
+                if let Ok(name) = device.name() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let host = cpal::default_host();
+        if let Ok(mut devices) = host.input_devices() {
+            if let Some(device) = devices.find(|d| {
+                d.name()
+                    .map(|name| {
+                        name.contains("BlackHole") || name.contains("Loopback")
+                    })
+                    .unwrap_or(false)
+            }) {
+                if let Ok(name) = device.name() {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Zwraca opis instrukcji do włączenia Stereo Mix na Windowsie 11.
+pub fn get_stereo_mix_setup_instructions() -> &'static str {
+    r#"
+WŁĄCZENIE STEREO MIX NA WINDOWS 11
+===================================
+
+Aby nasłuchiwać dźwięku bezpośrednio z gry (zamiast mikrofonu), musisz włączyć "Stereo Mix":
+
+METODA 1: Ustawienia Windows 11 (Główna)
+-----------
+1. START → Ustawienia (Settings)
+2. System (po lewej)
+3. Dźwięk (Sound)
+4. Przewiń w dół
+5. "Mikser głośności" (Volume mixer)
+6. Szukaj "Stereo Mix" na liście
+   - Jeśli nie widać: przewiń do góry → "Pokaż wyłączone urządzenia"
+   - Kliknij na "Stereo Mix" → Enable
+
+METODA 2: Dla kart NVIDIA (szybsze)
+-----------
+1. Kliknij prawo na pulpicie → NVIDIA Control Panel
+   (Lub: Win + X → Device Manager → Display adapters → Prawa kliawisz na NVIDIA → Open NVIDIA Control Panel)
+2. Po lewej: Audio
+3. Zaznacz "Enable Stereo Mix"
+4. Apply
+
+METODA 3: Zarządzanie Urządzeniami (Device Manager)
+-----------
+1. Wciśnij: Win + X → Device Manager
+2. Rozwiń "Sound, video and game controllers"
+3. Szukaj "Stereo Mix"
+4. Jeśli jest wyłączone (szara ikona) → kliknij prawo → Enable
+
+ROZWIĄZYWANIE PROBLEMÓW
+-----------
+Problem: "Stereo Mix" nie pojawia się nigdzie
+Rozwiązanie: Pobierz nowe sterowniki karty dźwiękowej ze strony producenta
+  - NVIDIA: https://www.nvidia.com/Download/driverDetails.aspx
+  - Realtek: https://www.realtek.com/en/component/zoo/category/pc-audio-codecs
+  - AMD: https://www.amd.com/en/support
+
+Problem: "Stereo Mix" jest nieaktywny (szary)
+Rozwiązanie:
+  - Spróbuj metody NVIDIA Control Panel (jeśli masz NVIDIA)
+  - Lub może być wyłączone w BIOS-ie (rzadko)
+
+Po włączeniu "Stereo Mix", HearRadar powinien go znaleźć automatycznie
+w menu "Urządzenie wejściowe" - kliknij przycisk "🎵 Stereo Mix"!
+"#
 }
 
 pub fn fetch_audio_from_device(

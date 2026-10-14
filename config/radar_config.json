@@ -65,10 +65,11 @@
     }
   ],
   "overlay_click_through": true,
-  "mono_boost_db": 0.0,
-  "radar_sensitivity": 9.5,
+  "mono_boost_db": 5.0,
+  "radar_sensitivity": 17.5,
   "edge_glow_enabled": false,
   "line_thickness": 1.0,
-  "mono_cue_style": "Off",
-  "direction_contrast_enabled": true
+  "mono_cue_style": "Bright",
+  "direction_contrast_enabled": false,
+  "visualization_mode": "OnlyBars"
 }

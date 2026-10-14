@@ -261,8 +261,8 @@ pub struct DirectionMarker {
 }
 
 /// Stan radaru utrzymywany między klatkami: historia kropek per kanał,
-/// wygładzona energia (do detekcji transientów), osobny wskaźnik LFE i
-/// aktywne wskaźniki kierunku (onsety).
+/// wygładzona energia (do detekcji transientów), osobny wskaźnik LFE,
+/// wygładzone poziomy stereo L/R i aktywne wskaźniki kierunku (onsety).
 #[derive(Default)]
 pub struct RadarState {
     dots: Vec<VecDeque<ChannelDot>>,
@@ -273,6 +273,18 @@ pub struct RadarState {
     /// Kolor wskaźnika LFE wg jego własnej dominującej reguły (LFE to kanał
     /// audio jak każdy inny, więc też przechodzi przez `resolve_color`).
     pub lfe_color_rgb: (u8, u8, u8),
+    /// Wygładzony poziom kanału lewego (stereo).
+    pub stereo_left_display: f32,
+    /// Kolor wskaźnika lewego kanału.
+    pub stereo_left_color_rgb: (u8, u8, u8),
+    /// Historia energii kanału lewego (ostatnie 3 ramki dla warstwowania).
+    stereo_left_history: VecDeque<f32>,
+    /// Wygładzony poziom kanału prawego (stereo).
+    pub stereo_right_display: f32,
+    /// Kolor wskaźnika prawego kanału.
+    pub stereo_right_color_rgb: (u8, u8, u8),
+    /// Historia energii kanału prawego (ostatnie 3 ramki dla warstwowania).
+    stereo_right_history: VecDeque<f32>,
     direction_markers: VecDeque<DirectionMarker>,
 }
 
@@ -352,6 +364,15 @@ impl RadarState {
                 continue;
             }
 
+            // Stereo L/R wskaźniki (dla 2.0 i większych konfiguracji)
+            if role == Some(ChannelRole::FrontLeft) {
+                self.stereo_left_display = self.stereo_left_display * 0.8 + energy * 0.2;
+                self.stereo_left_color_rgb = resolve_color(rules, energies);
+            } else if role == Some(ChannelRole::FrontRight) {
+                self.stereo_right_display = self.stereo_right_display * 0.8 + energy * 0.2;
+                self.stereo_right_color_rgb = resolve_color(rules, energies);
+            }
+
             let prev_ema = self.ema[i];
             let transient = energy > prev_ema * TRANSIENT_RATIO + 0.05;
             self.ema[i] = prev_ema * 0.9 + energy * 0.1;
@@ -400,7 +421,18 @@ pub fn draw_radar<C: RadarCanvas>(
     channels: usize,
     now: f64,
 ) {
+    use crate::sound::devices::VisualizationMode;
+
     state.prune(now, cfg.decay_secs);
+
+    // Sprawdzamy tryb wyświetlania
+    let show_radar = matches!(cfg.visualization_mode, VisualizationMode::OnlyRadar | VisualizationMode::Both);
+    let show_bars = matches!(cfg.visualization_mode, VisualizationMode::OnlyBars | VisualizationMode::Both);
+
+    // Jeśli nic się nie wyświetla, wyjdź wcześnie
+    if !show_radar && !show_bars {
+        return;
+    }
 
     let r = cfg.radius;
     let fg = cfg.fg_alpha;
@@ -424,55 +456,53 @@ pub fn draw_radar<C: RadarCanvas>(
     let c_center = Color32::from_rgba_unmultiplied(cross_rgb.0, cross_rgb.1, cross_rgb.2, 200);
     let c_bg     = Color32::from_rgba_unmultiplied(bg_rgb.0, bg_rgb.1, bg_rgb.2, (cfg.bg_alpha * 255.0) as u8);
 
-    canvas.circle_filled(center, r, c_bg);
-
-    // 3 koncentryczne okręgi = skala intensywności (słaby/średni/mocny), nie
-    // fizyczna odległość.
-    for frac in [1.0f32, 0.66, 0.33] {
-        let color = if frac == 1.0 { with_alpha(c_ring, fg) } else { with_alpha(c_inner, fg) };
-        let width = (if frac == 1.0 { 1.5 } else { 0.8 }) * lt;
-        canvas.circle_stroke(center, r * frac, Stroke::new(width, color));
-    }
-
-    // Krzyż kierunków.
-    let cross = Stroke::new(0.8 * lt, with_alpha(c_cross, fg));
-    canvas.line_segment([center - Vec2::new(0.0, r), center + Vec2::new(0.0, r)], cross);
-    canvas.line_segment([center - Vec2::new(r, 0.0), center + Vec2::new(r, 0.0)], cross);
-
-    // Bardzo delikatne linie sektorów co 45° — tylko w układzie 7.1, gdzie
-    // każdy z 8 kierunków ma osobny kanał.
-    if channels == 8 {
-        let sector = Stroke::new(0.5 * lt, with_alpha(c_cross, fg * 0.4));
-        for k in 0..8 {
-            let a = (k as f32) * std::f32::consts::FRAC_PI_4 - std::f32::consts::FRAC_PI_2;
-            let p = center + Vec2::new(a.cos(), a.sin()) * r;
-            canvas.line_segment([center, p], sector);
-        }
-    }
-
-    canvas.circle_filled(center, 2.5, with_alpha(c_center, fg));
-
-    // Etykiety kierunków (tryb z etykietami) — bez nich radar jest w pełni minimalny.
-    if cfg.show_labels {
-        let font = FontId::proportional((r * 0.09).clamp(9.0, 14.0));
-        let label_color = with_alpha(c_ring, fg);
-        let positions = [
-            center - Vec2::new(0.0, r + 12.0), // PRZÓD
-            center + Vec2::new(r + 6.0, 0.0),  // PRAWO
-            center + Vec2::new(0.0, r + 12.0), // TYŁ
-            center - Vec2::new(r + 6.0, 0.0),  // LEWO
-        ];
-        for (label, pos) in LABELS.iter().zip(positions.iter()) {
-            canvas.text(*pos, egui::Align2::CENTER_CENTER, *label, font.clone(), label_color);
-        }
-    }
-
-    // Kropki kanałów — opcjonalne (patrz `RadarConfig::show_channel_dots`);
-    // niezależne wskaźniki kierunku (markery, dalej w tej funkcji) rysują się
-    // zawsze, bez względu na ten przełącznik. `layout` jest potrzebny także
-    // niżej (wskaźnik LFE), więc żyje poza blokiem `if`.
     let layout = channel_layout(channels);
-    if cfg.show_channel_dots {
+
+    if show_radar {
+        canvas.circle_filled(center, r, c_bg);
+
+        // 3 koncentryczne okręgi = skala intensywności (słaby/średni/mocny), nie
+        // fizyczna odległość.
+        for frac in [1.0f32, 0.66, 0.33] {
+            let color = if frac == 1.0 { with_alpha(c_ring, fg) } else { with_alpha(c_inner, fg) };
+            let width = (if frac == 1.0 { 1.5 } else { 0.8 }) * lt;
+            canvas.circle_stroke(center, r * frac, Stroke::new(width, color));
+        }
+
+        // Krzyż kierunków.
+        let cross = Stroke::new(0.8 * lt, with_alpha(c_cross, fg));
+        canvas.line_segment([center - Vec2::new(0.0, r), center + Vec2::new(0.0, r)], cross);
+        canvas.line_segment([center - Vec2::new(r, 0.0), center + Vec2::new(r, 0.0)], cross);
+
+        // Bardzo delikatne linie sektorów co 45° — tylko w układzie 7.1, gdzie
+        // każdy z 8 kierunków ma osobny kanał.
+        if channels == 8 {
+            let sector = Stroke::new(0.5 * lt, with_alpha(c_cross, fg * 0.4));
+            for k in 0..8 {
+                let a = (k as f32) * std::f32::consts::FRAC_PI_4 - std::f32::consts::FRAC_PI_2;
+                let p = center + Vec2::new(a.cos(), a.sin()) * r;
+                canvas.line_segment([center, p], sector);
+            }
+        }
+
+        canvas.circle_filled(center, 2.5, with_alpha(c_center, fg));
+
+        // Etykiety kierunków (tryb z etykietami) — bez nich radar jest w pełni minimalny.
+        if cfg.show_labels {
+            let font = FontId::proportional((r * 0.09).clamp(9.0, 14.0));
+            let label_color = with_alpha(c_ring, fg);
+            let positions = [
+                center - Vec2::new(0.0, r + 12.0), // PRZÓD
+                center + Vec2::new(r + 6.0, 0.0),  // PRAWO
+                center + Vec2::new(0.0, r + 12.0), // TYŁ
+                center - Vec2::new(r + 6.0, 0.0),  // LEWO
+            ];
+            for (label, pos) in LABELS.iter().zip(positions.iter()) {
+                canvas.text(*pos, egui::Align2::CENTER_CENTER, *label, font.clone(), label_color);
+            }
+        }
+
+        // Kropki kanałów
         for (i, dots) in state.dots.iter().enumerate() {
             let Some(role) = layout.get(i).copied() else { continue };
             let Some(angle_deg) = role.radar_angle_degrees() else { continue }; // LFE ma osobny wskaźnik
@@ -534,76 +564,79 @@ pub fn draw_radar<C: RadarCanvas>(
                 }
             }
         }
-    }
 
-    // Wskaźnik LFE — osobny, poza tarczą, bez przypisanego kierunku. Kolor wg
-    // jego własnej dominującej reguły (poza trybem wysokiego kontrastu, gdzie
-    // i tak wracamy do jednej barwy).
-    if layout.contains(&ChannelRole::Lfe) {
-        let lfe_rgb = if hc { dot_rgb } else { state.lfe_color_rgb };
-        draw_lfe_indicator(canvas, center, r, state.lfe_display, fg, lfe_rgb);
-    }
-
-    // Niezależne wskaźniki kierunku — jeden na każde wykryte zdarzenie
-    // dźwiękowe (onset), rysowane na końcu, więc zawsze na wierzchu. Kropki
-    // per-kanał powyżej pokazują "który głośnik gra"; ta latarnia (strzałka +
-    // poświata, ciepły kolor odróżniony od reszty palety) pokazuje "skąd
-    // konkretnie zabrzmiało" — w przeciwieństwie do dawnego, pojedynczego
-    // sumarycznego wektora, dwa jednoczesne, przeciwstawne źródła dostają
-    // TERAZ dwa niezależne wskaźniki zamiast się wzajemnie znosić. Każdy
-    // wskaźnik gaśnie krótko i niezależnie od pozostałych.
-    for marker in &state.direction_markers {
-        let age = (now - marker.spawned_at) as f32;
-        if age < 0.0 || age > DIRECTION_MARKER_LIFETIME_SECS as f32 {
-            continue;
+        // Wskaźnik LFE — osobny, poza tarczą
+        if layout.contains(&ChannelRole::Lfe) {
+            let lfe_rgb = if hc { dot_rgb } else { state.lfe_color_rgb };
+            draw_lfe_indicator(canvas, center, r, state.lfe_display, fg, lfe_rgb);
         }
-        let life = 1.0 - (age / DIRECTION_MARKER_LIFETIME_SECS as f32).clamp(0.0, 1.0);
-        let alpha_frac = life.powf(1.6);
 
-        let beacon_rgb = if hc { (255, 255, 255) } else { marker.color_rgb };
-        let angle = marker.angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
-        let dir = Vec2::new(angle.cos(), angle.sin());
-        let perp = Vec2::new(-dir.y, dir.x);
-        let intensity = marker.intensity.clamp(0.0, 1.0);
+        // Niezależne wskaźniki kierunku
+        for marker in &state.direction_markers {
+            let age = (now - marker.spawned_at) as f32;
+            if age < 0.0 || age > DIRECTION_MARKER_LIFETIME_SECS as f32 {
+                continue;
+            }
+            let life = 1.0 - (age / DIRECTION_MARKER_LIFETIME_SECS as f32).clamp(0.0, 1.0);
+            let alpha_frac = life.powf(1.6);
 
-        let marker_r = (intensity * r).clamp(10.0, r);
-        let pos = center + dir * marker_r;
+            let beacon_rgb = if hc { (255, 255, 255) } else { marker.color_rgb };
+            let angle = marker.angle_deg.to_radians() - std::f32::consts::FRAC_PI_2;
+            let dir = Vec2::new(angle.cos(), angle.sin());
+            let perp = Vec2::new(-dir.y, dir.x);
+            let intensity = marker.intensity.clamp(0.0, 1.0);
 
-        // Dokładna pozycja piksela wskaźnika na tarczy w TYM oknie (podgląd w
-        // głównym oknie i overlay wołają `draw_radar` osobno, każde z własnym
-        // `center` — ta sama logiczna kropka wypadnie więc pod innymi x/y w
-        // każdym z nich). Loguje się co klatkę przez cały czas życia markera
-        // (~1 s), więc plik rośnie szybko — to świadomy kompromis dla
-        // dokładnego śledzenia ruchu/zaniku wskaźnika w czasie.
-        crate::dlog!(
-            "[marker-pos] angle={:.1}° age={:.2}s life={:.2} x={:.1} y={:.1} (center=({:.1},{:.1}))",
-            marker.angle_deg,
-            age,
-            life,
-            pos.x,
-            pos.y,
-            center.x,
-            center.y
-        );
+            let marker_r = (intensity * r).clamp(10.0, r);
+            let pos = center + dir * marker_r;
 
-        let alpha = ((intensity * 0.6 + 0.4) * 255.0 * fg * alpha_frac).clamp(0.0, 255.0) as u8;
-        let beacon_color =
-            Color32::from_rgba_unmultiplied(beacon_rgb.0, beacon_rgb.1, beacon_rgb.2, alpha);
-        let glow_alpha = ((alpha as f32) * 0.3) as u8;
-        let glow_color =
-            Color32::from_rgba_unmultiplied(beacon_rgb.0, beacon_rgb.1, beacon_rgb.2, glow_alpha);
+            crate::dlog!(
+                "[marker-pos] angle={:.1}° age={:.2}s life={:.2} x={:.1} y={:.1} (center=({:.1},{:.1}))",
+                marker.angle_deg,
+                age,
+                life,
+                pos.x,
+                pos.y,
+                center.x,
+                center.y
+            );
 
-        let head_len = 14.0 + intensity * 10.0;
-        let head_w = 9.0 + intensity * 6.0;
-        let tip = pos + dir * head_len * 0.6;
-        let base_center = pos - dir * head_len * 0.4;
-        let left = base_center + perp * head_w * 0.5;
-        let right = base_center - perp * head_w * 0.5;
+            let alpha = ((intensity * 0.6 + 0.4) * 255.0 * fg * alpha_frac).clamp(0.0, 255.0) as u8;
+            let beacon_color =
+                Color32::from_rgba_unmultiplied(beacon_rgb.0, beacon_rgb.1, beacon_rgb.2, alpha);
+            let glow_alpha = ((alpha as f32) * 0.3) as u8;
+            let glow_color =
+                Color32::from_rgba_unmultiplied(beacon_rgb.0, beacon_rgb.1, beacon_rgb.2, glow_alpha);
 
-        canvas.line_segment([center, base_center], Stroke::new(2.2 * lt, beacon_color));
-        canvas.circle_filled(pos, head_w * 1.1, glow_color);
-        canvas.triangle_filled([tip, left, right], beacon_color);
-        canvas.circle_stroke(pos, head_w * 1.1, Stroke::new(1.0 * lt, beacon_color));
+            let head_len = 14.0 + intensity * 10.0;
+            let head_w = 9.0 + intensity * 6.0;
+            let tip = pos + dir * head_len * 0.6;
+            let base_center = pos - dir * head_len * 0.4;
+            let left = base_center + perp * head_w * 0.5;
+            let right = base_center - perp * head_w * 0.5;
+
+            canvas.line_segment([center, base_center], Stroke::new(2.2 * lt, beacon_color));
+            canvas.circle_filled(pos, head_w * 1.1, glow_color);
+            canvas.triangle_filled([tip, left, right], beacon_color);
+            canvas.circle_stroke(pos, head_w * 1.1, Stroke::new(1.0 * lt, beacon_color));
+        }
+    }
+
+    // Wskaźniki stereo L/R — rysują się gdy include_bars
+    if show_bars {
+        if layout.contains(&ChannelRole::FrontLeft) || layout.contains(&ChannelRole::FrontRight) {
+            let left_rgb = if hc { dot_rgb } else { state.stereo_left_color_rgb };
+            let right_rgb = if hc { dot_rgb } else { state.stereo_right_color_rgb };
+            draw_stereo_indicators(
+                canvas,
+                center,
+                r,
+                state.stereo_left_display,
+                left_rgb,
+                state.stereo_right_display,
+                right_rgb,
+                fg,
+            );
+        }
     }
 }
 
@@ -617,6 +650,80 @@ fn draw_lfe_indicator<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, level: f
     let fill_w = w * level.clamp(0.0, 1.0);
     let fill = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, (220.0 * fg) as u8);
     canvas.rect_filled(egui::Rect::from_min_size(top_left, Vec2::new(fill_w, h)), 2.0, fill);
+}
+
+fn draw_stereo_indicators<C: RadarCanvas>(
+    canvas: &C,
+    center: Pos2,
+    r: f32,
+    left_level: f32,
+    left_rgb: (u8, u8, u8),
+    right_level: f32,
+    right_rgb: (u8, u8, u8),
+    fg: f32,
+) {
+    let bar_width = (r * 0.12).clamp(8.0, 16.0);
+    let bar_height = (r * 0.8).clamp(60.0, 150.0);
+    let spacing = (r * 0.3).clamp(20.0, 50.0);
+
+    // Lewy słupek (L) — po lewej stronie radaru
+    let left_x = center.x - spacing - bar_width;
+    let left_top = center.y - bar_height / 2.0;
+    let bg = Color32::from_rgba_unmultiplied(255, 255, 255, (30.0 * fg) as u8);
+    canvas.rect_filled(
+        egui::Rect::from_min_size(Pos2::new(left_x, left_top), Vec2::new(bar_width, bar_height)),
+        2.0,
+        bg,
+    );
+
+    let fill_h_left = bar_height * left_level.clamp(0.0, 1.0);
+    let fill_left = Color32::from_rgba_unmultiplied(left_rgb.0, left_rgb.1, left_rgb.2, (220.0 * fg) as u8);
+    canvas.rect_filled(
+        egui::Rect::from_min_size(
+            Pos2::new(left_x, left_top + bar_height - fill_h_left),
+            Vec2::new(bar_width, fill_h_left),
+        ),
+        2.0,
+        fill_left,
+    );
+
+    // Prawy słupek (R) — po prawej stronie radaru
+    let right_x = center.x + spacing;
+    let right_top = center.y - bar_height / 2.0;
+    canvas.rect_filled(
+        egui::Rect::from_min_size(Pos2::new(right_x, right_top), Vec2::new(bar_width, bar_height)),
+        2.0,
+        bg,
+    );
+
+    let fill_h_right = bar_height * right_level.clamp(0.0, 1.0);
+    let fill_right = Color32::from_rgba_unmultiplied(right_rgb.0, right_rgb.1, right_rgb.2, (220.0 * fg) as u8);
+    canvas.rect_filled(
+        egui::Rect::from_min_size(
+            Pos2::new(right_x, right_top + bar_height - fill_h_right),
+            Vec2::new(bar_width, fill_h_right),
+        ),
+        2.0,
+        fill_right,
+    );
+
+    // Etykiety L i R
+    let font = FontId::proportional((bar_width * 1.5).clamp(8.0, 12.0));
+    let label_color = Color32::from_rgba_unmultiplied(255, 255, 255, (180.0 * fg) as u8);
+    canvas.text(
+        Pos2::new(left_x + bar_width / 2.0, left_top - 8.0),
+        egui::Align2::CENTER_BOTTOM,
+        "L",
+        font.clone(),
+        label_color,
+    );
+    canvas.text(
+        Pos2::new(right_x + bar_width / 2.0, right_top - 8.0),
+        egui::Align2::CENTER_BOTTOM,
+        "R",
+        font,
+        label_color,
+    );
 }
 
 // ── Drugi tryb wizualizacji: poświaty na krawędzi ekranu ──────────────────────

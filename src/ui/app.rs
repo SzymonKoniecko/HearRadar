@@ -386,6 +386,14 @@ impl HearRadarApp {
                     }
                 });
 
+            if ui.button("🎵 Stereo Mix").clicked() {
+                if let Some(stereo_mix_name) = devices::find_stereo_mix_device() {
+                    self.selected_device = stereo_mix_name;
+                } else {
+                    crate::dlog!("Stereo Mix nie znaleziony. Patrz instrukcje poniżej.");
+                }
+            }
+
             if ui.button("Odśwież").clicked() {
                 self.devices = devices::fetch_output_devices().map_err(|e| e.to_string());
             }
@@ -417,6 +425,57 @@ impl HearRadarApp {
                     self.overlay_reposition_pending = true;
                 }
             }
+        });
+
+        // Instrukcje do włączenia Stereo Mix
+        ui.separator();
+        ui.collapsing("ℹ️ Jak używać Stereo Mix (nasłuchiwanie dźwięku gry)?", |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    "Zamiast przechwytywać dźwięk z mikrofonu, możesz nasłuchiwać dźwięku \
+                     bezpośrednio z gry dzięki funkcji \"Stereo Mix\". To przydatne do testowania \
+                     z grami, ale wymaga włączenia w ustawieniach Windows."
+                );
+                ui.separator();
+                ui.strong("KROK 1: Włącz Stereo Mix na Windows 11");
+                ui.label(
+                    "START → Ustawienia (Settings) → System → Dźwięk (Sound)"
+                );
+                ui.label(
+                    "Przewiń w dół → \"Mikser głośności\" (Volume mixer)"
+                );
+                ui.label(
+                    "Szukaj \"Stereo Mix\" na liście urządzeń"
+                );
+                ui.label(
+                    "Jeśli nie widać: przewiń do góry → \"Pokaż wyłączone urządzenia\" \
+                     (Show disabled devices) → Enable"
+                );
+                ui.label(
+                    "Jeśli ciągle go nie ma: pobierz nowe sterowniki karty dźwiękowej \
+                     (NVIDIA, Realtek, itp.) ze strony producenta"
+                );
+                ui.separator();
+                ui.strong("KROK 2: Wybierz Stereo Mix w HearRadar");
+                ui.label(
+                    "Kliknij przycisk \"🎵 Stereo Mix\" powyżej - aplikacja automatycznie go \
+                     znajdzie"
+                );
+                ui.label(
+                    "Lub wybierz ręcznie z listy \"Urządzenie wejściowe\""
+                );
+                ui.separator();
+                ui.strong("KROK 3: Nasłuchuj");
+                ui.label(
+                    "Kliknij \"Przechwytuj\" i otwórz grę. Radar będzie pokazywać dźwięk \
+                     bezpośrednio ze speaker'ów!"
+                );
+                ui.separator();
+                ui.small(
+                    "💡 Wskazówka: Jeśli audio się nie słyszy w słuchawkach (mono router), \
+                     włącz routing po ustawieniu Stereo Mix jako głównego wejścia."
+                );
+            });
         });
 
         ui.separator();
@@ -635,6 +694,25 @@ impl HearRadarApp {
         });
 
         let mut changed = false;
+        ui.label("Tryb wyświetlania:");
+        egui::Grid::new("visualization_mode_grid").num_columns(2).show(ui, |ui| {
+            for mode in devices::VisualizationMode::ALL {
+                if ui
+                    .selectable_label(self.radar_config.visualization_mode == *mode, mode.label())
+                    .clicked()
+                {
+                    self.radar_config.visualization_mode = *mode;
+                    changed = true;
+                }
+                ui.end_row();
+            }
+        });
+
+        if changed {
+            self.write_radar_config();
+        }
+
+        let mut changed = false;
         let mut position_changed = false;
         position_changed |= ui
             .add(egui::Slider::new(&mut self.radar_config.anchor_x, 0.0..=1.0).text("Pozycja X"))
@@ -686,12 +764,6 @@ impl HearRadarApp {
             .add(
                 egui::Slider::new(&mut self.radar_config.line_thickness, 0.3..=3.0)
                     .text("Grubość linii"),
-            )
-            .changed();
-        changed |= ui
-            .checkbox(
-                &mut self.radar_config.show_channel_dots,
-                "Kropki kanałów (ślad energii głośników w czasie)",
             )
             .changed();
         changed |= ui
