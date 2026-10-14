@@ -368,9 +368,17 @@ impl RadarState {
             if role == Some(ChannelRole::FrontLeft) {
                 self.stereo_left_display = self.stereo_left_display * 0.8 + energy * 0.2;
                 self.stereo_left_color_rgb = resolve_color(rules, energies);
+                self.stereo_left_history.push_back(energy);
+                while self.stereo_left_history.len() > 3 {
+                    self.stereo_left_history.pop_front();
+                }
             } else if role == Some(ChannelRole::FrontRight) {
                 self.stereo_right_display = self.stereo_right_display * 0.8 + energy * 0.2;
                 self.stereo_right_color_rgb = resolve_color(rules, energies);
+                self.stereo_right_history.push_back(energy);
+                while self.stereo_right_history.len() > 3 {
+                    self.stereo_right_history.pop_front();
+                }
             }
 
             let prev_ema = self.ema[i];
@@ -621,19 +629,15 @@ pub fn draw_radar<C: RadarCanvas>(
         }
     }
 
-    // Wskaźniki stereo L/R — rysują się gdy include_bars
+    // Wskaźniki stereo L/R — rysują się gdy show_bars
     if show_bars {
         if layout.contains(&ChannelRole::FrontLeft) || layout.contains(&ChannelRole::FrontRight) {
-            let left_rgb = if hc { dot_rgb } else { state.stereo_left_color_rgb };
-            let right_rgb = if hc { dot_rgb } else { state.stereo_right_color_rgb };
             draw_stereo_indicators(
                 canvas,
                 center,
                 r,
-                state.stereo_left_display,
-                left_rgb,
-                state.stereo_right_display,
-                right_rgb,
+                &state.stereo_left_history,
+                &state.stereo_right_history,
                 fg,
             );
         }
@@ -656,15 +660,20 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     canvas: &C,
     center: Pos2,
     r: f32,
-    left_level: f32,
-    left_rgb: (u8, u8, u8),
-    right_level: f32,
-    right_rgb: (u8, u8, u8),
+    left_history: &VecDeque<f32>,
+    right_history: &VecDeque<f32>,
     fg: f32,
 ) {
     let bar_width = (r * 0.12).clamp(8.0, 16.0);
-    let bar_height = (r * 0.8).clamp(60.0, 150.0);
-    let spacing = (r * 0.3).clamp(20.0, 50.0);
+    let bar_height = (r * 1.2).clamp(100.0, 250.0);
+    let spacing = (r * 0.4).clamp(30.0, 70.0);
+
+    // Kolory warstw: niebieski -> czerwony -> niebieski
+    let layer_colors = [
+        (0, 100, 200),    // Niebieski (warstwa 0)
+        (200, 50, 50),    // Czerwony (warstwa 1)
+        (0, 100, 200),    // Niebieski (warstwa 2)
+    ];
 
     // Lewy słupek (L) — po lewej stronie radaru
     let left_x = center.x - spacing - bar_width;
@@ -676,16 +685,23 @@ fn draw_stereo_indicators<C: RadarCanvas>(
         bg,
     );
 
-    let fill_h_left = bar_height * left_level.clamp(0.0, 1.0);
-    let fill_left = Color32::from_rgba_unmultiplied(left_rgb.0, left_rgb.1, left_rgb.2, (220.0 * fg) as u8);
-    canvas.rect_filled(
-        egui::Rect::from_min_size(
-            Pos2::new(left_x, left_top + bar_height - fill_h_left),
-            Vec2::new(bar_width, fill_h_left),
-        ),
-        2.0,
-        fill_left,
-    );
+    // Rysuj warstwy dla lewego słupka
+    let mut accumulated_height = 0.0;
+    for (layer_idx, &energy) in left_history.iter().enumerate() {
+        let layer_height = bar_height * energy.clamp(0.0, 1.0);
+        let (r_color, g_color, b_color) = layer_colors[layer_idx % layer_colors.len()];
+        let color = Color32::from_rgba_unmultiplied(r_color, g_color, b_color, (220.0 * fg) as u8);
+
+        canvas.rect_filled(
+            egui::Rect::from_min_size(
+                Pos2::new(left_x, left_top + bar_height - accumulated_height - layer_height),
+                Vec2::new(bar_width, layer_height),
+            ),
+            2.0,
+            color,
+        );
+        accumulated_height += layer_height;
+    }
 
     // Prawy słupek (R) — po prawej stronie radaru
     let right_x = center.x + spacing;
@@ -696,29 +712,36 @@ fn draw_stereo_indicators<C: RadarCanvas>(
         bg,
     );
 
-    let fill_h_right = bar_height * right_level.clamp(0.0, 1.0);
-    let fill_right = Color32::from_rgba_unmultiplied(right_rgb.0, right_rgb.1, right_rgb.2, (220.0 * fg) as u8);
-    canvas.rect_filled(
-        egui::Rect::from_min_size(
-            Pos2::new(right_x, right_top + bar_height - fill_h_right),
-            Vec2::new(bar_width, fill_h_right),
-        ),
-        2.0,
-        fill_right,
-    );
+    // Rysuj warstwy dla prawego słupka
+    accumulated_height = 0.0;
+    for (layer_idx, &energy) in right_history.iter().enumerate() {
+        let layer_height = bar_height * energy.clamp(0.0, 1.0);
+        let (r_color, g_color, b_color) = layer_colors[layer_idx % layer_colors.len()];
+        let color = Color32::from_rgba_unmultiplied(r_color, g_color, b_color, (220.0 * fg) as u8);
+
+        canvas.rect_filled(
+            egui::Rect::from_min_size(
+                Pos2::new(right_x, right_top + bar_height - accumulated_height - layer_height),
+                Vec2::new(bar_width, layer_height),
+            ),
+            2.0,
+            color,
+        );
+        accumulated_height += layer_height;
+    }
 
     // Etykiety L i R
     let font = FontId::proportional((bar_width * 1.5).clamp(8.0, 12.0));
     let label_color = Color32::from_rgba_unmultiplied(255, 255, 255, (180.0 * fg) as u8);
     canvas.text(
-        Pos2::new(left_x + bar_width / 2.0, left_top - 8.0),
+        Pos2::new(left_x + bar_width / 2.0, left_top - 12.0),
         egui::Align2::CENTER_BOTTOM,
         "L",
         font.clone(),
         label_color,
     );
     canvas.text(
-        Pos2::new(right_x + bar_width / 2.0, right_top - 8.0),
+        Pos2::new(right_x + bar_width / 2.0, right_top - 12.0),
         egui::Align2::CENTER_BOTTOM,
         "R",
         font,
