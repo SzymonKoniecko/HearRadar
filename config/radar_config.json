@@ -2,11 +2,11 @@
   "anchor_x": 0.52,
   "anchor_y": 1.0,
   "radius": 125.0,
-  "bg_alpha": 0.0,
-  "fg_alpha": 1.0,
+  "bg_alpha": 0.56,
+  "fg_alpha": 0.55,
   "show_labels": false,
   "high_contrast": false,
-  "decay_secs": 2.5,
+  "decay_secs": 2.55,
   "color_rules": [
     {
       "freq_min": 0.0,

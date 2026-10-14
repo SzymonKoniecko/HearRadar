@@ -668,11 +668,18 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     let bar_height = (r * 1.2).clamp(100.0, 250.0);
     let spacing = (r * 0.4).clamp(30.0, 70.0);
 
-    // Kolory warstw: niebieski -> czerwony -> niebieski
-    let layer_colors = [
+    // Kolory warstw dla L: niebieski -> czerwony -> niebieski
+    let left_colors = [
         (0, 100, 200),    // Niebieski (warstwa 0)
         (200, 50, 50),    // Czerwony (warstwa 1)
         (0, 100, 200),    // Niebieski (warstwa 2)
+    ];
+
+    // Kolory warstw dla R: zielony -> żółty -> zielony
+    let right_colors = [
+        (50, 150, 50),    // Zielony (warstwa 0)
+        (200, 180, 30),   // Żółty (warstwa 1)
+        (50, 150, 50),    // Zielony (warstwa 2)
     ];
 
     // Lewy słupek (L) — po lewej stronie radaru
@@ -689,7 +696,7 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     let mut accumulated_height = 0.0;
     for (layer_idx, &energy) in left_history.iter().enumerate() {
         let layer_height = bar_height * energy.clamp(0.0, 1.0);
-        let (r_color, g_color, b_color) = layer_colors[layer_idx % layer_colors.len()];
+        let (r_color, g_color, b_color) = left_colors[layer_idx % left_colors.len()];
         let color = Color32::from_rgba_unmultiplied(r_color, g_color, b_color, (220.0 * fg) as u8);
 
         canvas.rect_filled(
@@ -716,7 +723,7 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     accumulated_height = 0.0;
     for (layer_idx, &energy) in right_history.iter().enumerate() {
         let layer_height = bar_height * energy.clamp(0.0, 1.0);
-        let (r_color, g_color, b_color) = layer_colors[layer_idx % layer_colors.len()];
+        let (r_color, g_color, b_color) = right_colors[layer_idx % right_colors.len()];
         let color = Color32::from_rgba_unmultiplied(r_color, g_color, b_color, (220.0 * fg) as u8);
 
         canvas.rect_filled(
@@ -744,9 +751,72 @@ fn draw_stereo_indicators<C: RadarCanvas>(
         Pos2::new(right_x + bar_width / 2.0, right_top - 12.0),
         egui::Align2::CENTER_BOTTOM,
         "R",
-        font,
+        font.clone(),
         label_color,
     );
+
+    // Wskaźnik porównania L vs R — pasek między słupkami
+    let left_energy = left_history.back().copied().unwrap_or(0.0);
+    let right_energy = right_history.back().copied().unwrap_or(0.0);
+
+    let bar_center_x = center.x;
+    let indicator_y = center.y + bar_height / 2.0 + 20.0;
+    let indicator_width = spacing * 1.5;
+    let indicator_height = 12.0;
+
+    // Tło wskaźnika
+    let indicator_bg = Color32::from_rgba_unmultiplied(60, 60, 60, (100.0 * fg) as u8);
+    canvas.rect_filled(
+        egui::Rect::from_min_size(
+            Pos2::new(bar_center_x - indicator_width / 2.0, indicator_y),
+            Vec2::new(indicator_width, indicator_height),
+        ),
+        3.0,
+        indicator_bg,
+    );
+
+    // Oblicz którą stronę wypełnić
+    let energy_diff = (left_energy - right_energy).clamp(-1.0, 1.0);
+    let fill_center_offset = (indicator_width / 2.0) * energy_diff;
+
+    // Wypełnienie wskaźnika (lewe lub prawe, w zależności od L vs R)
+    if energy_diff > 0.05 {
+        // L > R — wypełniamy od lewej
+        let fill_width = (indicator_width / 2.0) * (energy_diff / 1.0);
+        let left_color = Color32::from_rgba_unmultiplied(0, 100, 200, (220.0 * fg) as u8);
+        canvas.rect_filled(
+            egui::Rect::from_min_size(
+                Pos2::new(bar_center_x - indicator_width / 2.0, indicator_y),
+                Vec2::new(fill_width, indicator_height),
+            ),
+            3.0,
+            left_color,
+        );
+    } else if energy_diff < -0.05 {
+        // R > L — wypełniamy od prawej
+        let fill_width = (indicator_width / 2.0) * (-energy_diff / 1.0);
+        let right_color = Color32::from_rgba_unmultiplied(50, 150, 50, (220.0 * fg) as u8);
+        canvas.rect_filled(
+            egui::Rect::from_min_size(
+                Pos2::new(bar_center_x + indicator_width / 2.0 - fill_width, indicator_y),
+                Vec2::new(fill_width, indicator_height),
+            ),
+            3.0,
+            right_color,
+        );
+    } else {
+        // Prawie równe — wypełniamy środek
+        let center_fill = 8.0;
+        let equal_color = Color32::from_rgba_unmultiplied(150, 150, 150, (220.0 * fg) as u8);
+        canvas.rect_filled(
+            egui::Rect::from_min_size(
+                Pos2::new(bar_center_x - center_fill / 2.0, indicator_y),
+                Vec2::new(center_fill, indicator_height),
+            ),
+            3.0,
+            equal_color,
+        );
+    }
 }
 
 // ── Drugi tryb wizualizacji: poświaty na krawędzi ekranu ──────────────────────
