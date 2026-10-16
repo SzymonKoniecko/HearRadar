@@ -790,6 +790,12 @@ impl HearRadarApp {
             self.overlay_reposition_pending = true;
         }
         changed |= edge_glow_changed;
+        changed |= ui
+            .checkbox(
+                &mut self.radar_config.speaker_layout_view,
+                "🔈 Rozróżnij układ 2.0 / 5.1 / 7.1 (kropki głośników zamiast łuków)",
+            )
+            .changed();
 
         ui.separator();
         changed |= ui

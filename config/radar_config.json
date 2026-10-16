@@ -1,9 +1,9 @@
 {
   "anchor_x": 0.5,
-  "anchor_y": 1.0,
+  "anchor_y": 0.52,
   "radius": 125.0,
   "bg_alpha": 0.56,
-  "fg_alpha": 0.55,
+  "fg_alpha": 0.88,
   "show_labels": false,
   "high_contrast": false,
   "decay_secs": 2.55,
@@ -65,10 +65,11 @@
     }
   ],
   "overlay_click_through": true,
-  "mono_boost_db": 1.0,
-  "radar_sensitivity": 17.5,
+  "mono_boost_db": 7.0,
+  "radar_sensitivity": 16.0,
   "edge_glow_enabled": false,
-  "line_thickness": 1.0,
+  "speaker_layout_view": false,
+  "line_thickness": 1.6,
   "mono_cue_style": "Bright",
   "direction_contrast_enabled": false,
   "visualization_mode": "OnlyBars"

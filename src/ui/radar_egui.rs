@@ -1,5 +1,5 @@
 use crate::sound::devices::{DirectionEvent, RadarConfig};
-use crate::sound::direction::{channel_layout, ChannelRole};
+use crate::sound::direction::{channel_layout, layout_name, ChannelRole};
 use crate::sound::spectrum::{resolve_color, ColorRule};
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 use std::collections::VecDeque;
@@ -629,8 +629,9 @@ pub fn draw_radar<C: RadarCanvas>(
         }
     }
 
-    // Wskaźniki stereo L/R — rysują się gdy show_bars
-    if show_bars {
+    let split_layouts = cfg.speaker_layout_view;
+
+    if show_bars && (!split_layouts || channels <= 2) {
         if layout.contains(&ChannelRole::FrontLeft) || layout.contains(&ChannelRole::FrontRight) {
             draw_stereo_indicators(
                 canvas,
@@ -639,8 +640,22 @@ pub fn draw_radar<C: RadarCanvas>(
                 &state.stereo_left_history,
                 &state.stereo_right_history,
                 fg,
+                lt,
             );
         }
+    }
+
+    if split_layouts && show_radar {
+        if channels > 2 {
+            draw_speaker_ring(canvas, center, r, layout, &state.ema, fg, lt);
+        }
+        canvas.text(
+            Pos2::new(center.x, center.y - r - 22.0),
+            Align2::CENTER_CENTER,
+            &layout_name(channels),
+            FontId::proportional(12.0),
+            Color32::from_rgba_unmultiplied(ring_rgb.0, ring_rgb.1, ring_rgb.2, (200.0 * fg) as u8),
+        );
     }
 }
 
@@ -656,6 +671,40 @@ fn draw_lfe_indicator<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, level: f
     canvas.rect_filled(egui::Rect::from_min_size(top_left, Vec2::new(fill_w, h)), 2.0, fill);
 }
 
+/// Pierścień kropek w pozycjach głośników 5.1/7.1; jasność każdej = poziom jej kanału.
+fn draw_speaker_ring<C: RadarCanvas>(
+    canvas: &C,
+    center: Pos2,
+    r: f32,
+    layout: &[ChannelRole],
+    levels: &[f32],
+    fg: f32,
+    lt: f32,
+) {
+    let ring_r = r + 14.0;
+    let lt = lt.max(0.5);
+    for (i, role) in layout.iter().enumerate() {
+        let Some(angle) = role.radar_angle_degrees() else {
+            continue;
+        };
+        let level = levels.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let pos = center + screen_direction(angle) * ring_r;
+        let fill = Color32::from_rgba_unmultiplied(0, 255, 157, ((60.0 + 195.0 * level) * fg) as u8);
+        canvas.circle_filled(pos, 3.5 * lt + 2.0 * level, fill);
+        canvas.circle_stroke(
+            pos,
+            3.5 * lt + 2.0 * level + 1.5,
+            Stroke::new(1.0 * lt, Color32::from_rgba_unmultiplied(0, 255, 157, (90.0 * fg) as u8)),
+        );
+    }
+}
+
+fn stereo_arc_thickness(r: f32, lt: f32) -> f32 {
+    (r * 0.05).clamp(3.0, 8.0) * lt.max(0.5)
+}
+
+/// Łuki L/R na obwodzie tarczy: lewy rozchodzi się od godziny 9, prawy od 3,
+/// długość i jasność rosną z energią kanału; cienka kreska to szczyt z historii.
 fn draw_stereo_indicators<C: RadarCanvas>(
     canvas: &C,
     center: Pos2,
@@ -663,181 +712,75 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     left_history: &VecDeque<f32>,
     right_history: &VecDeque<f32>,
     fg: f32,
+    lt: f32,
 ) {
-    let bar_width = (r * 0.12).clamp(8.0, 16.0);
-    let bar_height = (r * 1.2).clamp(100.0, 250.0);
-    let spacing = (r * 0.4).clamp(30.0, 70.0);
+    const MAX_HALF_SPAN_DEG: f32 = 70.0;
+    const STEP_DEG: f32 = 3.0;
+    const DOMINANCE_MARGIN: f32 = 0.05;
 
-    // Kolory warstw dla L: niebieski -> czerwony -> niebieski
-    let left_colors = [
-        (0, 100, 200),    // Niebieski (warstwa 0)
-        (200, 50, 50),    // Czerwony (warstwa 1)
-        (0, 100, 200),    // Niebieski (warstwa 2)
-    ];
+    let thickness = stereo_arc_thickness(r, lt);
+    let arc_r = r + 4.0 + thickness * 0.5;
 
-    // Kolory warstw dla R: zielony -> żółty -> zielony
-    let right_colors = [
-        (50, 150, 50),    // Zielony (warstwa 0)
-        (200, 180, 30),   // Żółty (warstwa 1)
-        (50, 150, 50),    // Zielony (warstwa 2)
-    ];
+    let point_at = |deg: f32, radius: f32| center + screen_direction(deg) * radius;
 
-    // Lewy słupek (L) — po lewej stronie radaru
-    let left_x = center.x - spacing - bar_width;
-    let left_top = center.y - bar_height / 2.0;
-    let bg = Color32::from_rgba_unmultiplied(255, 255, 255, (30.0 * fg) as u8);
-    canvas.rect_filled(
-        egui::Rect::from_min_size(Pos2::new(left_x, left_top), Vec2::new(bar_width, bar_height)),
-        2.0,
-        bg,
-    );
+    let stroke_arc = |mid_deg: f32, half_span: f32, radius: f32, stroke: Stroke| {
+        if half_span <= 0.0 {
+            return;
+        }
+        let steps = ((2.0 * half_span) / STEP_DEG).ceil().max(1.0) as usize;
+        let start = mid_deg - half_span;
+        let step = 2.0 * half_span / steps as f32;
+        let mut prev = point_at(start, radius);
+        for i in 1..=steps {
+            let next = point_at(start + step * i as f32, radius);
+            canvas.line_segment([prev, next], stroke);
+            prev = next;
+        }
+    };
 
-    // Rysuj warstwy dla lewego słupka
-    let mut accumulated_height = 0.0;
-    for (layer_idx, &energy) in left_history.iter().enumerate() {
-        let layer_height = bar_height * energy.clamp(0.0, 1.0);
-        let (r_color, g_color, b_color) = left_colors[layer_idx % left_colors.len()];
-        let color = Color32::from_rgba_unmultiplied(r_color, g_color, b_color, (220.0 * fg) as u8);
-
-        canvas.rect_filled(
-            egui::Rect::from_min_size(
-                Pos2::new(left_x, left_top + bar_height - accumulated_height - layer_height),
-                Vec2::new(bar_width, layer_height),
-            ),
-            2.0,
-            color,
-        );
-        accumulated_height += layer_height;
-    }
-
-    // Prawy słupek (R) — po prawej stronie radaru
-    let right_x = center.x + spacing;
-    let right_top = center.y - bar_height / 2.0;
-    canvas.rect_filled(
-        egui::Rect::from_min_size(Pos2::new(right_x, right_top), Vec2::new(bar_width, bar_height)),
-        2.0,
-        bg,
-    );
-
-    // Rysuj warstwy dla prawego słupka
-    accumulated_height = 0.0;
-    for (layer_idx, &energy) in right_history.iter().enumerate() {
-        let layer_height = bar_height * energy.clamp(0.0, 1.0);
-        let (r_color, g_color, b_color) = right_colors[layer_idx % right_colors.len()];
-        let color = Color32::from_rgba_unmultiplied(r_color, g_color, b_color, (220.0 * fg) as u8);
-
-        canvas.rect_filled(
-            egui::Rect::from_min_size(
-                Pos2::new(right_x, right_top + bar_height - accumulated_height - layer_height),
-                Vec2::new(bar_width, layer_height),
-            ),
-            2.0,
-            color,
-        );
-        accumulated_height += layer_height;
-    }
-
-    // Etykiety L i R
-    let font = FontId::proportional((bar_width * 1.5).clamp(8.0, 12.0));
-    let label_color = Color32::from_rgba_unmultiplied(255, 255, 255, (180.0 * fg) as u8);
-    canvas.text(
-        Pos2::new(left_x + bar_width / 2.0, left_top - 12.0),
-        egui::Align2::CENTER_BOTTOM,
-        "L",
-        font.clone(),
-        label_color,
-    );
-    canvas.text(
-        Pos2::new(right_x + bar_width / 2.0, right_top - 12.0),
-        egui::Align2::CENTER_BOTTOM,
-        "R",
-        font.clone(),
-        label_color,
-    );
-
-    // Wskaźnik porównania L vs R — pasek między słupkami
     let left_energy = left_history.back().copied().unwrap_or(0.0);
     let right_energy = right_history.back().copied().unwrap_or(0.0);
 
-    let bar_center_x = center.x;
+    let channels = [
+        (270.0_f32, left_history, (0u8, 150u8, 255u8), "L", left_energy - right_energy > DOMINANCE_MARGIN),
+        (90.0_f32, right_history, (100u8, 200u8, 50u8), "R", right_energy - left_energy > DOMINANCE_MARGIN),
+    ];
 
-    // Zmień wymiary na znacznie większe
-    let indicator_y = center.y + bar_height / 2.0 + 16.0;
-    let indicator_width = spacing * 2.2;
-    let indicator_height = 28.0;
+    for (mid_deg, history, rgb, label, dominant) in channels {
+        let energy = history.back().copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let peak = history.iter().copied().fold(0.0_f32, f32::max).clamp(0.0, 1.0);
+        let rgba = |a: f32| Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, (a * fg).clamp(0.0, 255.0) as u8);
 
-    // Zmień tło na bardziej widoczne
-    let indicator_bg = Color32::from_rgba_unmultiplied(30, 30, 30, (180.0 * fg) as u8);
-    canvas.rect_filled(
-        egui::Rect::from_min_size(
-            Pos2::new(bar_center_x - indicator_width / 2.0, indicator_y),
-            Vec2::new(indicator_width, indicator_height),
-        ),
-        6.0,
-        indicator_bg,
-    );
+        stroke_arc(mid_deg, MAX_HALF_SPAN_DEG, arc_r, Stroke::new(thickness, rgba(28.0)));
 
-    // Oblicz którą stronę wypełnić
-    let energy_diff = (left_energy - right_energy).clamp(-1.0, 1.0);
+        let half_span = MAX_HALF_SPAN_DEG * energy;
+        stroke_arc(mid_deg, half_span, arc_r, Stroke::new(thickness * 2.2, rgba(40.0 + 60.0 * energy)));
+        if dominant {
+            let outline = Color32::from_rgba_unmultiplied(255, 40, 40, (230.0 * fg) as u8);
+            stroke_arc(mid_deg, half_span, arc_r, Stroke::new(thickness + 4.0, outline));
+        }
+        stroke_arc(mid_deg, half_span, arc_r, Stroke::new(thickness, rgba(110.0 + 145.0 * energy)));
 
-    // Wypełnienie wskaźnika (lewe lub prawe, w zależności od L vs R)
-    if energy_diff > 0.05 {
-        // L > R — wypełniamy od lewej (jasny niebieski)
-        let fill_width = (indicator_width / 2.0) * (energy_diff / 1.0);
-        let left_color = Color32::from_rgba_unmultiplied(0, 150, 255, (255.0 * fg) as u8);
-        canvas.rect_filled(
-            egui::Rect::from_min_size(
-                Pos2::new(bar_center_x - indicator_width / 2.0, indicator_y),
-                Vec2::new(fill_width, indicator_height),
-            ),
-            6.0,
-            left_color,
-        );
-    } else if energy_diff < -0.05 {
-        // R > L — wypełniamy od prawej (jasny zielony)
-        let fill_width = (indicator_width / 2.0) * (-energy_diff / 1.0);
-        let right_color = Color32::from_rgba_unmultiplied(100, 200, 50, (255.0 * fg) as u8);
-        canvas.rect_filled(
-            egui::Rect::from_min_size(
-                Pos2::new(bar_center_x + indicator_width / 2.0 - fill_width, indicator_y),
-                Vec2::new(fill_width, indicator_height),
-            ),
-            6.0,
-            right_color,
-        );
-    } else {
-        // Prawie równe — pół niebieskiego (L) i pół zielonego (R)
-        let left_color = Color32::from_rgba_unmultiplied(0, 150, 255, (255.0 * fg) as u8);
-        let right_color = Color32::from_rgba_unmultiplied(100, 200, 50, (255.0 * fg) as u8);
+        if peak > 0.02 {
+            let peak_span = MAX_HALF_SPAN_DEG * peak;
+            let tick = Stroke::new(1.5 * lt.max(0.5), rgba(230.0));
+            for deg in [mid_deg - peak_span, mid_deg + peak_span] {
+                canvas.line_segment(
+                    [point_at(deg, arc_r - thickness), point_at(deg, arc_r + thickness)],
+                    tick,
+                );
+            }
+        }
 
-        // Lewa połowa — niebieski (L)
-        canvas.rect_filled(
-            egui::Rect::from_min_size(
-                Pos2::new(bar_center_x - indicator_width / 2.0, indicator_y),
-                Vec2::new(indicator_width / 2.0, indicator_height),
-            ),
-            6.0,
-            left_color,
-        );
-
-        // Prawa połowa — zielony (R)
-        canvas.rect_filled(
-            egui::Rect::from_min_size(
-                Pos2::new(bar_center_x, indicator_y),
-                Vec2::new(indicator_width / 2.0, indicator_height),
-            ),
-            6.0,
-            right_color,
+        let font = FontId::proportional((thickness * 1.8).clamp(10.0, 14.0));
+        canvas.text(
+            point_at(mid_deg, arc_r + thickness + 8.0),
+            Align2::CENTER_CENTER,
+            label,
+            font,
+            rgba(120.0 + 135.0 * energy),
         );
     }
-
-    // Obramowanie dla kontrastu
-    let outline_color = Color32::from_rgba_unmultiplied(150, 150, 150, (200.0 * fg) as u8);
-    canvas.circle_stroke(
-        Pos2::new(bar_center_x, indicator_y + indicator_height / 2.0),
-        indicator_width / 2.0 + 2.0,
-        Stroke::new(2.5, outline_color),
-    );
 }
 
 // ── Drugi tryb wizualizacji: poświaty na krawędzi ekranu ──────────────────────

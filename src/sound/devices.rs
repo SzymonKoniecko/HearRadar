@@ -107,6 +107,10 @@ pub struct RadarConfig {
     /// tarczy (patrz `HearRadarApp::ui_overlay_contents`).
     #[serde(default)]
     pub edge_glow_enabled: bool,
+    /// Rozróżnienie układu: 2.0 dostaje łuki L/R, 5.1/7.1 pierścień kropek
+    /// w pozycjach głośników i etykietę układu. Wyłączone = dawny wygląd.
+    #[serde(default)]
+    pub speaker_layout_view: bool,
     /// Mnożnik grubości WSZYSTKICH linii rysowanych na radarze (okręgi skali,
     /// krzyż kierunków, sektory 7.1, obrys kropek/wskaźników) — `1.0`
     /// odtwarza dawne, sztywne szerokości linii z `radar_egui::draw_radar`.
@@ -176,6 +180,7 @@ impl Default for RadarConfig {
             mono_boost_db: 0.0,
             radar_sensitivity: default_radar_sensitivity(),
             edge_glow_enabled: false,
+            speaker_layout_view: false,
             line_thickness: default_line_thickness(),
             mono_cue_style: MonoCueStyle::default(),
             direction_contrast_enabled: false,
