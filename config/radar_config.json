@@ -1,5 +1,5 @@
 {
-  "anchor_x": 0.52,
+  "anchor_x": 0.5,
   "anchor_y": 1.0,
   "radius": 125.0,
   "bg_alpha": 0.56,
@@ -65,7 +65,7 @@
     }
   ],
   "overlay_click_through": true,
-  "mono_boost_db": 5.0,
+  "mono_boost_db": 1.0,
   "radar_sensitivity": 17.5,
   "edge_glow_enabled": false,
   "line_thickness": 1.0,
