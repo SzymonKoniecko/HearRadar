@@ -47,6 +47,12 @@ fn band_energy(channel_samples: &[f32], sample_rate: f32, freq_min: f32, freq_ma
     if channel_samples.is_empty() || sample_rate <= 0.0 {
         return 0.0;
     }
+    // Pusty albo odwrócony zakres (min >= max) to błąd konfiguracji. Bez tego
+    // różnica dwóch filtrów dawałaby niezerową energię "z niczego" i taka
+    // reguła mogłaby wygrywać kolor kropek — traktujemy ją jak nieaktywną.
+    if freq_max <= freq_min {
+        return 0.0;
+    }
     let low_cut = one_pole_lowpass(channel_samples, sample_rate, freq_max.max(1.0));
     if freq_min <= 0.0 {
         return rms(&low_cut);
@@ -371,5 +377,21 @@ mod tests {
         for pair in rules.windows(2) {
             assert_eq!(pair[0].freq_max, pair[1].freq_min, "luka/nakładka między domyślnymi pasmami");
         }
+    }
+
+    #[test]
+    fn inverted_or_empty_range_never_produces_energy() {
+        // Regresja: reguła z min >= max dawała niezerową energię (różnica dwóch
+        // filtrów), więc mogła wygrywać kolor kropek mimo że nic nie słychać.
+        let sample_rate = 48_000.0;
+        let samples: Vec<f32> = (0..4800)
+            .map(|i| (i as f32 / sample_rate * TAU * 1000.0).sin())
+            .collect();
+        let rules = vec![
+            ColorRule::new(5000.0, 200.0, [1, 0, 0]),
+            ColorRule::new(1000.0, 1000.0, [2, 0, 0]),
+        ];
+        let energies = rule_energies(&samples, sample_rate, &rules);
+        assert_eq!(energies, vec![0.0, 0.0]);
     }
 }

@@ -59,17 +59,12 @@ impl RadarCanvas for Painter {
 #[repr(u8)]
 pub enum TestScenario {
     Off         = 0,
-    FullCircle  = 1,
-    AllSilent   = 2,
-    HalfLoud    = 3,
     Sine        = 4,
     SinglePulse = 5,
-    RampUp      = 6,
-    Noise       = 7,
     /// Dwa DOKŁADNIE przeciwstawne kanały (SL/SR, 180° od siebie), pulsujące
     /// RÓWNOCZEŚNIE z podobną energią — dokładny przypadek, w którym dawny,
     /// pojedynczy sumaryczny wskaźnik kierunku (suma wektorowa wszystkich
-    /// kanałów, patrz `direction::compute_direction`) dawał `sum≈0` i mylącą,
+    /// kanałów) dawał `sum≈0` i mylącą,
     /// zanikającą strzałkę "z przodu", mimo że oba źródła realnie grają
     /// (np. silnik z lewej + wybuch z prawej). Powinien pokazać DWA osobne,
     /// niezależne wskaźniki kierunku naraz — po jednym na stronę.
@@ -87,60 +82,32 @@ pub enum TestScenario {
 impl TestScenario {
     pub const ALL: &'static [Self] = &[
         Self::Off,
-        Self::FullCircle,
-        Self::AllSilent,
-        Self::HalfLoud,
         Self::Sine,
         Self::SinglePulse,
-        Self::RampUp,
-        Self::Noise,
         Self::OpposingSources,
         Self::Tone,
     ];
 
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::FullCircle,
-            2 => Self::AllSilent,
-            3 => Self::HalfLoud,
-            4 => Self::Sine,
-            5 => Self::SinglePulse,
-            6 => Self::RampUp,
-            7 => Self::Noise,
-            8 => Self::OpposingSources,
-            9 => Self::Tone,
-            _ => Self::Off,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Off         => "🎙 Live audio",
-            Self::FullCircle  => "⬤ Wszystkie kanały (max)",
-            Self::AllSilent   => "· Cisza (min)",
-            Self::HalfLoud    => "◑ Połowa kanałów",
             Self::Sine        => "∿ Sinusoida (rotacja)",
             Self::SinglePulse => "▲ Pojedynczy impuls (transient)",
-            Self::RampUp      => "/ Klin rosnący",
-            Self::Noise       => "≋ Szum losowy (seed)",
             Self::OpposingSources => "⇄ Dwa przeciwstawne źródła naraz",
             Self::Tone        => "🎵 Ton o zadanym Hz (kolor pasma)",
         }
     }
 
     /// Zwraca symulowany RMS dla każdego z `channels` kanałów, w danej fazie.
-    /// `seed` różnicuje/odtwarza deterministycznie scenariusze losowe
-    /// (`Noise`) i cykliczne (`SinglePulse`) — ten sam `seed` zawsze da ten
-    /// sam przebieg, więc łatwiej porównywać zmiany w renderowaniu.
+    /// `seed` decyduje, który kanał dostaje cykliczny impuls w `SinglePulse` —
+    /// ten sam `seed` zawsze da ten sam przebieg, więc łatwiej porównywać
+    /// zmiany w renderowaniu.
     pub fn generate(self, channels: usize, phase: f32, seed: u32) -> Vec<f32> {
         (0..channels)
             .map(|i| {
                 let t = i as f32 / channels.max(1) as f32;
                 match self {
                     Self::Off         => 0.0,
-                    Self::FullCircle  => 0.9,
-                    Self::AllSilent   => 0.02,
-                    Self::HalfLoud    => if i % 2 == 0 { 0.9 } else { 0.02 },
                     Self::Sine        => ((phase - t * std::f32::consts::TAU).sin() * 0.5 + 0.5).clamp(0.0, 1.0),
                     Self::SinglePulse => {
                         // Krótki, cykliczny impuls na jednym kanale na raz — pokazuje
@@ -148,13 +115,6 @@ impl TestScenario {
                         let active = ((phase * 0.5) as usize + seed as usize) % channels;
                         let just_fired = (phase * 8.0).fract() < 0.15;
                         if i == active && just_fired { 1.0 } else { 0.02 }
-                    }
-                    Self::RampUp      => (phase.fract() * (i as f32 + 1.0) / channels as f32).clamp(0.0, 1.0),
-                    Self::Noise       => {
-                        let s  = (i as u32).wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                        let s  = s.wrapping_add(seed.wrapping_mul(2_654_435_761));
-                        let s2 = s.wrapping_add((phase * 1000.0) as u32);
-                        s2 as f32 / u32::MAX as f32
                     }
                     Self::OpposingSources => {
                         // SL i SR leżą dokładnie naprzeciw siebie (-90°/90°) —
@@ -414,7 +374,13 @@ impl RadarState {
 
 // ── Główna funkcja rysująca ───────────────────────────────────────────────────
 
-const LABELS: [&str; 4] = ["PRZÓD", "PRAWO", "TYŁ", "LEWO"];
+/// Kolor obrysu dominującego kanału (łuk L/R i głośnik w pierścieniu). Czerwień
+/// celowo nie jest w paletach użytkownika (patrz `RadarConfig::stereo_left_color`).
+const DOMINANT_OUTLINE_RGB: (u8, u8, u8) = (255, 40, 40);
+
+/// Ile energii (0.0..=1.0) jeden kanał musi przewyższać drugi, żeby zostać
+/// uznanym za dominujący i dostać czerwony obrys.
+const DOMINANCE_MARGIN: f32 = 0.05;
 
 /// Rysuje minimalistyczny radar audio: tło, okręgi skali, krzyż kierunków,
 /// opcjonalne sektory 7.1, kropki kanałów (z zanikiem w czasie), osobny
@@ -494,21 +460,6 @@ pub fn draw_radar<C: RadarCanvas>(
         }
 
         canvas.circle_filled(center, 2.5, with_alpha(c_center, fg));
-
-        // Etykiety kierunków (tryb z etykietami) — bez nich radar jest w pełni minimalny.
-        if cfg.show_labels {
-            let font = FontId::proportional((r * 0.09).clamp(9.0, 14.0));
-            let label_color = with_alpha(c_ring, fg);
-            let positions = [
-                center - Vec2::new(0.0, r + 12.0), // PRZÓD
-                center + Vec2::new(r + 6.0, 0.0),  // PRAWO
-                center + Vec2::new(0.0, r + 12.0), // TYŁ
-                center - Vec2::new(r + 6.0, 0.0),  // LEWO
-            ];
-            for (label, pos) in LABELS.iter().zip(positions.iter()) {
-                canvas.text(*pos, egui::Align2::CENTER_CENTER, *label, font.clone(), label_color);
-            }
-        }
 
         // Kropki kanałów
         for (i, dots) in state.dots.iter().enumerate() {
@@ -597,17 +548,6 @@ pub fn draw_radar<C: RadarCanvas>(
             let marker_r = (intensity * r).clamp(10.0, r);
             let pos = center + dir * marker_r;
 
-            crate::dlog!(
-                "[marker-pos] angle={:.1}° age={:.2}s life={:.2} x={:.1} y={:.1} (center=({:.1},{:.1}))",
-                marker.angle_deg,
-                age,
-                life,
-                pos.x,
-                pos.y,
-                center.x,
-                center.y
-            );
-
             let alpha = ((intensity * 0.6 + 0.4) * 255.0 * fg * alpha_frac).clamp(0.0, 255.0) as u8;
             let beacon_color =
                 Color32::from_rgba_unmultiplied(beacon_rgb.0, beacon_rgb.1, beacon_rgb.2, alpha);
@@ -639,6 +579,8 @@ pub fn draw_radar<C: RadarCanvas>(
                 r,
                 &state.stereo_left_history,
                 &state.stereo_right_history,
+                cfg.stereo_left_color,
+                cfg.stereo_right_color,
                 fg,
                 lt,
             );
@@ -672,6 +614,7 @@ fn draw_lfe_indicator<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, level: f
 }
 
 /// Pierścień kropek w pozycjach głośników 5.1/7.1; jasność każdej = poziom jej kanału.
+/// Dominujący głośnik (patrz [`dominant_speaker`]) dostaje czerwony obrys.
 fn draw_speaker_ring<C: RadarCanvas>(
     canvas: &C,
     center: Pos2,
@@ -683,20 +626,53 @@ fn draw_speaker_ring<C: RadarCanvas>(
 ) {
     let ring_r = r + 14.0;
     let lt = lt.max(0.5);
+    let dominant = dominant_speaker(layout, levels);
     for (i, role) in layout.iter().enumerate() {
         let Some(angle) = role.radar_angle_degrees() else {
             continue;
         };
         let level = levels.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         let pos = center + screen_direction(angle) * ring_r;
+        let dot_r = 3.5 * lt + 2.0 * level;
         let fill = Color32::from_rgba_unmultiplied(0, 255, 157, ((60.0 + 195.0 * level) * fg) as u8);
-        canvas.circle_filled(pos, 3.5 * lt + 2.0 * level, fill);
+        canvas.circle_filled(pos, dot_r, fill);
         canvas.circle_stroke(
             pos,
-            3.5 * lt + 2.0 * level + 1.5,
+            dot_r + 1.5,
             Stroke::new(1.0 * lt, Color32::from_rgba_unmultiplied(0, 255, 157, (90.0 * fg) as u8)),
         );
+        if dominant == Some(i) {
+            let (ro, go, bo) = DOMINANT_OUTLINE_RGB;
+            let outline = Color32::from_rgba_unmultiplied(ro, go, bo, (230.0 * fg) as u8);
+            canvas.circle_stroke(pos, dot_r + 4.0, Stroke::new(2.0 * lt, outline));
+        }
     }
+}
+
+/// Indeks dominującego głośnika w pierścieniu 5.1/7.1: ten kanał kierunkowy,
+/// którego poziom wyraźnie (o więcej niż [`DOMINANCE_MARGIN`]) przewyższa
+/// drugi najgłośniejszy. LFE pomijany (nie ma pozycji). `None`, gdy nikt nie
+/// dominuje albo sygnał jest zbyt cichy, żeby go oceniać.
+fn dominant_speaker(layout: &[ChannelRole], levels: &[f32]) -> Option<usize> {
+    const MIN_LEVEL: f32 = 0.05;
+    let mut best: Option<(usize, f32)> = None;
+    let mut second = 0.0f32;
+    for (i, role) in layout.iter().enumerate() {
+        if role.radar_angle_degrees().is_none() {
+            continue;
+        }
+        let level = levels.get(i).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        match best {
+            Some((_, top)) if level <= top => second = second.max(level),
+            Some((_, top)) => {
+                second = second.max(top);
+                best = Some((i, level));
+            }
+            None => best = Some((i, level)),
+        }
+    }
+    let (idx, top) = best?;
+    (top >= MIN_LEVEL && top - second > DOMINANCE_MARGIN).then_some(idx)
 }
 
 fn stereo_arc_thickness(r: f32, lt: f32) -> f32 {
@@ -711,12 +687,13 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     r: f32,
     left_history: &VecDeque<f32>,
     right_history: &VecDeque<f32>,
+    left_rgb: [u8; 3],
+    right_rgb: [u8; 3],
     fg: f32,
     lt: f32,
 ) {
     const MAX_HALF_SPAN_DEG: f32 = 70.0;
     const STEP_DEG: f32 = 3.0;
-    const DOMINANCE_MARGIN: f32 = 0.05;
 
     let thickness = stereo_arc_thickness(r, lt);
     let arc_r = r + 4.0 + thickness * 0.5;
@@ -742,21 +719,22 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     let right_energy = right_history.back().copied().unwrap_or(0.0);
 
     let channels = [
-        (270.0_f32, left_history, (0u8, 150u8, 255u8), "L", left_energy - right_energy > DOMINANCE_MARGIN),
-        (90.0_f32, right_history, (100u8, 200u8, 50u8), "R", right_energy - left_energy > DOMINANCE_MARGIN),
+        (270.0_f32, left_history, left_rgb, "L", left_energy - right_energy > DOMINANCE_MARGIN),
+        (90.0_f32, right_history, right_rgb, "R", right_energy - left_energy > DOMINANCE_MARGIN),
     ];
 
     for (mid_deg, history, rgb, label, dominant) in channels {
         let energy = history.back().copied().unwrap_or(0.0).clamp(0.0, 1.0);
         let peak = history.iter().copied().fold(0.0_f32, f32::max).clamp(0.0, 1.0);
-        let rgba = |a: f32| Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, (a * fg).clamp(0.0, 255.0) as u8);
+        let rgba = |a: f32| Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], (a * fg).clamp(0.0, 255.0) as u8);
 
         stroke_arc(mid_deg, MAX_HALF_SPAN_DEG, arc_r, Stroke::new(thickness, rgba(28.0)));
 
         let half_span = MAX_HALF_SPAN_DEG * energy;
         stroke_arc(mid_deg, half_span, arc_r, Stroke::new(thickness * 2.2, rgba(40.0 + 60.0 * energy)));
         if dominant {
-            let outline = Color32::from_rgba_unmultiplied(255, 40, 40, (230.0 * fg) as u8);
+            let (ro, go, bo) = DOMINANT_OUTLINE_RGB;
+            let outline = Color32::from_rgba_unmultiplied(ro, go, bo, (230.0 * fg) as u8);
             stroke_arc(mid_deg, half_span, arc_r, Stroke::new(thickness + 4.0, outline));
         }
         stroke_arc(mid_deg, half_span, arc_r, Stroke::new(thickness, rgba(110.0 + 145.0 * energy)));
@@ -903,5 +881,21 @@ pub fn draw_edge_glow_indicators<C: RadarCanvas>(
         let dir = screen_direction(marker.angle_deg);
         let (point, vertical_edge) = edge_intersection(screen_rect, dir);
         draw_edge_glow_at(canvas, screen_rect, point, vertical_edge, rgb, strength, fg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dominant_speaker_needs_a_clear_gap_over_the_second_loudest() {
+        let layout = channel_layout(6); // FL, FR, C, LFE, RL, RR
+        // Wyraźnie głośny FL, reszta cicho → FL dominuje (LFE pomijany).
+        assert_eq!(dominant_speaker(layout, &[0.6, 0.1, 0.1, 0.9, 0.1, 0.1]), Some(0));
+        // Dwa równe, głośne kanały → nikt nie dominuje.
+        assert_eq!(dominant_speaker(layout, &[0.5, 0.5, 0.1, 0.9, 0.1, 0.1]), None);
+        // Cisza poniżej progu → brak obrysu.
+        assert_eq!(dominant_speaker(layout, &[0.01, 0.0, 0.0, 0.0, 0.0, 0.0]), None);
     }
 }

@@ -5,7 +5,6 @@ use cpal::{
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sound::direction::{self, analyze_channels};
 use crate::sound::sample_logger;
@@ -60,8 +59,6 @@ pub struct RadarConfig {
     pub bg_alpha: f32,
     /// Ogólny mnożnik przezroczystości linii i kropek (0.0 .. 1.0).
     pub fg_alpha: f32,
-    /// Tryb z etykietami (PRZÓD/TYŁ/LEWO/PRAWO + legenda) zamiast minimalnego.
-    pub show_labels: bool,
     /// Tryb wysokiego kontrastu — paleta monochromatyczna zamiast kolorowej.
     pub high_contrast: bool,
     /// Czas zanikania pojedynczej kropki w sekundach (1.0 .. 3.0) — efekt
@@ -86,6 +83,12 @@ pub struct RadarConfig {
     /// samym WYJŚCIU dźwięku (patrz `mono_router::db_to_linear`).
     #[serde(default)]
     pub mono_boost_db: f32,
+    /// Korekcja barwy sygnału mono na wyjściu, w decybelach: dodatnie = jaśniej
+    /// (wysokie w górę, bas w dół), ujemne = ciemniej/cieplej (bas w górę,
+    /// wysokie w dół), 0.0 = bez zmian. To pochylenie widma wokół
+    /// `mono_router::TONE_CROSSOVER_HZ`, a NIE zmiana wysokości dźwięku (pitch).
+    #[serde(default)]
+    pub mono_tone_db: f32,
     /// Czułość radaru — mnożnik RMS każdego kanału przed przeliczeniem na
     /// odległość/rozmiar kropki od środka tarczy (patrz
     /// `radar_egui::RadarState::update`). Wyżej = ciche dźwięki wyglądają na
@@ -111,6 +114,13 @@ pub struct RadarConfig {
     /// w pozycjach głośników i etykietę układu. Wyłączone = dawny wygląd.
     #[serde(default)]
     pub speaker_layout_view: bool,
+    /// Kolor łuku kanału lewego (2.0). Czerwień celowo poza listą wyboru —
+    /// jest zarezerwowana na obrys dominującego kanału.
+    #[serde(default = "default_stereo_left_color")]
+    pub stereo_left_color: [u8; 3],
+    /// Kolor łuku kanału prawego (2.0), patrz `stereo_left_color`.
+    #[serde(default = "default_stereo_right_color")]
+    pub stereo_right_color: [u8; 3],
     /// Mnożnik grubości WSZYSTKICH linii rysowanych na radarze (okręgi skali,
     /// krzyż kierunków, sektory 7.1, obrys kropek/wskaźników) — `1.0`
     /// odtwarza dawne, sztywne szerokości linii z `radar_egui::draw_radar`.
@@ -152,10 +162,6 @@ fn default_overlay_click_through() -> bool {
     true
 }
 
-fn default_show_channel_dots() -> bool {
-    true
-}
-
 fn default_radar_sensitivity() -> f32 {
     crate::sound::direction::INTENSITY_SCALE
 }
@@ -163,6 +169,23 @@ fn default_radar_sensitivity() -> f32 {
 fn default_line_thickness() -> f32 {
     1.0
 }
+
+fn default_stereo_left_color() -> [u8; 3] {
+    [0, 150, 255]
+}
+
+fn default_stereo_right_color() -> [u8; 3] {
+    [100, 200, 50]
+}
+
+pub const STEREO_COLOR_PRESETS: &[(&str, [u8; 3])] = &[
+    ("Niebieski", [0, 150, 255]),
+    ("Zielony", [100, 200, 50]),
+    ("Cyjan", [0, 220, 220]),
+    ("Żółty", [255, 230, 60]),
+    ("Fioletowy", [180, 40, 200]),
+    ("Biały", [255, 255, 255]),
+];
 
 impl Default for RadarConfig {
     fn default() -> Self {
@@ -172,15 +195,17 @@ impl Default for RadarConfig {
             radius:   125.0,
             bg_alpha: 0.82,
             fg_alpha: 1.0,
-            show_labels: false,
             high_contrast: false,
             decay_secs: 2.5,
             color_rules: spectrum::default_color_rules(),
             overlay_click_through: true,
             mono_boost_db: 0.0,
+            mono_tone_db: 0.0,
             radar_sensitivity: default_radar_sensitivity(),
             edge_glow_enabled: false,
             speaker_layout_view: false,
+            stereo_left_color: default_stereo_left_color(),
+            stereo_right_color: default_stereo_right_color(),
             line_thickness: default_line_thickness(),
             mono_cue_style: MonoCueStyle::default(),
             direction_contrast_enabled: false,
@@ -290,8 +315,6 @@ pub struct DirectionEvent {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioAnalysis {
-    pub peak_l: f32,
-    pub peak_r: f32,
     /// Poziom RMS każdego kanału z ostatniej ramki analizy (patrz
     /// [`crate::sound::direction::analyze_channels`]) — jedna wartość na
     /// kanał, w kolejności zgodnej z układem głośnikowym danego strumienia.
@@ -341,11 +364,6 @@ const TARGET_RING_LATENCY_SAMPLES: usize = 2_400;
 /// dryfu. ~150ms przy 48kHz — trzykrotność celu, żeby nie przycinać przy
 /// zwykłym, chwilowym jitterze.
 const RING_TRIM_THRESHOLD_SAMPLES: usize = TARGET_RING_LATENCY_SAMPLES * 3;
-
-/// Licznik do przerzedzenia diagnostycznego logu głębokości `mono_ring` w
-/// [`SharedAudioAnalysis::push_stereo_pan`] — bez tego logowalibyśmy co
-/// callback (co ~10ms), zalewając `debug.log`.
-static PUSH_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct SharedAudioAnalysis {
@@ -437,15 +455,6 @@ impl SharedAudioAnalysis {
                 for _ in 0..excess {
                     ring.pop_front();
                 }
-                crate::dlog!(
-                    "[mono_ring] przycięto {excess} próbek (wejście trwale wyprzedzało wyjście) -> {} (~{:.0}ms @48kHz)",
-                    ring.len(),
-                    ring.len() as f32 / 48.0
-                );
-            }
-            let n = PUSH_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-            if n % 200 == 0 {
-                crate::dlog!("[mono_ring] depth={} (~{:.0}ms @48kHz)", ring.len(), ring.len() as f32 / 48.0);
             }
         }
     }
@@ -715,58 +724,6 @@ pub fn find_stereo_mix_device() -> Option<String> {
     None
 }
 
-/// Zwraca opis instrukcji do włączenia Stereo Mix na Windowsie 11.
-pub fn get_stereo_mix_setup_instructions() -> &'static str {
-    r#"
-WŁĄCZENIE STEREO MIX NA WINDOWS 11
-===================================
-
-Aby nasłuchiwać dźwięku bezpośrednio z gry (zamiast mikrofonu), musisz włączyć "Stereo Mix":
-
-METODA 1: Ustawienia Windows 11 (Główna)
------------
-1. START → Ustawienia (Settings)
-2. System (po lewej)
-3. Dźwięk (Sound)
-4. Przewiń w dół
-5. "Mikser głośności" (Volume mixer)
-6. Szukaj "Stereo Mix" na liście
-   - Jeśli nie widać: przewiń do góry → "Pokaż wyłączone urządzenia"
-   - Kliknij na "Stereo Mix" → Enable
-
-METODA 2: Dla kart NVIDIA (szybsze)
------------
-1. Kliknij prawo na pulpicie → NVIDIA Control Panel
-   (Lub: Win + X → Device Manager → Display adapters → Prawa kliawisz na NVIDIA → Open NVIDIA Control Panel)
-2. Po lewej: Audio
-3. Zaznacz "Enable Stereo Mix"
-4. Apply
-
-METODA 3: Zarządzanie Urządzeniami (Device Manager)
------------
-1. Wciśnij: Win + X → Device Manager
-2. Rozwiń "Sound, video and game controllers"
-3. Szukaj "Stereo Mix"
-4. Jeśli jest wyłączone (szara ikona) → kliknij prawo → Enable
-
-ROZWIĄZYWANIE PROBLEMÓW
------------
-Problem: "Stereo Mix" nie pojawia się nigdzie
-Rozwiązanie: Pobierz nowe sterowniki karty dźwiękowej ze strony producenta
-  - NVIDIA: https://www.nvidia.com/Download/driverDetails.aspx
-  - Realtek: https://www.realtek.com/en/component/zoo/category/pc-audio-codecs
-  - AMD: https://www.amd.com/en/support
-
-Problem: "Stereo Mix" jest nieaktywny (szary)
-Rozwiązanie:
-  - Spróbuj metody NVIDIA Control Panel (jeśli masz NVIDIA)
-  - Lub może być wyłączone w BIOS-ie (rzadko)
-
-Po włączeniu "Stereo Mix", HearRadar powinien go znaleźć automatycznie
-w menu "Urządzenie wejściowe" - kliknij przycisk "🎵 Stereo Mix"!
-"#
-}
-
 pub fn fetch_audio_from_device(
     target_device_name: &str,
     analysis: SharedAudioAnalysis,
@@ -828,20 +785,12 @@ pub fn fetch_audio_from_device(
         channels
     );
 
-    let call_counter = Arc::new(AtomicU64::new(0));
-
     let stream = match default_config.sample_format() {
         SampleFormat::F32 => {
             let a = analysis.clone();
-            let counter = call_counter.clone();
             target_device.build_input_stream(
                 &config,
                 move |data: &[f32], _| {
-                    let n = counter.fetch_add(1, Ordering::Relaxed);
-                    if n % 200 == 0 {
-                        let peak = data.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        crate::dlog!("[audio] cb #{n} samples={} peak={peak:.4}", data.len());
-                    }
                     update_analysis(data, channels, sample_rate, &a);
                 },
                 err_fn,
@@ -850,16 +799,10 @@ pub fn fetch_audio_from_device(
         }
         SampleFormat::I16 => {
             let a = analysis.clone();
-            let counter = call_counter.clone();
             target_device.build_input_stream(
                 &config,
                 move |data: &[i16], _| {
-                    let n = counter.fetch_add(1, Ordering::Relaxed);
                     let f: Vec<f32> = data.iter().map(|&s| direction::i16_to_f32(s)).collect();
-                    if n % 200 == 0 {
-                        let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        crate::dlog!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
-                    }
                     update_analysis(&f, channels, sample_rate, &a);
                 },
                 err_fn,
@@ -868,16 +811,10 @@ pub fn fetch_audio_from_device(
         }
         SampleFormat::U16 => {
             let a = analysis.clone();
-            let counter = call_counter.clone();
             target_device.build_input_stream(
                 &config,
                 move |data: &[u16], _| {
-                    let n = counter.fetch_add(1, Ordering::Relaxed);
                     let f: Vec<f32> = data.iter().map(|&s| direction::u16_to_f32(s)).collect();
-                    if n % 200 == 0 {
-                        let peak = f.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        crate::dlog!("[audio] cb #{n} samples={} peak={peak:.4}", f.len());
-                    }
                     update_analysis(&f, channels, sample_rate, &a);
                 },
                 err_fn,
@@ -982,32 +919,7 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         }
     }
 
-    let labels = ["L", "R", "C", "LFE", "RL", "RR", "SL", "SR"];
-    let ch_str: Vec<String> = stats.rms.iter().enumerate().map(|(i, rms)| {
-        let label = labels.get(i).copied().unwrap_or("?");
-        let pct = (rms.clamp(0.0, 1.0) * 100.0).round() as u32;
-        format!("{label}:{pct}")
-    }).collect();
-    crate::dlog!("[ch] {} | onsets={}", ch_str.join(" "), direction_events.len());
-    crate::dlog!("[analysis] rms={:?}", &stats.rms);
-    // Pozycja (kąt na tarczy) i intensywność każdego wskaźnika kierunku —
-    // dokładnie to, co dostaje `RadarState::update` i zamienia na osobny,
-    // gasnący marker na radarze (patrz `ui::radar_egui::DirectionMarker`).
-    // Logowane tylko gdy coś faktycznie wykryto, żeby nie zalewać pliku
-    // pustymi liniami przy każdej ramce ciszy.
-    for event in &direction_events {
-        crate::dlog!(
-            "[onset] angle={:.1}° intensity={:.2} color=rgb({},{},{})",
-            event.angle_deg,
-            event.intensity,
-            event.color_rgb.0,
-            event.color_rgb.1,
-            event.color_rgb.2
-        );
-    }
     if let Ok(mut lock) = analysis.lock() {
-        lock.peak_l = stats.peak.first().copied().unwrap_or(0.0);
-        lock.peak_r = stats.peak.get(1).copied().unwrap_or(0.0);
         lock.channel_rms = stats.rms;
         lock.channel_count = channels;
         lock.channel_rule_energies = rule_energies;

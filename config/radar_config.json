@@ -4,7 +4,6 @@
   "radius": 125.0,
   "bg_alpha": 0.56,
   "fg_alpha": 0.88,
-  "show_labels": false,
   "high_contrast": false,
   "decay_secs": 2.55,
   "color_rules": [
@@ -65,12 +64,23 @@
     }
   ],
   "overlay_click_through": true,
-  "mono_boost_db": 7.0,
+  "mono_boost_db": 8.5,
+  "mono_tone_db": 6.5,
   "radar_sensitivity": 16.0,
   "edge_glow_enabled": false,
   "speaker_layout_view": false,
-  "line_thickness": 1.6,
-  "mono_cue_style": "Bright",
+  "stereo_left_color": [
+    0,
+    150,
+    255
+  ],
+  "stereo_right_color": [
+    100,
+    200,
+    50
+  ],
+  "line_thickness": 0.4,
+  "mono_cue_style": "Dark",
   "direction_contrast_enabled": false,
   "visualization_mode": "OnlyBars"
 }

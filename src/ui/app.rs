@@ -583,6 +583,20 @@ impl HearRadarApp {
             self.write_radar_config();
         }
 
+        // Korekcja barwy (pochylenie bas↔wysokie wokół 500 Hz) — to NIE zmiana
+        // wysokości dźwięku. Patrz `mono_router::apply_tone`.
+        if ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.mono_tone_db, -12.0..=12.0)
+                    .text("Ton (ciemniej ↔ jaśniej)")
+                    .suffix(" dB"),
+            )
+            .on_hover_text("Dodatnie: podbija wysokie i tłumi bas. Ujemne: odwrotnie. 0 = bez zmian.")
+            .changed()
+        {
+            self.write_radar_config();
+        }
+
         let is_routing = self.mono_router.is_some();
         let can_start = capturing && !self.mono_sel_out.is_empty();
         ui.add_enabled_ui(can_start || is_routing, |ui| {
@@ -650,7 +664,7 @@ impl HearRadarApp {
         ui.add_space(4.0);
         ui.add(
             egui::Slider::new(&mut self.test_seed, 0..=9999)
-                .text("Seed (Szum losowy / Pojedynczy impuls)"),
+                .text("Seed (Pojedynczy impuls)"),
         );
         ui.label("Ten sam seed zawsze daje ten sam przebieg — przydatne do porównywania zmian.");
 
@@ -768,12 +782,6 @@ impl HearRadarApp {
             .changed();
         changed |= ui
             .checkbox(
-                &mut self.radar_config.show_labels,
-                "Etykiety kierunków (PRZÓD/TYŁ/LEWO/PRAWO)",
-            )
-            .changed();
-        changed |= ui
-            .checkbox(
                 &mut self.radar_config.high_contrast,
                 "Wysoki kontrast (monochromatyczny)",
             )
@@ -796,6 +804,10 @@ impl HearRadarApp {
                 "🔈 Rozróżnij układ 2.0 / 5.1 / 7.1 (kropki głośników zamiast łuków)",
             )
             .changed();
+        ui.horizontal(|ui| {
+            changed |= stereo_color_combo(ui, "Kolor łuku L", &mut self.radar_config.stereo_left_color);
+            changed |= stereo_color_combo(ui, "Kolor łuku R", &mut self.radar_config.stereo_right_color);
+        });
 
         ui.separator();
         changed |= ui
@@ -883,14 +895,22 @@ impl HearRadarApp {
                         .changed();
                     changed |= ui.color_edit_button_srgb(&mut rule.color).changed();
 
-                    let mut label_text = rule.label.clone().unwrap_or_default();
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut label_text).desired_width(120.0))
-                        .changed()
-                    {
-                        rule.label = if label_text.is_empty() { None } else { Some(label_text) };
-                        changed = true;
-                    }
+                    // Odwrócony zakres (min >= max) jest ignorowany przez analizę
+                    // (patrz `spectrum::band_energy`) — tu tylko go oznaczamy.
+                    let inverted = rule.freq_max <= rule.freq_min;
+                    ui.horizontal(|ui| {
+                        let mut label_text = rule.label.clone().unwrap_or_default();
+                        if ui
+                            .add(egui::TextEdit::singleline(&mut label_text).desired_width(120.0))
+                            .changed()
+                        {
+                            rule.label = if label_text.is_empty() { None } else { Some(label_text) };
+                            changed = true;
+                        }
+                        if inverted {
+                            ui.colored_label(egui::Color32::from_rgb(230, 80, 80), "⚠ min ≥ max");
+                        }
+                    });
 
                     if ui.small_button("🗑").clicked() {
                         remove_index = Some(i);
@@ -918,6 +938,8 @@ impl HearRadarApp {
                 .push(spectrum::ColorRule::new(start, (start + 1000.0).min(20_000.0), [200, 200, 200]));
             changed = true;
         }
+
+        ui_frequency_strip(ui, &self.radar_config.color_rules);
 
         if self.radar_config.color_rules.is_empty() {
             ui.colored_label(
@@ -1325,6 +1347,69 @@ impl eframe::App for HearRadarApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         egui::Rgba::TRANSPARENT.to_array()
     }
+}
+
+/// Podgląd reguł na osi częstotliwości 20 Hz – 20 kHz (skala logarytmiczna,
+/// jak słuch). Każda reguła to kolorowy odcinek we własnym zakresie; nakładki
+/// rysują się kolejno (późniejsza reguła na wierzchu), a odwrócone zakresy
+/// są pomijane, tak jak w analizie.
+fn ui_frequency_strip(ui: &mut egui::Ui, rules: &[spectrum::ColorRule]) {
+    const F_MIN: f32 = 20.0;
+    const F_MAX: f32 = 20_000.0;
+    const BAR_H: f32 = 18.0;
+    const LABEL_H: f32 = 14.0;
+
+    let width = ui.available_width().max(120.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, BAR_H + LABEL_H), egui::Sense::hover());
+    let bar = egui::Rect::from_min_size(rect.min, egui::vec2(width, BAR_H));
+    let painter = ui.painter_at(rect);
+
+    let log_span = F_MAX.log10() - F_MIN.log10();
+    let x_of = |hz: f32| {
+        let t = (hz.clamp(F_MIN, F_MAX).log10() - F_MIN.log10()) / log_span;
+        bar.left() + t * bar.width()
+    };
+
+    painter.rect_filled(bar, 3.0, egui::Color32::from_gray(30));
+    for rule in rules {
+        if rule.freq_max <= rule.freq_min {
+            continue;
+        }
+        let [r, g, b] = rule.color;
+        let seg = egui::Rect::from_min_max(
+            egui::pos2(x_of(rule.freq_min), bar.top()),
+            egui::pos2(x_of(rule.freq_max), bar.bottom()),
+        );
+        painter.rect_filled(seg, 0.0, egui::Color32::from_rgb(r, g, b));
+    }
+
+    let font = egui::FontId::proportional(10.0);
+    let tick_color = egui::Color32::from_gray(150);
+    for (hz, text) in [(100.0, "100"), (1_000.0, "1k"), (10_000.0, "10k")] {
+        painter.text(
+            egui::pos2(x_of(hz), bar.bottom() + 1.0),
+            egui::Align2::CENTER_TOP,
+            text,
+            font.clone(),
+            tick_color,
+        );
+    }
+}
+
+fn stereo_color_combo(ui: &mut egui::Ui, label: &str, color: &mut [u8; 3]) -> bool {
+    let current = devices::STEREO_COLOR_PRESETS
+        .iter()
+        .find(|(_, c)| c == color)
+        .map_or("Własny", |(name, _)| *name);
+    let mut changed = false;
+    egui::ComboBox::from_label(label)
+        .selected_text(current)
+        .show_ui(ui, |ui| {
+            for (name, c) in devices::STEREO_COLOR_PRESETS {
+                changed |= ui.selectable_value(color, *c, *name).changed();
+            }
+        });
+    changed
 }
 
 fn ui_device_details(ui: &mut egui::Ui, device: Option<&SoundDevice>) {

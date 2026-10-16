@@ -205,10 +205,9 @@ impl RadarCanvas for SkiaCanvas<'_> {
     }
 
     fn text(&self, _pos: Pos2, _anchor: Align2, _text: &str, _font: FontId, _color: Color32) {
-        // tiny-skia nie ma silnika tekstu — etykiety kierunków (opcjonalne,
-        // `RadarConfig::show_labels`) są tu po prostu pomijane. Prototype:
-        // do rozważenia w przyszłości (np. przez `ab_glyph`/`fontdue`),
-        // jeśli etykiety na overlay Windows okażą się potrzebne.
+        // tiny-skia nie ma silnika tekstu — tekst (np. litery L/R przy łukach)
+        // jest tu po prostu pomijany. Do rozważenia w przyszłości (np. przez
+        // `ab_glyph`/`fontdue`), jeśli etykiety na overlay Windows okażą się potrzebne.
     }
 }
 

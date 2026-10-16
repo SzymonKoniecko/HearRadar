@@ -162,6 +162,51 @@ fn apply_cue(style: MonoCueStyle, sample: f32, sample_rate: f32, state: &mut Cue
     }
 }
 
+/// Częstotliwość podziału pasm dla korekcji tonu ([`apply_tone`]) — poniżej
+/// jest składowa "bas", powyżej "wysokie". 500 Hz leży w środku pasma, w którym
+/// słuchacz najłatwiej słyszy barwę, a nie tylko głośność.
+pub(crate) const TONE_CROSSOVER_HZ: f32 = 500.0;
+
+/// Stan korekcji tonu (filtr dolnoprzepustowy trzymany między callbackami, tak
+/// jak [`CueState`]), żeby podział na bas/wysokie nie trzaskał na granicach
+/// buforów.
+#[derive(Debug, Default, Clone, Copy)]
+struct ToneState {
+    lp: f32,
+}
+
+/// Korekcja barwy: rozdziela próbkę na składową niską (lowpass na
+/// [`TONE_CROSSOVER_HZ`]) i wysoką (reszta, `sample - low`), każdą mnoży
+/// osobnym wzmocnieniem i sumuje z powrotem. Przy obu wzmocnieniach `1.0`
+/// jest to tożsamość — dlatego korekcja w pozycji 0 dB nic nie zmienia.
+#[inline]
+fn apply_tone(sample: f32, sample_rate: f32, low_gain: f32, high_gain: f32, state: &mut ToneState) -> f32 {
+    let low = one_pole_lowpass_step(sample, sample_rate.max(1.0), TONE_CROSSOVER_HZ, &mut state.lp);
+    let high = sample - low;
+    low * low_gain + high * high_gain
+}
+
+/// Wszystko, co wpływa na brzmienie wyjścia w jednym callbacku, czytane raz
+/// z `SharedAudioAnalysis` (patrz [`read_output_settings`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OutputSettings {
+    ear: MonoEar,
+    /// Wzmocnienie liniowe (`mono_boost_db`).
+    gain: f32,
+    cue_style: MonoCueStyle,
+    /// Wzmocnienie składowej niskiej i wysokiej korekcji tonu — `1.0` obie = bez zmian.
+    tone_low_gain: f32,
+    tone_high_gain: f32,
+}
+
+impl OutputSettings {
+    /// Ustawienia bez korekcji tonu — do testów i ścieżek, którym tonu nie trzeba.
+    #[cfg(test)]
+    fn plain(ear: MonoEar, gain: f32, cue_style: MonoCueStyle) -> Self {
+        Self { ear, gain, cue_style, tone_low_gain: 1.0, tone_high_gain: 1.0 }
+    }
+}
+
 // ── Uchwyt do strumienia wyjściowego ─────────────────────────────────────────
 
 /// Trzymaj ten obiekt przy życiu tak długo, jak ma grać routing.
@@ -196,13 +241,14 @@ fn build_output_stream(
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
             let mut cue_state = CueState::default();
+            let mut tone_state = ToneState::default();
             device.build_output_stream(
                 &stream_config,
                 move |out: &mut [f32], _| {
                     let frames = out.len() / out_channels.max(1);
                     let pan = analysis.read_stereo_pan(frames);
-                    let (ear, gain, cue_style) = read_ear_and_gain(&analysis);
-                    fill_output_f32(out, &pan, out_channels, ear, gain, cue_style, sample_rate, &mut cue_state);
+                    let settings = read_output_settings(&analysis);
+                    fill_output_f32(out, &pan, out_channels, &settings, sample_rate, &mut cue_state, &mut tone_state);
                 },
                 err_fn,
                 None,
@@ -210,15 +256,16 @@ fn build_output_stream(
         }
         SampleFormat::I16 => {
             let mut cue_state = CueState::default();
+            let mut tone_state = ToneState::default();
             device.build_output_stream(
                 &stream_config,
                 move |out: &mut [i16], _| {
                     let frames = out.len() / out_channels.max(1);
                     let pan = analysis.read_stereo_pan(frames);
-                    let (ear, gain, cue_style) = read_ear_and_gain(&analysis);
+                    let settings = read_output_settings(&analysis);
                     // Konwersja f32 → i16
                     let mut tmp = vec![0.0f32; out.len()];
-                    fill_output_f32(&mut tmp, &pan, out_channels, ear, gain, cue_style, sample_rate, &mut cue_state);
+                    fill_output_f32(&mut tmp, &pan, out_channels, &settings, sample_rate, &mut cue_state, &mut tone_state);
                     for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
                         *dst = (src * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                     }
@@ -229,14 +276,15 @@ fn build_output_stream(
         }
         SampleFormat::U16 => {
             let mut cue_state = CueState::default();
+            let mut tone_state = ToneState::default();
             device.build_output_stream(
                 &stream_config,
                 move |out: &mut [u16], _| {
                     let frames = out.len() / out_channels.max(1);
                     let pan = analysis.read_stereo_pan(frames);
-                    let (ear, gain, cue_style) = read_ear_and_gain(&analysis);
+                    let settings = read_output_settings(&analysis);
                     let mut tmp = vec![0.0f32; out.len()];
-                    fill_output_f32(&mut tmp, &pan, out_channels, ear, gain, cue_style, sample_rate, &mut cue_state);
+                    fill_output_f32(&mut tmp, &pan, out_channels, &settings, sample_rate, &mut cue_state, &mut tone_state);
                     for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
                         // f32 (-1..1) → u16 (0..65535), środek = 32768
                         *dst = ((src * 0.5 + 0.5) * u16::MAX as f32)
@@ -287,15 +335,30 @@ fn soft_limit(x: f32) -> f32 {
     x.signum() * compressed
 }
 
-/// Czyta `mono_ear`, `radar_config.mono_boost_db` i
-/// `radar_config.mono_cue_style` jednym lockiem i od razu zamienia dB na
-/// mnożnik — wołane raz na każdą ramkę callbacku wyjściowego.
-fn read_ear_and_gain(analysis: &SharedAudioAnalysis) -> (MonoEar, f32, MonoCueStyle) {
-    let (ear, boost_db, cue_style) = analysis
+/// Czyta `mono_ear`, `mono_boost_db`, `mono_cue_style` i `mono_tone_db` jednym
+/// lockiem i od razu zamienia dB na mnożniki liniowe — wołane raz na każdy
+/// callback wyjściowy. Korekcja tonu rozkłada dB symetrycznie: `+x` dB na
+/// wysokich to `+x/2` na wysokich i `-x/2` na niskich (pochylenie, a nie
+/// sama głośność).
+fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
+    let (ear, boost_db, cue_style, tone_db) = analysis
         .lock()
-        .map(|g| (g.mono_ear, g.radar_config.mono_boost_db, g.radar_config.mono_cue_style))
-        .unwrap_or((MonoEar::Off, 0.0, MonoCueStyle::Off));
-    (ear, db_to_linear(boost_db), cue_style)
+        .map(|g| {
+            (
+                g.mono_ear,
+                g.radar_config.mono_boost_db,
+                g.radar_config.mono_cue_style,
+                g.radar_config.mono_tone_db,
+            )
+        })
+        .unwrap_or((MonoEar::Off, 0.0, MonoCueStyle::Off, 0.0));
+    OutputSettings {
+        ear,
+        gain: db_to_linear(boost_db),
+        cue_style,
+        tone_low_gain: db_to_linear(-tone_db * 0.5),
+        tone_high_gain: db_to_linear(tone_db * 0.5),
+    }
 }
 
 // ── Wypełnianie bufora wyjściowego ───────────────────────────────────────────
@@ -306,6 +369,9 @@ fn read_ear_and_gain(analysis: &SharedAudioAnalysis) -> (MonoEar, f32, MonoCueSt
 /// patrz [`db_to_linear`]) — dociśnięte do `-1.0..=1.0`, żeby duży boost dawał
 /// głośniej, a nie zawinięcie/trzaski przy konwersji do i16/u16 niżej w
 /// łańcuchu. Kanały poza `out_channels` są zerowane.
+///
+/// Korekcja tonu (`settings.tone_*_gain`, patrz [`apply_tone`]) działa na sumie
+/// trafiającej do słuchawki, przed wzmocnieniem i miękkim limiterem.
 ///
 /// `ear` decyduje który kanał stereo dostaje sygnał — w trybach jednousznych
 /// (`Left`/`Right`) strona PRZECIWNA do granego ucha nie jest po prostu
@@ -318,18 +384,19 @@ fn read_ear_and_gain(analysis: &SharedAudioAnalysis) -> (MonoEar, f32, MonoCueSt
 /// przeciwna gra na pełnej głośności, tak samo jak swoja, bez żadnego
 /// oznaczenia.
 #[inline]
-#[allow(clippy::too_many_arguments)]
 fn fill_output_f32(
     out: &mut [f32],
     pan: &[(f32, f32)],
     out_channels: usize,
-    ear: MonoEar,
-    gain: f32,
-    cue_style: MonoCueStyle,
+    settings: &OutputSettings,
     sample_rate: f32,
     cue_state: &mut CueState,
+    tone_state: &mut ToneState,
 ) {
     let ch = out_channels.max(1);
+    let OutputSettings { ear, gain, cue_style, tone_low_gain, tone_high_gain } = *settings;
+    let tone = |x: f32, state: &mut ToneState| apply_tone(x, sample_rate, tone_low_gain, tone_high_gain, state);
+
     for (frame_idx, frame) in out.chunks_exact_mut(ch).enumerate() {
         let (left, right) = pan.get(frame_idx).copied().unwrap_or((0.0, 0.0));
 
@@ -340,21 +407,21 @@ fn fill_output_f32(
             MonoEar::Off => { /* cisza */ }
             MonoEar::Left => {
                 let opposite = apply_cue(cue_style, right, sample_rate, cue_state);
-                frame[0] = soft_limit((left + opposite) * gain);
+                frame[0] = soft_limit(tone(left + opposite, tone_state) * gain);
             }
             MonoEar::Right if ch >= 2 => {
                 let opposite = apply_cue(cue_style, left, sample_rate, cue_state);
-                frame[1] = soft_limit((right + opposite) * gain);
+                frame[1] = soft_limit(tone(right + opposite, tone_state) * gain);
             }
             MonoEar::Right => {
                 // mono device fallback
                 let opposite = apply_cue(cue_style, left, sample_rate, cue_state);
-                frame[0] = soft_limit((right + opposite) * gain);
+                frame[0] = soft_limit(tone(right + opposite, tone_state) * gain);
             }
             MonoEar::Both => {
                 // Oba uszy już słyszą osobno lewą/prawą stronę (stereo
-                // wyjście) — bez efektu, bo cue nie jest tu potrzebne.
-                let sample = soft_limit((left + right) * gain);
+                // wyjście) — bez efektu cue, ale tonem objęty jest cały miks.
+                let sample = soft_limit(tone(left + right, tone_state) * gain);
                 frame[0] = sample;
                 if ch >= 2 {
                     frame[1] = sample;
@@ -424,7 +491,9 @@ mod tests {
         let pan_frames = vec![*pan; n];
         let mut out = vec![0.0f32; n * out_channels];
         let mut cue_state = CueState::default();
-        fill_output_f32(&mut out, &pan_frames, out_channels, ear, 1.0, cue_style, 48_000.0, &mut cue_state);
+        let mut tone_state = ToneState::default();
+        let settings = OutputSettings::plain(ear, 1.0, cue_style);
+        fill_output_f32(&mut out, &pan_frames, out_channels, &settings, 48_000.0, &mut cue_state, &mut tone_state);
         out
     }
 
@@ -631,6 +700,45 @@ mod tests {
     }
 
     #[test]
+    fn flat_tone_leaves_the_signal_unchanged() {
+        // 0 dB (oba wzmocnienia 1.0) ma być tożsamością — domyślna konfiguracja
+        // nie może zmieniać brzmienia.
+        let mut state = ToneState::default();
+        for i in 0..256 {
+            let x = if i % 2 == 0 { 0.5 } else { -0.3 };
+            let y = apply_tone(x, 48_000.0, 1.0, 1.0, &mut state);
+            assert!((y - x).abs() < 1e-6, "przy 0 dB sygnał ma przejść bez zmian: {x} -> {y}");
+        }
+    }
+
+    #[test]
+    fn positive_tone_favours_treble_and_negative_favours_bass() {
+        // Stały sygnał to składowa niska (wychodzi z wagą `low_gain`), naprzemienny
+        // przy Nyquist to wysokie (waga `high_gain`). Po ustabilizowaniu filtra
+        // porównujemy oba.
+        let settle = |low_gain: f32, high_gain: f32| {
+            let mut dc_state = ToneState::default();
+            let mut nyq_state = ToneState::default();
+            let mut dc_out = 0.0f32;
+            let mut nyq_max = 0.0f32;
+            for i in 0..2000 {
+                dc_out = apply_tone(0.5, 48_000.0, low_gain, high_gain, &mut dc_state);
+                let x = if i % 2 == 0 { 0.5 } else { -0.5 };
+                let y = apply_tone(x, 48_000.0, low_gain, high_gain, &mut nyq_state);
+                if i > 1000 {
+                    nyq_max = nyq_max.max(y.abs());
+                }
+            }
+            (dc_out, nyq_max)
+        };
+        let (bright_dc, bright_nyq) = settle(db_to_linear(-3.0), db_to_linear(3.0));
+        let (dark_dc, dark_nyq) = settle(db_to_linear(3.0), db_to_linear(-3.0));
+        assert!(bright_nyq > bright_dc, "jasny ton ma wzmacniać wysokie: nyq={bright_nyq} dc={bright_dc}");
+        assert!(dark_dc > dark_nyq, "ciemny ton ma wzmacniać bas: dc={dark_dc} nyq={dark_nyq}");
+        assert!(bright_nyq > dark_nyq, "wysokie przy jasnym tonie muszą być głośniejsze niż przy ciemnym");
+    }
+
+    #[test]
     fn boosted_gain_no_longer_hard_clips_the_combined_signal() {
         // Regresja dla "ścinki dźwięku przy mono": zsumowany sygnał (własna
         // strona + zmodulowana przeciwna) z boostem łatwo szedł powyżej
@@ -639,8 +747,10 @@ mod tests {
         let pan_frames = vec![(0.35, 0.35); 32];
         let mut out = vec![0.0f32; pan_frames.len() * 2];
         let mut cue_state = CueState::default();
-        let boosted_gain = db_to_linear(6.0); // ~2.0x, so (0.35+0.35)*2.0 ≈ 1.4 — over the old ±1.0 clamp
-        fill_output_f32(&mut out, &pan_frames, 2, MonoEar::Left, boosted_gain, MonoCueStyle::Off, 48_000.0, &mut cue_state);
+        let mut tone_state = ToneState::default();
+        // ~2.0x, so (0.35+0.35)*2.0 ≈ 1.4 — over the old ±1.0 clamp
+        let boosted = OutputSettings::plain(MonoEar::Left, db_to_linear(6.0), MonoCueStyle::Off);
+        fill_output_f32(&mut out, &pan_frames, 2, &boosted, 48_000.0, &mut cue_state, &mut tone_state);
         let left_channel: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
         assert!(left_channel.iter().all(|&s| s <= 1.0 && s >= -1.0), "limiter nie może przekroczyć zakresu wyjścia");
         assert!(
