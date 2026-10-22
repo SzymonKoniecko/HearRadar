@@ -121,6 +121,10 @@ pub struct RadarConfig {
     /// Kolor łuku kanału prawego (2.0), patrz `stereo_left_color`.
     #[serde(default = "default_stereo_right_color")]
     pub stereo_right_color: [u8; 3],
+    /// Punkt źródła dźwięku na tarczy w układzie 2.0: lewo–prawo z balansu L/R,
+    /// przód–tył z widma (wysokie pasma), wysokość jako jasność punktu.
+    #[serde(default)]
+    pub spatial_audio_view: bool,
     /// Mnożnik grubości WSZYSTKICH linii rysowanych na radarze (okręgi skali,
     /// krzyż kierunków, sektory 7.1, obrys kropek/wskaźników) — `1.0`
     /// odtwarza dawne, sztywne szerokości linii z `radar_egui::draw_radar`.
@@ -206,6 +210,7 @@ impl Default for RadarConfig {
             speaker_layout_view: false,
             stereo_left_color: default_stereo_left_color(),
             stereo_right_color: default_stereo_right_color(),
+            spatial_audio_view: false,
             line_thickness: default_line_thickness(),
             mono_cue_style: MonoCueStyle::default(),
             direction_contrast_enabled: false,

@@ -808,6 +808,12 @@ impl HearRadarApp {
             changed |= stereo_color_combo(ui, "Kolor łuku L", &mut self.radar_config.stereo_left_color);
             changed |= stereo_color_combo(ui, "Kolor łuku R", &mut self.radar_config.stereo_right_color);
         });
+        changed |= ui
+            .checkbox(
+                &mut self.radar_config.spatial_audio_view,
+                "🎧 Punkt źródła 3D w 2.0 (lewo–prawo, przód–tył, wysokość w jasności)",
+            )
+            .changed();
 
         ui.separator();
         changed |= ui

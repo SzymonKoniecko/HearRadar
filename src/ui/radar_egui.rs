@@ -246,11 +246,63 @@ pub struct RadarState {
     /// Historia energii kanału prawego (ostatnie 3 ramki dla warstwowania).
     stereo_right_history: VecDeque<f32>,
     direction_markers: VecDeque<DirectionMarker>,
+    spatial_tilt_baseline: f32,
+    spatial_mid_baseline: f32,
+    spatial_front_back: f32,
+    spatial_height: f32,
+    spatial_energy: f32,
+}
+
+/// Udział energii pasma `num` w sumie energii pasm `num` i `den`, liczony z
+/// reguł pasm (po środku pasma każdej reguły). `None`, gdy obie strony są
+/// zerowe, bo wtedy udział nie ma sensu.
+fn band_share(rules: &[ColorRule], energies: &[f32], num: (f32, f32), den: (f32, f32)) -> Option<f32> {
+    let band_sum = |(lo, hi): (f32, f32)| -> f32 {
+        rules
+            .iter()
+            .zip(energies)
+            .filter(|(r, _)| {
+                let center = (r.freq_min + r.freq_max) * 0.5;
+                center >= lo && center < hi
+            })
+            .map(|(_, e)| *e)
+            .sum()
+    };
+    let n = band_sum(num);
+    let total = n + band_sum(den);
+    (total > 1e-6).then(|| n / total)
 }
 
 impl RadarState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn update_spatial(&mut self, tilt: (f32, u32), mid: (f32, u32)) {
+        const BASELINE_RATE: f32 = 0.002;
+        const SPATIAL_GAIN: f32 = 6.0;
+
+        let energy = (self.stereo_left_display + self.stereo_right_display).min(1.0);
+        self.spatial_energy = self.spatial_energy * 0.8 + energy * 0.2;
+        if tilt.1 == 0 || mid.1 == 0 {
+            self.spatial_front_back *= 0.8;
+            self.spatial_height *= 0.8;
+            return;
+        }
+
+        let tilt = tilt.0 / tilt.1 as f32;
+        let mid = mid.0 / mid.1 as f32;
+        if self.spatial_tilt_baseline == 0.0 && self.spatial_mid_baseline == 0.0 {
+            self.spatial_tilt_baseline = tilt;
+            self.spatial_mid_baseline = mid;
+        }
+        self.spatial_tilt_baseline += (tilt - self.spatial_tilt_baseline) * BASELINE_RATE;
+        self.spatial_mid_baseline += (mid - self.spatial_mid_baseline) * BASELINE_RATE;
+
+        let front_back = ((tilt - self.spatial_tilt_baseline) * SPATIAL_GAIN).clamp(-1.0, 1.0);
+        let height = ((mid - self.spatial_mid_baseline) * SPATIAL_GAIN).clamp(-1.0, 1.0);
+        self.spatial_front_back = self.spatial_front_back * 0.8 + front_back * 0.2;
+        self.spatial_height = self.spatial_height * 0.8 + height * 0.2;
     }
 
     /// Doprowadza wewnętrzne bufory do rozmiaru bieżącego układu kanałów.
@@ -312,6 +364,9 @@ impl RadarState {
         let max_dots = ((decay_secs as f64 / SPAWN_INTERVAL_SECS).ceil() as usize)
             .clamp(MIN_DOTS_PER_CHANNEL, MAX_DOTS_PER_CHANNEL);
 
+        let mut tilt_sum = (0.0f32, 0u32);
+        let mut mid_sum = (0.0f32, 0u32);
+
         for (i, dots) in self.dots.iter_mut().enumerate() {
             let energy = (channel_rms.get(i).copied().unwrap_or(0.0) * sensitivity).clamp(0.0, 1.0);
             let role = channel_layout(channels).get(i).copied();
@@ -325,6 +380,17 @@ impl RadarState {
             }
 
             // Stereo L/R wskaźniki (dla 2.0 i większych konfiguracji)
+            if role == Some(ChannelRole::FrontLeft) || role == Some(ChannelRole::FrontRight) {
+                if let Some(t) = band_share(rules, energies, (4000.0, 20_000.0), (0.0, 1000.0)) {
+                    tilt_sum.0 += t;
+                    tilt_sum.1 += 1;
+                }
+                if let Some(m) = band_share(rules, energies, (4000.0, 8000.0), (1000.0, 4000.0)) {
+                    mid_sum.0 += m;
+                    mid_sum.1 += 1;
+                }
+            }
+
             if role == Some(ChannelRole::FrontLeft) {
                 self.stereo_left_display = self.stereo_left_display * 0.8 + energy * 0.2;
                 self.stereo_left_color_rgb = resolve_color(rules, energies);
@@ -356,6 +422,8 @@ impl RadarState {
                 dots.pop_front();
             }
         }
+
+        self.update_spatial(tilt_sum, mid_sum);
     }
 
     /// Usuwa kropki starsze niż `decay_secs` (porządkuje pamięć dla kanałów
@@ -571,7 +639,7 @@ pub fn draw_radar<C: RadarCanvas>(
 
     let split_layouts = cfg.speaker_layout_view;
 
-    if show_bars && (!split_layouts || channels <= 2) {
+    if show_bars {
         if layout.contains(&ChannelRole::FrontLeft) || layout.contains(&ChannelRole::FrontRight) {
             draw_stereo_indicators(
                 canvas,
@@ -585,6 +653,10 @@ pub fn draw_radar<C: RadarCanvas>(
                 lt,
             );
         }
+    }
+
+    if cfg.spatial_audio_view && show_bars {
+        draw_spatial_arcs(canvas, center, r, state, fg, lt);
     }
 
     if split_layouts && show_radar {
@@ -611,6 +683,51 @@ fn draw_lfe_indicator<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, level: f
     let fill_w = w * level.clamp(0.0, 1.0);
     let fill = Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, (220.0 * fg) as u8);
     canvas.rect_filled(egui::Rect::from_min_size(top_left, Vec2::new(fill_w, h)), 2.0, fill);
+}
+
+/// Przód i tył jako dwa łuki (góra/dół) w stylu łuków L/R. Długość = odchylenie
+/// przód/tył, jasność = wysokość. Znika w ciszy.
+fn draw_spatial_arcs<C: RadarCanvas>(
+    canvas: &C,
+    center: Pos2,
+    r: f32,
+    state: &RadarState,
+    fg: f32,
+    lt: f32,
+) {
+    // Łuki L/R zajmują 20°–160° i 200°–340°, więc P/T muszą mieścić się w ±20°.
+    const MAX_HALF_SPAN_DEG: f32 = 18.0;
+    if state.spatial_energy < 0.005 {
+        return;
+    }
+
+    let thickness = stereo_arc_thickness(r, lt);
+    let arc_r = r + 4.0 + thickness * 0.5;
+    let brightness = 0.75 + 0.25 * state.spatial_height.clamp(-1.0, 1.0);
+    let front = state.spatial_front_back.max(0.0);
+    let back = (-state.spatial_front_back).max(0.0);
+    let font = FontId::proportional((thickness * 1.8).clamp(10.0, 14.0));
+
+    const SHIFT_PX: f32 = 10.0;
+    const FRONT_RGB: (u8, u8, u8) = (255, 230, 60);
+    const BACK_RGB: (u8, u8, u8) = (200, 80, 255);
+    for (mid_deg, value, label, dy, rgb) in [
+        (0.0_f32, front, "P", -SHIFT_PX, FRONT_RGB),
+        (180.0_f32, back, "T", SHIFT_PX, BACK_RGB),
+    ] {
+        let rgba = |a: f32| {
+            let alpha = (a * fg * brightness).clamp(0.0, 255.0) as u8;
+            Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, alpha)
+        };
+        let value = value.clamp(0.0, 1.0);
+        let half_span = MAX_HALF_SPAN_DEG * value;
+        let c = center + Vec2::new(0.0, dy);
+        draw_arc(canvas, c, mid_deg, MAX_HALF_SPAN_DEG, arc_r, Stroke::new(thickness, rgba(60.0)));
+        draw_arc(canvas, c, mid_deg, half_span, arc_r, Stroke::new(thickness * 2.2, rgba(80.0 + 80.0 * value)));
+        draw_arc(canvas, c, mid_deg, half_span, arc_r, Stroke::new(thickness, rgba(160.0 + 95.0 * value)));
+        let label_pos = c + screen_direction(mid_deg) * (arc_r + thickness + 8.0);
+        canvas.text(label_pos, Align2::CENTER_CENTER, label, font.clone(), rgba(180.0 + 75.0 * value));
+    }
 }
 
 /// Pierścień kropek w pozycjach głośników 5.1/7.1; jasność każdej = poziom jej kanału.
@@ -679,6 +796,30 @@ fn stereo_arc_thickness(r: f32, lt: f32) -> f32 {
     (r * 0.05).clamp(3.0, 8.0) * lt.max(0.5)
 }
 
+fn draw_arc<C: RadarCanvas>(
+    canvas: &C,
+    center: Pos2,
+    mid_deg: f32,
+    half_span: f32,
+    radius: f32,
+    stroke: Stroke,
+) {
+    if half_span <= 0.0 {
+        return;
+    }
+    const STEP_DEG: f32 = 3.0;
+    let steps = ((2.0 * half_span) / STEP_DEG).ceil().max(1.0) as usize;
+    let start = mid_deg - half_span;
+    let step = 2.0 * half_span / steps as f32;
+    let point_at = |deg: f32| center + screen_direction(deg) * radius;
+    let mut prev = point_at(start);
+    for i in 1..=steps {
+        let next = point_at(start + step * i as f32);
+        canvas.line_segment([prev, next], stroke);
+        prev = next;
+    }
+}
+
 /// Łuki L/R na obwodzie tarczy: lewy rozchodzi się od godziny 9, prawy od 3,
 /// długość i jasność rosną z energią kanału; cienka kreska to szczyt z historii.
 fn draw_stereo_indicators<C: RadarCanvas>(
@@ -693,27 +834,11 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     lt: f32,
 ) {
     const MAX_HALF_SPAN_DEG: f32 = 70.0;
-    const STEP_DEG: f32 = 3.0;
 
     let thickness = stereo_arc_thickness(r, lt);
     let arc_r = r + 4.0 + thickness * 0.5;
 
     let point_at = |deg: f32, radius: f32| center + screen_direction(deg) * radius;
-
-    let stroke_arc = |mid_deg: f32, half_span: f32, radius: f32, stroke: Stroke| {
-        if half_span <= 0.0 {
-            return;
-        }
-        let steps = ((2.0 * half_span) / STEP_DEG).ceil().max(1.0) as usize;
-        let start = mid_deg - half_span;
-        let step = 2.0 * half_span / steps as f32;
-        let mut prev = point_at(start, radius);
-        for i in 1..=steps {
-            let next = point_at(start + step * i as f32, radius);
-            canvas.line_segment([prev, next], stroke);
-            prev = next;
-        }
-    };
 
     let left_energy = left_history.back().copied().unwrap_or(0.0);
     let right_energy = right_history.back().copied().unwrap_or(0.0);
@@ -728,16 +853,16 @@ fn draw_stereo_indicators<C: RadarCanvas>(
         let peak = history.iter().copied().fold(0.0_f32, f32::max).clamp(0.0, 1.0);
         let rgba = |a: f32| Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], (a * fg).clamp(0.0, 255.0) as u8);
 
-        stroke_arc(mid_deg, MAX_HALF_SPAN_DEG, arc_r, Stroke::new(thickness, rgba(28.0)));
+        draw_arc(canvas, center, mid_deg, MAX_HALF_SPAN_DEG, arc_r, Stroke::new(thickness, rgba(28.0)));
 
         let half_span = MAX_HALF_SPAN_DEG * energy;
-        stroke_arc(mid_deg, half_span, arc_r, Stroke::new(thickness * 2.2, rgba(40.0 + 60.0 * energy)));
+        draw_arc(canvas, center, mid_deg, half_span, arc_r, Stroke::new(thickness * 2.2, rgba(40.0 + 60.0 * energy)));
         if dominant {
             let (ro, go, bo) = DOMINANT_OUTLINE_RGB;
             let outline = Color32::from_rgba_unmultiplied(ro, go, bo, (230.0 * fg) as u8);
-            stroke_arc(mid_deg, half_span, arc_r, Stroke::new(thickness + 4.0, outline));
+            draw_arc(canvas, center, mid_deg, half_span, arc_r, Stroke::new(thickness + 4.0, outline));
         }
-        stroke_arc(mid_deg, half_span, arc_r, Stroke::new(thickness, rgba(110.0 + 145.0 * energy)));
+        draw_arc(canvas, center, mid_deg, half_span, arc_r, Stroke::new(thickness, rgba(110.0 + 145.0 * energy)));
 
         if peak > 0.02 {
             let peak_span = MAX_HALF_SPAN_DEG * peak;
