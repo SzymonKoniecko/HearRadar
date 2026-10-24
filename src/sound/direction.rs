@@ -357,6 +357,18 @@ pub fn detect_channel_activity(
         })
         .collect();
 
+    // Średnia krocząca sprzed TEJ ramki — stereo liczy kąt z tego, co właśnie
+    // podniosło się ponad nią (patrz `stereo_onset_angle_deg`), a pętla niżej
+    // już aktualizuje `ema_state`.
+    let prev_scaled = ema_state.to_vec();
+    let stereo_angle = (layout.len() == 2 && channel_rms.len() >= 2).then(|| {
+        stereo_onset_angle_deg(
+            [channel_rms[0], channel_rms[1]],
+            [prev_scaled[0], prev_scaled[1]],
+            sensitivity,
+        )
+    });
+
     let mut activity = Vec::new();
 
     for (i, &level) in channel_rms.iter().enumerate() {
@@ -406,7 +418,7 @@ pub fn detect_channel_activity(
             channel_index: i,
             energy: level,
             scaled_energy: scaled,
-            angle_deg: onset_angle_deg(channel_rms, i),
+            angle_deg: stereo_angle.unwrap_or_else(|| onset_angle_deg(channel_rms, i)),
             is_onset,
         });
     }
@@ -443,6 +455,10 @@ pub fn onset_angle_deg(channel_rms: &[f32], channel_index: usize) -> f32 {
         return 0.0;
     };
 
+    if layout.len() == 2 && channel_rms.len() >= 2 {
+        return stereo_onset_angle_deg([channel_rms[0], channel_rms[1]], [0.0, 0.0], 1.0);
+    }
+
     let mut sum_x = 0.0f32;
     let mut sum_y = 0.0f32;
     let mut total_energy = 0.0f32;
@@ -466,6 +482,36 @@ pub fn onset_angle_deg(channel_rms: &[f32], channel_index: usize) -> f32 {
     }
 
     sum_x.atan2(sum_y).to_degrees()
+}
+
+/// Kąt onsetu dla stereo (2.0): balans L/R zamiast sztywnego kąta głośnika.
+///
+/// Liczy się z tego, co właśnie PODNIOSŁO się ponad średnią kroczącą
+/// (`prev_scaled`), a nie z surowych poziomów — inaczej stałe tło grające po
+/// jednej stronie (muzyka, ambient) przeciągałoby każdy krok w swoją stronę.
+/// Gdy żaden kanał nie urósł, wraca do balansu surowych poziomów.
+///
+/// `pan = (P - L) / (P + L)` mieści się w `-1..=1` i jest mapowany na kąty
+/// głośników FL/FR (`-45°`/`+45°`): dźwięk tylko z lewej ląduje na lewym
+/// głośniku, równy poziom daje `0°`, a pośrednie balanse dają kąty pośrednie.
+/// Wcześniej każdy onset stereo lądował dokładnie na głośniku, niezależnie od
+/// tego, jak bardzo jeden kanał przeważał.
+fn stereo_onset_angle_deg(levels: [f32; 2], prev_scaled: [f32; 2], sensitivity: f32) -> f32 {
+    let scaled = |i: usize| (levels[i].max(0.0) * sensitivity).clamp(0.0, 1.0);
+    let rise = |i: usize| (scaled(i) - prev_scaled[i]).max(0.0);
+
+    let (mut left, mut right) = (rise(0), rise(1));
+    if left + right < f32::EPSILON {
+        left = levels[0].max(0.0);
+        right = levels[1].max(0.0);
+    }
+    let total = left + right;
+    if total < f32::EPSILON {
+        return 0.0;
+    }
+
+    let speaker_angle = ChannelRole::FrontRight.radar_angle_degrees().unwrap_or(45.0);
+    (right - left) / total * speaker_angle
 }
 
 /// Zwraca poglądową nazwę układu kanałów, np. "2.0", "5.1", "7.1".
@@ -869,18 +915,53 @@ mod tests {
     }
 
     #[test]
-    fn onset_angle_deg_front_left_and_front_right_stay_distinct_for_plain_stereo() {
-        // Regresja znaleziona w logu diagnostycznym z prawdziwego audio:
-        // zwykłe stereo (2.0: [FL, FR], podobna energia na obu) dawało IDENTYCZNY
-        // kąt dla onsetów L i R (oba ~0°), bo FL(-45°)/FR(45°) leżą DOKŁADNIE
-        // NEIGHBOR_MAX_ANGLE_DIFF_DEG (90°) od siebie, a próg był domknięty
-        // (`<=`), więc ta para się wzajemnie uśredniała — dokładnie ten problem,
-        // który detect_onsets miał rozwiązywać (dwa niezależne, ROZRÓŻNIALNE
-        // wskaźniki), zamiast tego zapadały się w jeden punkt na środku.
-        let rms = [0.025, 0.030]; // niemal identyczna energia L/R
-        let angle_l = onset_angle_deg(&rms, 0);
-        let angle_r = onset_angle_deg(&rms, 1);
-        assert_close(angle_l, -45.0, "onset L powinien zostać przy własnym kącie FL");
-        assert_close(angle_r, 45.0, "onset R powinien zostać przy własnym kącie FR");
+    fn onset_angle_deg_stereo_follows_left_right_balance() {
+        // Zwykłe stereo (2.0): kąt zależy od tego, który kanał przeważa, a nie
+        // jest przyklejony do głośnika. Pełna przewaga L -> FL (-45°), pełna
+        // przewaga P -> FR (+45°), równy poziom -> środek (0°) dla obu kanałów.
+        assert_close(onset_angle_deg(&[0.3, 0.0], 0), -45.0, "tylko lewy -> FL");
+        assert_close(onset_angle_deg(&[0.0, 0.3], 1), 45.0, "tylko prawy -> FR");
+        assert_close(onset_angle_deg(&[0.2, 0.2], 0), 0.0, "równy poziom, kanał L -> środek");
+        assert_close(onset_angle_deg(&[0.2, 0.2], 1), 0.0, "równy poziom, kanał R -> środek");
+    }
+
+    #[test]
+    fn onset_angle_deg_stereo_moves_with_partial_balance() {
+        // Przewaga 3:1 w stronę lewej: pan = (0.1 - 0.3) / 0.4 = -0.5 -> -22.5°.
+        assert_close(onset_angle_deg(&[0.3, 0.1], 0), -22.5, "przewaga L 3:1");
+    }
+
+    #[test]
+    fn stereo_onset_angle_points_at_the_side_that_rose_not_the_steady_background() {
+        // Prawy kanał to stałe, głośne tło (np. muzyka); lewy nagle skacze.
+        // Kąt ma wskazywać LEWĄ stronę, mimo że surowo prawy kanał przeważa.
+        let mut ema = vec![0.0, 0.0];
+        let mut band_ema = Vec::new();
+        for _ in 0..50 {
+            detect_channel_activity(&[0.1, 0.4], &[], &mut ema, &mut band_ema, 1.0, false);
+        }
+        let activity = detect_channel_activity(&[0.3, 0.4], &[], &mut ema, &mut band_ema, 1.0, false);
+        let left = activity.iter().find(|a| a.channel_index == 0).unwrap();
+        assert!(left.is_onset, "skok lewego kanału powinien być onsetem");
+        assert!(
+            left.angle_deg < -40.0,
+            "krok z lewej ma wskazywać lewo, a nie tło z prawej: {}",
+            left.angle_deg
+        );
+    }
+
+    #[test]
+    fn stereo_onset_angle_is_centre_when_both_sides_rise_equally() {
+        let mut ema = vec![0.0, 0.0];
+        let mut band_ema = Vec::new();
+        for _ in 0..50 {
+            detect_channel_activity(&[0.1, 0.1], &[], &mut ema, &mut band_ema, 1.0, false);
+        }
+        let activity = detect_channel_activity(&[0.4, 0.4], &[], &mut ema, &mut band_ema, 1.0, false);
+        assert_eq!(activity.len(), 2);
+        for a in &activity {
+            assert!(a.is_onset);
+            assert_close(a.angle_deg, 0.0, "równy wzrost obu stron = źródło na środku");
+        }
     }
 }
