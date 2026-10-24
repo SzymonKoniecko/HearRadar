@@ -1,0 +1,3 @@
+[submodule "src/analyzer/HearAnalytics-ML"]
+	path = src/analyzer/HearAnalytics-ML
+	url = https://github.com/SzymonKoniecko/HearAnalytics-ML.git
