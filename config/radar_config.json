@@ -1,7 +1,7 @@
 {
   "anchor_x": 0.5,
   "anchor_y": 0.52,
-  "radius": 125.0,
+  "radius": 65.0,
   "bg_alpha": 1.0,
   "fg_alpha": 1.0,
   "high_contrast": false,
@@ -86,7 +86,7 @@
   "visualization_mode": "LayerBars",
   "layer_arc_inner": 0.69,
   "layer_arc_spacing": 0.15,
-  "layer_steps_gain": 4.0,
+  "layer_steps_gain": 3.2,
   "layer_shots_gain": 0.9,
   "layer_rest_gain": 0.9,
   "layer_shots_color": [
