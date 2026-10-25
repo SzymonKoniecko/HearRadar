@@ -5,8 +5,11 @@ use cpal::{
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::sound::direction::{self, analyze_channels};
+use crate::sound::layers::{self, LayerHit};
+use crate::sound::recorder;
 use crate::sound::sample_logger;
 use crate::sound::spectrum::{self, ColorRule};
 
@@ -19,6 +22,8 @@ pub enum VisualizationMode {
     OnlyBars,
     /// Zarówno radar jak i słupki stereo.
     Both,
+    /// Sześć słupków 3+3: po trzy na stronę (strzały, kroki, reszta), patrz `sound::layers`.
+    LayerBars,
     /// Nic nie wyświetlaj (overlay wyłączony).
     None,
 }
@@ -28,6 +33,7 @@ impl VisualizationMode {
         Self::OnlyRadar,
         Self::OnlyBars,
         Self::Both,
+        Self::LayerBars,
         Self::None,
     ];
 
@@ -36,6 +42,7 @@ impl VisualizationMode {
             Self::OnlyRadar => "◉ Tylko radar",
             Self::OnlyBars => "≡ Tylko słupki L/R",
             Self::Both => "◉≡ Radar + słupki",
+            Self::LayerBars => "▮▮▮ Warstwy 3+3",
             Self::None => "⊘ Nic",
         }
     }
@@ -160,6 +167,29 @@ pub struct RadarConfig {
     /// Tryb wyświetlania: radar, słupki L/R, oba razem, albo nic.
     #[serde(default)]
     pub visualization_mode: VisualizationMode,
+    /// Promień wewnętrznego łuku zestawu 3+3 (warstwa strzałów), jako ułamek promienia radaru.
+    /// `#[serde(default = ...)]`, żeby stary plik konfiguracji dał wartość domyślną.
+    #[serde(default = "default_layer_arc_inner")]
+    pub layer_arc_inner: f32,
+    /// Odstęp promieni łuków kolejnych warstw 3+3, jako ułamek promienia radaru.
+    #[serde(default = "default_layer_arc_spacing")]
+    pub layer_arc_spacing: f32,
+    /// Wzmocnienie wysokości łuków kroków na radarze (1.0 = bez zmian). Pozwala lepiej widzieć
+    /// ciche kroki, nie zmienia tego, co zostało wykryte.
+    #[serde(default = "default_layer_steps_gain")]
+    pub layer_steps_gain: f32,
+    /// Wzmocnienie strzałów i reszty na radarze (1.0 = bez zmian). 0.0 chowa parę.
+    #[serde(default = "default_layer_gain")]
+    pub layer_shots_gain: f32,
+    #[serde(default = "default_layer_gain")]
+    pub layer_rest_gain: f32,
+    /// Kolory każdej pary 3+3 (RGB).
+    #[serde(default = "default_layer_shots_color")]
+    pub layer_shots_color: [u8; 3],
+    #[serde(default = "default_layer_steps_color")]
+    pub layer_steps_color: [u8; 3],
+    #[serde(default = "default_layer_rest_color")]
+    pub layer_rest_color: [u8; 3],
 }
 
 fn default_overlay_click_through() -> bool {
@@ -172,6 +202,34 @@ fn default_radar_sensitivity() -> f32 {
 
 fn default_line_thickness() -> f32 {
     1.0
+}
+
+fn default_layer_arc_inner() -> f32 {
+    0.35
+}
+
+fn default_layer_arc_spacing() -> f32 {
+    0.15
+}
+
+fn default_layer_steps_gain() -> f32 {
+    1.0
+}
+
+fn default_layer_gain() -> f32 {
+    1.0
+}
+
+fn default_layer_shots_color() -> [u8; 3] {
+    [255, 140, 40]
+}
+
+fn default_layer_steps_color() -> [u8; 3] {
+    [150, 255, 90]
+}
+
+fn default_layer_rest_color() -> [u8; 3] {
+    [80, 170, 255]
 }
 
 fn default_stereo_left_color() -> [u8; 3] {
@@ -215,6 +273,14 @@ impl Default for RadarConfig {
             mono_cue_style: MonoCueStyle::default(),
             direction_contrast_enabled: false,
             visualization_mode: VisualizationMode::default(),
+            layer_arc_inner: default_layer_arc_inner(),
+            layer_arc_spacing: default_layer_arc_spacing(),
+            layer_steps_gain: default_layer_steps_gain(),
+            layer_shots_gain: default_layer_gain(),
+            layer_rest_gain: default_layer_gain(),
+            layer_shots_color: default_layer_shots_color(),
+            layer_steps_color: default_layer_steps_color(),
+            layer_rest_color: default_layer_rest_color(),
         }
     }
 }
@@ -318,6 +384,29 @@ pub struct DirectionEvent {
     pub color_rgb: (u8, u8, u8),
 }
 
+/// Zdarzenie kierunku z chwilą wykrycia w callbacku audio. Kolejka trzyma je,
+/// dopóki UI ich nie odbierze, więc zdarzenie nie znika, gdy UI nie zdąży przed
+/// kolejnym callbackiem (callback działa co ~10 ms, klatka UI co ~16 ms).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueuedDirectionEvent {
+    pub captured_at: Instant,
+    pub event: DirectionEvent,
+}
+
+/// Najwięcej zdarzeń czekających w kolejce. Gdy UI stoi, odrzucane są najstarsze.
+const MAX_QUEUED_DIRECTION_EVENTS: usize = 256;
+
+/// Trafienie warstwy z chwilą decyzji w callbacku audio. Działa tak samo jak
+/// [`QueuedDirectionEvent`]: kolejka trzyma je, dopóki UI ich nie odbierze.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QueuedLayerHit {
+    pub captured_at: Instant,
+    pub hit: LayerHit,
+}
+
+/// Najwięcej trafień warstw czekających w kolejce (jak [`MAX_QUEUED_DIRECTION_EVENTS`]).
+const MAX_QUEUED_LAYER_HITS: usize = 256;
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioAnalysis {
     /// Poziom RMS każdego kanału z ostatniej ramki analizy (patrz
@@ -332,10 +421,13 @@ pub struct AudioAnalysis {
     /// Patrz [`crate::sound::spectrum`]. Używane do kolorowania kropek radaru
     /// wg "typu" dźwięku, niezależnie od kierunku (kąta) kanału.
     pub channel_rule_energies: Vec<Vec<f32>>,
-    /// Niezależne zdarzenia kierunku (onsety) wykryte w ostatniej ramce —
-    /// patrz [`DirectionEvent`]. Zasila `RadarState::update`, które zamienia
-    /// każde w osobny, gasnący wskaźnik na radarze.
-    pub active_direction_events: Vec<DirectionEvent>,
+    /// Niezależne zdarzenia kierunku (onsety) czekające na UI, z chwilą wykrycia.
+    /// Callback audio dokłada do kolejki, a UI opróżnia ją co klatkę
+    /// (patrz [`AudioAnalysis::drain_direction_events`]).
+    pub direction_queue: VecDeque<QueuedDirectionEvent>,
+    /// Trafienia warstw 3+3 (strzały/kroki/reszta, strona) czekające na UI, patrz
+    /// [`crate::sound::layers`]. Opróżniane razem z `direction_queue`.
+    pub layer_queue: VecDeque<QueuedLayerHit>,
     /// Indeks scenariusza testowego: 0 = live audio, 1..N = kolejne testy.
     /// Ustawiany przez UI Dioxus, odczytywany przez egui.
     pub test_scenario: u8,
@@ -343,6 +435,45 @@ pub struct AudioAnalysis {
     pub radar_config: RadarConfig,
     /// Wybór ucha do mono routingu. Ustawiany przez UI, czytany przez mono_router.
     pub mono_ear: MonoEar,
+}
+
+impl AudioAnalysis {
+    /// Dokłada zdarzenia wykryte w jednym callbacku. Wszystkie dostają tę samą
+    /// chwilę `captured_at`, więc dają się rozpoznać jako jedno uderzenie.
+    pub fn push_direction_events(&mut self, events: &[DirectionEvent], captured_at: Instant) {
+        for event in events {
+            if self.direction_queue.len() >= MAX_QUEUED_DIRECTION_EVENTS {
+                self.direction_queue.pop_front();
+            }
+            self.direction_queue.push_back(QueuedDirectionEvent {
+                captured_at,
+                event: *event,
+            });
+        }
+    }
+
+    /// Oddaje wszystkie zdarzenia z kolejki, w kolejności wykrycia, i czyści ją.
+    pub fn drain_direction_events(&mut self) -> Vec<QueuedDirectionEvent> {
+        self.direction_queue.drain(..).collect()
+    }
+
+    /// Dokłada trafienia warstw wykryte w jednym callbacku (wszystkie z tą samą chwilą).
+    pub fn push_layer_hits(&mut self, hits: &[LayerHit], captured_at: Instant) {
+        for hit in hits {
+            if self.layer_queue.len() >= MAX_QUEUED_LAYER_HITS {
+                self.layer_queue.pop_front();
+            }
+            self.layer_queue.push_back(QueuedLayerHit {
+                captured_at,
+                hit: *hit,
+            });
+        }
+    }
+
+    /// Oddaje wszystkie trafienia warstw z kolejki, w kolejności wykrycia, i czyści ją.
+    pub fn drain_layer_hits(&mut self) -> Vec<QueuedLayerHit> {
+        self.layer_queue.drain(..).collect()
+    }
 }
 
 /// Pojemność bufora kołowego próbek mono — ~340ms przy 48kHz, zaokrąglone
@@ -407,6 +538,12 @@ pub struct SharedAudioAnalysis {
     /// [`crate::sound::sample_logger`]. Wyłączony domyślnie; włączany
     /// checkboxem w UI (`ui::app`).
     sample_logger: Arc<sample_logger::SampleLogger>,
+    /// Nagrywanie sesji (`radar --recordSample` / `--recordVideo`). Wyłączone, dopóki sesja nie wystartuje.
+    recorder: Arc<recorder::Recorder>,
+    /// Bufor ostatniej sekundy próbek i onsety czekające na klasyfikację warstw
+    /// (patrz [`layers::LayerTracker`]). Zasilany przez `update_analysis`, więc działa
+    /// tak samo dla żywego audio i dla odtwarzania pliku (`sound::playback`).
+    layers: Arc<Mutex<layers::LayerTracker>>,
 }
 
 impl PartialEq for SharedAudioAnalysis {
@@ -424,6 +561,8 @@ impl Default for SharedAudioAnalysis {
             onset_ema: Arc::new(Mutex::new(Vec::new())),
             band_ema: Arc::new(Mutex::new(Vec::new())),
             sample_logger: Arc::new(sample_logger::SampleLogger::new()),
+            recorder: Arc::new(recorder::Recorder::new()),
+            layers: Arc::new(Mutex::new(layers::LayerTracker::default().with_external_onsets())),
         }
     }
 }
@@ -431,6 +570,10 @@ impl Default for SharedAudioAnalysis {
 impl SharedAudioAnalysis {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn recorder(&self) -> &recorder::Recorder {
+        &self.recorder
     }
 
     pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, AudioAnalysis>> {
@@ -833,7 +976,7 @@ pub fn fetch_audio_from_device(
     Ok(stream)
 }
 
-fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis: &SharedAudioAnalysis) {
+pub(crate) fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis: &SharedAudioAnalysis) {
     let stats = analyze_channels(samples, channels);
 
     // Reguły kolorowania i czułość mogą się zmienić w dowolnym momencie z
@@ -851,20 +994,9 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         .unwrap_or_else(|_| (spectrum::default_color_rules(), default_radar_sensitivity(), false));
     let rule_energies = spectrum::analyze_channel_rule_energies(samples, channels, sample_rate, &rules);
 
-    // Niezależne zdarzenia kierunku: KAŻDY nagły skok energii na KAŻDYM
-    // kanale osobno, zamiast jednego sumarycznego wektora, który przy dwóch
-    // przeciwstawnych źródłach o podobnej energii potrafi się wyzerować
-    // (patrz doc-komentarz `direction::detect_onsets`). Ten sam suwak
-    // "Czułość radaru", który już reguluje jak duże/daleko są kropki kanałów,
-    // reguluje też PRÓG detekcji onsetów — bez tego, przy cichszych źródłach
-    // (patrz log diagnostyczny), detekcja odpalała się raz na starcie i
-    // prawie nigdy więcej, niezależnie od tego, jak wysoko user podniósłby
-    // suwak.
-    // Stan KAŻDEGO kanału z kierunkiem (nie tylko tych, które przebiły próg
-    // onsetu) — `direction_events` niżej filtruje z tego tylko onsety
-    // (identycznie jak dawne `detect_onsets`), a logger próbek (niżej) widzi
-    // WSZYSTKIE, żeby dało się złapać dźwięk, który był słyszalny, ale nigdy
-    // nie wygenerował markera (patrz doc-komentarz `direction::ChannelActivity`).
+    // Stan KAŻDEGO kanału z kierunkiem. Wskaźniki kierunku nie biorą onsetów stąd (robi to
+    // tracker warstw, patrz niżej), ale logger próbek (niżej) widzi wszystkie kanały, żeby dało się
+    // złapać dźwięk, który był słyszalny, a nie dał zdarzenia (patrz `direction::ChannelActivity`).
     let channel_activity: Vec<direction::ChannelActivity> = {
         let mut ema_guard = analysis.onset_ema.lock().unwrap_or_else(|e| e.into_inner());
         let mut band_ema_guard = analysis.band_ema.lock().unwrap_or_else(|e| e.into_inner());
@@ -878,9 +1010,22 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         )
     };
 
+    // Warstwy 3+3 i wskaźniki kierunku dostają zdarzenia z szybkiego detektora, ale tylko te,
+    // które przechodzą regułę poziomu z Pythona. Odrzuca to szum przy starcie i ogon dźwięku.
+    let (layer_hits, accepted) = {
+        let mut tracker = analysis.layers.lock().unwrap_or_else(|e| e.into_inner());
+        tracker.push_frames(samples, channels, sample_rate);
+        let accepted = tracker.onset_allowed() && channel_activity.iter().any(|a| a.is_onset);
+        if accepted && tracker.has_external_onsets() {
+            tracker.add_onset();
+        }
+        (tracker.take_ready(), accepted)
+    };
+
+    // Wskaźniki kierunku i kroki idą z tego samego, szybkiego detektora kanałów.
     let direction_events: Vec<DirectionEvent> = channel_activity
         .iter()
-        .filter(|a| a.is_onset)
+        .filter(|a| accepted && a.is_onset)
         .map(|onset| DirectionEvent {
             angle_deg: onset.angle_deg,
             intensity: (onset.energy * sensitivity).clamp(0.0, 1.0),
@@ -928,13 +1073,22 @@ fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis:
         lock.channel_rms = stats.rms;
         lock.channel_count = channels;
         lock.channel_rule_energies = rule_energies;
-        lock.active_direction_events = direction_events;
+        lock.push_direction_events(&direction_events, Instant::now());
+    }
+
+    // Trafienia warstw trafiają do słupków 3+3 (patrz `ui::radar_egui`).
+    if !layer_hits.is_empty() {
+        if let Ok(mut lock) = analysis.lock() {
+            lock.push_layer_hits(&layer_hits, Instant::now());
+        }
     }
 
     // Miks do "ważonego mono" na sam koniec — dopiero tu, dla ewentualnego
     // odtwarzania przez `mono_router`. Radar powyżej już dostał pełne dane
     // per-kanał, więc to nie zastępuje ich, tylko dokłada osobny strumień do
     // wyjścia.
+    // Nagrywanie: kopia dwóch pierwszych kanałów. Bez trwającej sesji kończy od razu.
+    analysis.recorder.push(samples, channels);
     analysis.push_stereo_pan(&downmix_to_stereo_pan(samples, channels));
 }
 
@@ -1076,6 +1230,61 @@ mod tests {
         assert!(
             ring_len < MONO_RING_CAPACITY,
             "bufor utknął przy pełnej pojemności (~340ms) zamiast się przyciąć, ma {ring_len}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod layer_bar_config_tests {
+    use super::*;
+
+    /// Stary plik konfiguracji bez nowych pól dostaje domyślne promienie łuków 3+3.
+    #[test]
+    fn old_config_without_layer_arcs_gets_defaults() {
+        let mut value = serde_json::to_value(RadarConfig::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("layer_arc_inner");
+        object.remove("layer_arc_spacing");
+        let cfg: RadarConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.layer_arc_inner, 0.35);
+        assert_eq!(cfg.layer_arc_spacing, 0.15);
+    }
+}
+
+#[cfg(test)]
+mod direction_queue_tests {
+    use super::*;
+
+    fn event(angle_deg: f32) -> DirectionEvent {
+        DirectionEvent { angle_deg, intensity: 0.5, color_rgb: (0, 0, 0) }
+    }
+
+    #[test]
+    fn events_between_two_ui_frames_are_all_kept() {
+        let mut analysis = AudioAnalysis::default();
+        let t = Instant::now();
+        // Dwa callbacki przed jedną klatką UI (klatka ~16 ms, callback ~10 ms).
+        analysis.push_direction_events(&[event(-30.0)], t);
+        analysis.push_direction_events(&[event(10.0), event(20.0)], t);
+        let drained = analysis.drain_direction_events();
+        assert_eq!(drained.len(), 3, "żadne zdarzenie nie znika między klatkami");
+        assert_eq!(drained[0].event.angle_deg, -30.0, "kolejność wykrycia");
+        assert!(analysis.drain_direction_events().is_empty(), "po odczycie kolejka jest pusta");
+    }
+
+    #[test]
+    fn queue_drops_the_oldest_events_when_ui_stalls() {
+        let mut analysis = AudioAnalysis::default();
+        let t = Instant::now();
+        for i in 0..(MAX_QUEUED_DIRECTION_EVENTS + 10) {
+            analysis.push_direction_events(&[event(i as f32)], t);
+        }
+        let drained = analysis.drain_direction_events();
+        assert_eq!(drained.len(), MAX_QUEUED_DIRECTION_EVENTS);
+        assert_eq!(
+            drained.last().map(|q| q.event.angle_deg),
+            Some((MAX_QUEUED_DIRECTION_EVENTS + 9) as f32),
+            "najnowsze zdarzenia zostają"
         );
     }
 }

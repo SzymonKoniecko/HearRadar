@@ -8,10 +8,13 @@
 //! systemowym katalogu ustawień użytkownika — celowo, żeby konfigurację dało
 //! się łatwo znaleźć, wersjonować albo skopiować razem z projektem zamiast
 //! szukać jej w `~/Library/Application Support` czy `%APPDATA%`.
+//!
+//! Testy nie dotykają tego pliku: zapis i odczyt działają na ścieżce podanej
+//! przez wywołującego (`save_to`/`load_from`), a testy podają plik tymczasowy.
 
 use crate::sound::devices::RadarConfig;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const CONFIG_FILE_NAME: &str = "radar_config.json";
 
@@ -28,26 +31,36 @@ pub fn config_file_path() -> PathBuf {
     config_dir().join(CONFIG_FILE_NAME)
 }
 
-/// Zapisuje konfigurację jako czytelny (pretty-printed) JSON. Tworzy katalog
-/// konfiguracyjny, jeśli jeszcze nie istnieje. Zwraca ścieżkę zapisanego pliku.
+/// Zapisuje konfigurację do pliku w `config/`. Zwraca ścieżkę zapisanego pliku.
 pub fn save(cfg: &RadarConfig) -> Result<PathBuf> {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("nie udało się utworzyć katalogu {}", dir.display()))?;
-
     let path = config_file_path();
-    let json = serde_json::to_string_pretty(cfg).context("serializacja konfiguracji do JSON")?;
-    std::fs::write(&path, json)
-        .with_context(|| format!("nie udało się zapisać pliku {}", path.display()))?;
+    save_to(&path, cfg)?;
     Ok(path)
 }
 
-/// Wczytuje wcześniej zapisaną konfigurację. Zwraca błąd, jeśli plik nie
-/// istnieje albo ma nieprawidłowy format — wywołujący decyduje, czy w takim
+/// Zapisuje konfigurację jako czytelny (pretty-printed) JSON pod podaną ścieżką.
+/// Tworzy katalog nadrzędny, jeśli jeszcze nie istnieje.
+pub fn save_to(path: &Path, cfg: &RadarConfig) -> Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("nie udało się utworzyć katalogu {}", dir.display()))?;
+    }
+    let json = serde_json::to_string_pretty(cfg).context("serializacja konfiguracji do JSON")?;
+    std::fs::write(path, json)
+        .with_context(|| format!("nie udało się zapisać pliku {}", path.display()))?;
+    Ok(())
+}
+
+/// Wczytuje wcześniej zapisaną konfigurację z `config/`. Zwraca błąd, jeśli plik
+/// nie istnieje albo ma nieprawidłowy format — wywołujący decyduje, czy w takim
 /// wypadku użyć `RadarConfig::default()`.
 pub fn load() -> Result<RadarConfig> {
-    let path = config_file_path();
-    let data = std::fs::read_to_string(&path)
+    load_from(&config_file_path())
+}
+
+/// Wczytuje konfigurację z podanej ścieżki. Błędy jak w [`load`].
+pub fn load_from(path: &Path) -> Result<RadarConfig> {
+    let data = std::fs::read_to_string(path)
         .with_context(|| format!("nie udało się odczytać pliku {}", path.display()))?;
     serde_json::from_str(&data).with_context(|| format!("nieprawidłowy JSON w {}", path.display()))
 }
@@ -55,14 +68,12 @@ pub fn load() -> Result<RadarConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// `save`/`load` operują na JEDNYM ustalonym pliku w repo (celowo, patrz
-    /// komentarz modułu), więc testy, które faktycznie piszą/czytają z
-    /// dysku, muszą się wykluczać — `cargo test` domyślnie odpala testy
-    /// równolegle, a bez tej blokady dwa takie testy naprzemiennie nadpisują
-    /// sobie ten sam plik (obserwowane jako losowe niepowodzenia asercji).
-    static FILE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// Plik tymczasowy o nazwie zależnej od testu i procesu. Testy zapisu nie
+    /// mogą używać `config/radar_config.json`, bo to dane użytkownika.
+    fn temp_config_path(test_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("hearradar_{test_name}_{}.json", std::process::id()))
+    }
 
     #[test]
     fn round_trips_through_json() {
@@ -77,17 +88,17 @@ mod tests {
     }
 
     #[test]
-    fn save_then_load_round_trips_on_the_real_filesystem() {
-        let _guard = FILE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fn save_then_load_round_trips_on_disk() {
+        let path = temp_config_path("round_trip");
         let cfg = RadarConfig {
             radius: 77.0,
             high_contrast: true,
             ..RadarConfig::default()
         };
-        let path = save(&cfg).expect("save should succeed");
+        save_to(&path, &cfg).expect("save should succeed");
         assert!(path.exists());
 
-        let loaded = load().expect("load should succeed right after save");
+        let loaded = load_from(&path).expect("load should succeed right after save");
         assert_eq!(cfg, loaded);
 
         let _ = std::fs::remove_file(&path);
@@ -122,7 +133,7 @@ mod tests {
         // `write_radar_config()` — a ta od teraz od razu zapisuje na dysk
         // (patrz `HearRadarApp::write_radar_config`), więc nowy profil musi
         // przetrwać zapis/wczytanie identycznie jak reszta konfiguracji.
-        let _guard = FILE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = temp_config_path("color_profile");
         let profile = crate::sound::color_profiles::built_in_profiles()
             .first()
             .expect("at least one built-in profile should exist");
@@ -133,8 +144,8 @@ mod tests {
         };
         assert!(!cfg.color_rules.is_empty(), "profile should produce at least one rule");
 
-        let path = save(&cfg).expect("save should succeed");
-        let loaded = load().expect("load should succeed right after save");
+        save_to(&path, &cfg).expect("save should succeed");
+        let loaded = load_from(&path).expect("load should succeed right after save");
         assert_eq!(cfg.color_rules, loaded.color_rules);
 
         let _ = std::fs::remove_file(&path);

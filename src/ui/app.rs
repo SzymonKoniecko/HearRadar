@@ -14,8 +14,9 @@ use crate::sound::color_profiles;
 use crate::sound::devices::{self, MonoCueStyle, MonoEar, RadarConfig, SharedAudioAnalysis, SoundDevice};
 use crate::sound::direction;
 use crate::sound::mono_router::{self, MonoRouter};
+use crate::sound::playback::{self, FilePlayer, PlayableFile};
 use crate::sound::spectrum;
-use crate::ui::radar_egui::{RadarState, TestScenario, draw_radar};
+use crate::ui::radar_egui::{RadarState, TestScenario, draw_radar, timed_from_queue, timed_now};
 #[cfg(not(windows))]
 use crate::ui::radar_egui::draw_edge_glow_indicators;
 use eframe::egui;
@@ -106,6 +107,15 @@ pub struct HearRadarApp {
     /// pokazywany pod przyciskami w panelu kolorów (`Ok(..)` na zielono,
     /// `Err(..)` na czerwono). `None` = nic jeszcze nie robiono w tej sesji.
     config_status: Option<Result<String, String>>,
+
+    /// Nagrania do odsłuchu z `recordings/` (lista w panelu „Źródło audio”).
+    playable: Vec<PlayableFile>,
+    /// Indeks wybranego pliku w `playable`.
+    playable_selected: usize,
+    /// Trwające odtwarzanie pliku. Zajmuje potok analizy, więc żywe przechwytywanie jest wtedy wyłączone.
+    file_player: Option<FilePlayer>,
+    /// Błąd ostatniej próby odtworzenia pliku.
+    playback_error: Option<String>,
 }
 
 impl HearRadarApp {
@@ -166,6 +176,10 @@ impl HearRadarApp {
             #[cfg(windows)]
             win_overlay: None,
             config_status: None,
+            playable: playback::list_playable(&crate::sound::recorder::recordings_dir()),
+            playable_selected: 0,
+            file_player: None,
+            playback_error: None,
         }
     }
 
@@ -217,7 +231,7 @@ impl HearRadarApp {
             let energies = self
                 .test_scenario
                 .synthetic_rule_energies(self.current_channels, self.test_phase, rule_count);
-            let direction_events = self.detect_test_direction_events(&rms, &energies);
+            let direction_events = timed_now(now, &self.detect_test_direction_events(&rms, &energies));
             self.radar_state.update(
                 now,
                 self.current_channels,
@@ -231,18 +245,22 @@ impl HearRadarApp {
             return;
         }
 
-        let (channel_rms, channel_count, channel_rule_energies, direction_events) = self
+        // Kolejka zdarzeń jest opróżniana w każdej klatce, żeby nic nie zginęło między callbackami.
+        let (channel_rms, channel_count, channel_rule_energies, queued, layer_queued) = self
             .analysis
             .lock()
-            .map(|g| {
+            .map(|mut g| {
                 (
                     g.channel_rms.clone(),
                     g.channel_count,
                     g.channel_rule_energies.clone(),
-                    g.active_direction_events.clone(),
+                    g.drain_direction_events(),
+                    g.drain_layer_hits(),
                 )
             })
             .unwrap_or_default();
+        let direction_events = timed_from_queue(now, &queued);
+        self.radar_state.record_layer_hits(now, &layer_queued);
 
         if channel_count > 0 {
             self.current_channels = channel_count;
@@ -287,7 +305,7 @@ impl HearRadarApp {
             sr,
             &self.radar_config.color_rules,
         );
-        let direction_events = self.detect_test_direction_events(&stats.rms, &energies);
+        let direction_events = timed_now(now, &self.detect_test_direction_events(&stats.rms, &energies));
         self.radar_state.update(
             now,
             self.current_channels,
@@ -408,6 +426,8 @@ impl HearRadarApp {
                 if is_streaming {
                     self.active_stream = None;
                 } else {
+                    // Żywe przechwytywanie zajmuje potok analizy, więc odtwarzany plik trzeba zatrzymać.
+                    self.file_player = None;
                     match devices::fetch_audio_from_device(
                         &self.selected_device,
                         self.analysis.clone(),
@@ -479,10 +499,75 @@ impl HearRadarApp {
         });
 
         ui.separator();
+        self.ui_file_playback(ui);
+
+        ui.separator();
         self.ui_mono_router(ui);
 
         ui.separator();
         ui_device_details(ui, devices.iter().find(|d| d.name == self.selected_device));
+    }
+
+    // ── Panel: odsłuch nagrania (test radaru) ────────────────────────────
+    /// Wybór nagrania z `recordings/` i odtwarzanie go przez ten sam potok analizy co
+    /// żywe audio, żeby zobaczyć na radarze, co wykrywa analiza.
+    fn ui_file_playback(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Odsłuch nagrania (test radaru)");
+        let playing = self.file_player.as_ref().is_some_and(|p| !p.is_finished());
+
+        ui.horizontal(|ui| {
+            let selected_text = self
+                .playable
+                .get(self.playable_selected)
+                .map_or_else(|| "brak nagrań w recordings/".to_string(), |f| f.label.clone());
+            egui::ComboBox::from_label("Nagranie")
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    for (i, file) in self.playable.iter().enumerate() {
+                        ui.selectable_value(&mut self.playable_selected, i, &file.label);
+                    }
+                });
+
+            if ui.button("Odśwież").clicked() {
+                self.playable = playback::list_playable(&crate::sound::recorder::recordings_dir());
+                self.playable_selected = 0;
+            }
+
+            if playing {
+                if ui.button("■ Stop").clicked() {
+                    self.file_player = None;
+                }
+            } else if ui
+                .add_enabled(!self.playable.is_empty(), egui::Button::new("▶ Odtwórz"))
+                .clicked()
+            {
+                self.start_file_playback();
+            }
+        });
+
+        if let Some(player) = self.file_player.as_ref().filter(|p| !p.is_finished()) {
+            ui.label(format!("▶ odtwarza: {}", player.name()));
+        }
+        if let Some(err) = &self.playback_error {
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err.as_str());
+        }
+    }
+
+    /// Startuje odtwarzanie wybranego pliku. Najpierw wyłącza żywe przechwytywanie, bo dwa
+    /// źródła w jednej analizie dałyby mieszankę.
+    fn start_file_playback(&mut self) {
+        let Some(file) = self.playable.get(self.playable_selected).cloned() else {
+            return;
+        };
+        self.active_stream = None;
+        self.file_player = None;
+        match FilePlayer::start(&file, self.analysis.clone()) {
+            Ok(player) => {
+                self.file_player = Some(player);
+                self.playback_error = None;
+            }
+            Err(err) => self.playback_error = Some(format!("Nie udało się odtworzyć: {err}")),
+        }
     }
 
     // ── Panel: mono router ────────────────────────────────────────────────
@@ -761,6 +846,54 @@ impl HearRadarApp {
                     .text("Czułość radaru (siła/zasięg dźwięku)"),
             )
             .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.layer_arc_inner, 0.1..=0.7)
+                    .text("Łuki 3+3: promień wewnętrznego łuku"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.layer_arc_spacing, 0.0..=0.3)
+                    .text("Łuki 3+3: odstęp między warstwami"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.layer_steps_gain, 0.0..=4.0)
+                    .text("Kroki 3+3: wzmocnienie widoczności"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.layer_shots_gain, 0.0..=4.0)
+                    .text("Strzały 3+3: wzmocnienie widoczności"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.radar_config.layer_rest_gain, 0.0..=4.0)
+                    .text("Reszta 3+3: wzmocnienie widoczności"),
+            )
+            .changed();
+        changed |= ui
+            .horizontal(|ui| {
+                ui.label("Kolor strzałów 3+3");
+                ui.color_edit_button_srgb(&mut self.radar_config.layer_shots_color).changed()
+            })
+            .inner;
+        changed |= ui
+            .horizontal(|ui| {
+                ui.label("Kolor kroków 3+3");
+                ui.color_edit_button_srgb(&mut self.radar_config.layer_steps_color).changed()
+            })
+            .inner;
+        changed |= ui
+            .horizontal(|ui| {
+                ui.label("Kolor reszty 3+3");
+                ui.color_edit_button_srgb(&mut self.radar_config.layer_rest_color).changed()
+            })
+            .inner;
         changed |= ui
             .checkbox(
                 &mut self.radar_config.direction_contrast_enabled,

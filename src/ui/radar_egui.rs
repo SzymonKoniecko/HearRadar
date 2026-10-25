@@ -1,8 +1,11 @@
-use crate::sound::devices::{DirectionEvent, RadarConfig};
+use crate::sound::devices::{DirectionEvent, QueuedDirectionEvent, QueuedLayerHit, RadarConfig};
 use crate::sound::direction::{channel_layout, layout_name, ChannelRole};
+use crate::sound::footsteps::StepTracker;
+use crate::sound::layers::{Layer, LayerBars};
 use crate::sound::spectrum::{resolve_color, ColorRule};
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 use std::collections::VecDeque;
+use std::time::Instant;
 
 /// Abstraction over the drawing primitives `draw_radar` needs, so the same
 /// layout/animation logic can target either an `egui::Painter` (main window
@@ -173,10 +176,9 @@ const SPAWN_INTERVAL_SECS: f64 = 0.03;
 const MIN_DOTS_PER_CHANNEL: usize = 4;
 const MAX_DOTS_PER_CHANNEL: usize = 200;
 
-/// Próg wykrywania nagłych skoków energii (transientów): kropka jest
-/// oznaczana jako transient, gdy jej energia przekracza średnią kroczącą
-/// kanału o ten mnożnik (np. 2.5x ~ +8 dB).
-const TRANSIENT_RATIO: f32 = 2.5;
+/// Kąt, w którego zasięgu (± tyle stopni od kąta kanału) zdarzenie z detektora zapala
+/// pierścień „transient” na tym kanale.
+const TRANSIENT_ANGLE_DEG: f32 = 45.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ChannelDot {
@@ -184,7 +186,7 @@ pub struct ChannelDot {
     pub spawned_at: f64,
     /// Energia (RMS) kanału w tej ramce, 0.0..=1.0.
     pub energy: f32,
-    /// Czy ta ramka została oznaczona jako nagły skok energii.
+    /// Czy w tym czasie detektor wykrył zdarzenie na tym kanale (pierścień „transient”).
     pub transient: bool,
     /// Kolor wybrany wg energetycznie dominującej reguły użytkownika
     /// (patrz [`resolve_color`]) w momencie powstania kropki — utrwalony raz,
@@ -203,6 +205,54 @@ const DIRECTION_MARKER_LIFETIME_SECS: f64 = 1.0;
 /// naturalnego zaniku po [`DIRECTION_MARKER_LIFETIME_SECS`]), tylko górna
 /// granica na wypadek nierealistycznie szybkiego strumienia zdarzeń.
 const MAX_DIRECTION_MARKERS: usize = 64;
+
+/// Czas życia błysku kroku na łukach L/R i przód/tył. Krótszy niż echo kropek,
+/// bo kroki chodzą w rytmie ~2–4 Hz i każdy ma być osobnym, czytelnym impulsem.
+const STEP_MARKER_LIFETIME_SECS: f64 = 0.8;
+
+/// Bezpiecznik pamięci dla kroków (jak [`MAX_DIRECTION_MARKERS`]).
+const MAX_STEP_MARKERS: usize = 16;
+
+/// Zdarzenie kierunku z chwilą wykrycia na osi UI (sekundy, jak `now`).
+#[derive(Clone, Copy, Debug)]
+pub struct TimedDirectionEvent {
+    pub at: f64,
+    pub event: DirectionEvent,
+}
+
+/// Zdarzenia z kolejki audio na osi UI. Wiek liczy się jedną miarą dla całej
+/// partii, więc zdarzenia z tego samego callbacku dostają identyczną chwilę.
+pub fn timed_from_queue(now: f64, queued: &[QueuedDirectionEvent]) -> Vec<TimedDirectionEvent> {
+    let batch = Instant::now();
+    queued
+        .iter()
+        .map(|q| TimedDirectionEvent {
+            at: now - batch.saturating_duration_since(q.captured_at).as_secs_f64(),
+            event: q.event,
+        })
+        .collect()
+}
+
+/// Zdarzenia syntetyczne (scenariusze testowe) pojawiają się od razu, w chwili `now`.
+pub fn timed_now(now: f64, events: &[DirectionEvent]) -> Vec<TimedDirectionEvent> {
+    events.iter().map(|&event| TimedDirectionEvent { at: now, event }).collect()
+}
+
+/// Jeden wykryty krok — patrz [`crate::sound::footsteps::StepTracker`].
+#[derive(Clone, Copy, Debug)]
+pub struct StepMarker {
+    /// Czas wykrycia kroku (sekundy, `egui::InputState::time`).
+    pub spawned_at: f64,
+    /// Balans L/R uderzenia w stopniach: ujemny = lewa strona, dodatni = prawa
+    /// (zakres ±45°, jak w [`crate::sound::direction::stereo_onset_angle_deg`]).
+    pub pan_deg: f32,
+    /// Siła uderzenia, 0.0..=1.0.
+    pub intensity: f32,
+    /// Przód (dodatni) / tył (ujemny), −1.0..=1.0. Liczone z nachylenia widma
+    /// w chwili uderzenia względem linii bazowej, a nie z ciągłej średniej,
+    /// żeby krok nie rozmywał się w tle.
+    pub front_back: f32,
+}
 
 /// Pojedynczy, niezależny wskaźnik kierunku źródła dźwięku — jeden na każde
 /// wykryte zdarzenie (onset, patrz [`crate::sound::direction::detect_onsets`]),
@@ -227,6 +277,9 @@ pub struct DirectionMarker {
 pub struct RadarState {
     dots: Vec<VecDeque<ChannelDot>>,
     ema: Vec<f32>,
+    /// Czy od ostatniej kropki kanału detektor wykrył na nim zdarzenie. Kolejna kropka dostaje
+    /// wtedy pierścień „transient”.
+    pending_transient: Vec<bool>,
     last_spawn: f64,
     /// Wygładzony poziom LFE do rysowania osobnego wskaźnika niskich częstotliwości.
     pub lfe_display: f32,
@@ -251,6 +304,16 @@ pub struct RadarState {
     spatial_front_back: f32,
     spatial_height: f32,
     spatial_energy: f32,
+    /// Czy linia bazowa nachylenia widma została już ustawiona na pierwszym
+    /// poprawnym odczycie (0.0 bywa poprawnym odczytem — tła ciemnego — więc nie
+    /// można tego poznać z samej wartości).
+    spatial_baseline_ready: bool,
+    /// Rytm uderzeń — mówi, które onsety pasują do rytmu kroków.
+    step_tracker: StepTracker,
+    /// Wykryte kroki, najnowszy na końcu.
+    steps: VecDeque<StepMarker>,
+    /// Słupki warstw 3+3 (tryb `VisualizationMode::LayerBars`), patrz `sound::layers`.
+    pub layer_bars: LayerBars,
 }
 
 /// Udział energii pasma `num` w sumie energii pasm `num` i `den`, liczony z
@@ -273,14 +336,62 @@ fn band_share(rules: &[ColorRule], energies: &[f32], num: (f32, f32), den: (f32,
     (total > 1e-6).then(|| n / total)
 }
 
+/// Wzmocnienie nachylenia widma na przód/tył i wysokość: ile odchylenia od
+/// linii bazowej składa się na pełną długość łuku P/T.
+const SPATIAL_GAIN: f32 = 6.0;
+
+/// Udział wysokich pasm (`tilt`) i średnich (`mid`) w kanałach przednich L/R tej
+/// ramki, jako pary (suma, liczba kanałów). Surowe, niewygładzone odczyty — dla
+/// `update_spatial` i dla pomiaru pojedynczego kroku.
+fn front_band_shares(
+    channels: usize,
+    rules: &[ColorRule],
+    channel_rule_energies: &[Vec<f32>],
+) -> ((f32, u32), (f32, u32)) {
+    let mut tilt_sum = (0.0f32, 0u32);
+    let mut mid_sum = (0.0f32, 0u32);
+    for (i, role) in channel_layout(channels).iter().enumerate() {
+        if !matches!(role, ChannelRole::FrontLeft | ChannelRole::FrontRight) {
+            continue;
+        }
+        let energies = channel_rule_energies.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        if let Some(t) = band_share(rules, energies, (4000.0, 20_000.0), (0.0, 1000.0)) {
+            tilt_sum.0 += t;
+            tilt_sum.1 += 1;
+        }
+        if let Some(m) = band_share(rules, energies, (4000.0, 8000.0), (1000.0, 4000.0)) {
+            mid_sum.0 += m;
+            mid_sum.1 += 1;
+        }
+    }
+    (tilt_sum, mid_sum)
+}
+
 impl RadarState {
     pub fn new() -> Self {
         Self::default()
     }
 
+
+    /// Aktualna energia lewego i prawego kanału stereo (0..1), tak jak ją pokazują stare wskaźniki L/R.
+    pub fn stereo_now(&self) -> (f32, f32) {
+        (
+            self.stereo_left_history.back().copied().unwrap_or(0.0),
+            self.stereo_right_history.back().copied().unwrap_or(0.0),
+        )
+    }
+
+    /// Zasila słupki warstw trafieniami z kolejki audio. Czas liczy się tak samo jak dla kropek.
+    pub fn record_layer_hits(&mut self, now: f64, queued: &[QueuedLayerHit]) {
+        let batch = Instant::now();
+        for q in queued {
+            let at = now - batch.saturating_duration_since(q.captured_at).as_secs_f64();
+            self.layer_bars.record(at, q.hit);
+        }
+    }
+
     fn update_spatial(&mut self, tilt: (f32, u32), mid: (f32, u32)) {
         const BASELINE_RATE: f32 = 0.002;
-        const SPATIAL_GAIN: f32 = 6.0;
 
         let energy = (self.stereo_left_display + self.stereo_right_display).min(1.0);
         self.spatial_energy = self.spatial_energy * 0.8 + energy * 0.2;
@@ -292,9 +403,10 @@ impl RadarState {
 
         let tilt = tilt.0 / tilt.1 as f32;
         let mid = mid.0 / mid.1 as f32;
-        if self.spatial_tilt_baseline == 0.0 && self.spatial_mid_baseline == 0.0 {
+        if !self.spatial_baseline_ready {
             self.spatial_tilt_baseline = tilt;
             self.spatial_mid_baseline = mid;
+            self.spatial_baseline_ready = true;
         }
         self.spatial_tilt_baseline += (tilt - self.spatial_tilt_baseline) * BASELINE_RATE;
         self.spatial_mid_baseline += (mid - self.spatial_mid_baseline) * BASELINE_RATE;
@@ -305,11 +417,44 @@ impl RadarState {
         self.spatial_height = self.spatial_height * 0.8 + height * 0.2;
     }
 
+    /// Zapisuje wykryty krok: balans L/R z najmocniejszego onsetu uderzenia oraz
+    /// przód/tył z nachylenia widma tego uderzenia (`tilt`, z [`front_band_shares`])
+    /// względem linii bazowej. Bez linii bazowej (start) przód/tył zostaje zerem.
+    fn push_step(&mut self, now: f64, strongest: &DirectionEvent, tilt: (f32, u32)) {
+        let front_back = if tilt.1 == 0 || !self.spatial_baseline_ready {
+            0.0
+        } else {
+            ((tilt.0 / tilt.1 as f32 - self.spatial_tilt_baseline) * SPATIAL_GAIN).clamp(-1.0, 1.0)
+        };
+        self.steps.push_back(StepMarker {
+            spawned_at: now,
+            pan_deg: strongest.angle_deg,
+            intensity: strongest.intensity.clamp(0.0, 1.0),
+            front_back,
+        });
+        while self.steps.len() > MAX_STEP_MARKERS {
+            self.steps.pop_front();
+        }
+    }
+
+    /// Przód/tył do narysowania: najnowszy krok, wygaszany liniowo w czasie życia,
+    /// a gdy żadnego kroku nie ma — ciągły estymator z `update_spatial`.
+    fn displayed_front_back(&self, now: f64) -> f32 {
+        match self.steps.back() {
+            Some(step) => {
+                let age = (now - step.spawned_at) as f32;
+                step.front_back * (1.0 - age / STEP_MARKER_LIFETIME_SECS as f32).clamp(0.0, 1.0)
+            }
+            None => self.spatial_front_back,
+        }
+    }
+
     /// Doprowadza wewnętrzne bufory do rozmiaru bieżącego układu kanałów.
     fn ensure_capacity(&mut self, channels: usize) {
         if self.dots.len() != channels {
             self.dots = (0..channels).map(|_| VecDeque::new()).collect();
             self.ema = vec![0.0; channels];
+            self.pending_transient = vec![false; channels];
         }
     }
 
@@ -336,19 +481,56 @@ impl RadarState {
         rules: &[ColorRule],
         decay_secs: f32,
         sensitivity: f32,
-        direction_events: &[DirectionEvent],
+        direction_events: &[TimedDirectionEvent],
     ) {
         self.ensure_capacity(channels);
 
-        for event in direction_events {
+
+        // Nachylenie widma kanałów przednich L/R w TEJ ramce — liczone przed bramką
+        // czasu niżej, bo krok może przyjść między kolejnymi spawnami kropek, a jego
+        // przód/tył trzeba wtedy mieć pod ręką.
+        let (tilt_sum, mid_sum) = front_band_shares(channels, rules, channel_rule_energies);
+
+        for timed in direction_events {
             self.direction_markers.push_back(DirectionMarker {
-                spawned_at: now,
-                angle_deg: event.angle_deg,
-                intensity: event.intensity,
-                color_rgb: event.color_rgb,
+                spawned_at: timed.at,
+                angle_deg: timed.event.angle_deg,
+                intensity: timed.event.intensity,
+                color_rgb: timed.event.color_rgb,
             });
             while self.direction_markers.len() > MAX_DIRECTION_MARKERS {
                 self.direction_markers.pop_front();
+            }
+        }
+
+        // Zdarzenia z detektora zapalają pierścień „transient” na kanałach, których dotyczą
+        // (kąt zdarzenia blisko kąta głośnika). Kropka dostaje go przy najbliższym spawnie.
+        let layout = channel_layout(channels);
+        for timed in direction_events {
+            for (i, role) in layout.iter().enumerate() {
+                let Some(channel_angle) = role.radar_angle_degrees() else {
+                    continue;
+                };
+                if (timed.event.angle_deg - channel_angle).abs() <= TRANSIENT_ANGLE_DEG {
+                    if let Some(flag) = self.pending_transient.get_mut(i) {
+                        *flag = true;
+                    }
+                }
+            }
+        }
+
+        // Zdarzenia z jednego callbacku (ta sama chwila) to jedno uderzenie. To rytm
+        // uderzeń decyduje, czy jest krokiem.
+        for hit in direction_events.chunk_by(|a, b| a.at == b.at) {
+            let at = hit[0].at;
+            if self.step_tracker.observe_hit(at) {
+                let strongest = hit
+                    .iter()
+                    .map(|timed| &timed.event)
+                    .max_by(|a, b| a.intensity.total_cmp(&b.intensity));
+                if let Some(strongest) = strongest {
+                    self.push_step(at, strongest, tilt_sum);
+                }
             }
         }
 
@@ -364,9 +546,6 @@ impl RadarState {
         let max_dots = ((decay_secs as f64 / SPAWN_INTERVAL_SECS).ceil() as usize)
             .clamp(MIN_DOTS_PER_CHANNEL, MAX_DOTS_PER_CHANNEL);
 
-        let mut tilt_sum = (0.0f32, 0u32);
-        let mut mid_sum = (0.0f32, 0u32);
-
         for (i, dots) in self.dots.iter_mut().enumerate() {
             let energy = (channel_rms.get(i).copied().unwrap_or(0.0) * sensitivity).clamp(0.0, 1.0);
             let role = channel_layout(channels).get(i).copied();
@@ -380,17 +559,6 @@ impl RadarState {
             }
 
             // Stereo L/R wskaźniki (dla 2.0 i większych konfiguracji)
-            if role == Some(ChannelRole::FrontLeft) || role == Some(ChannelRole::FrontRight) {
-                if let Some(t) = band_share(rules, energies, (4000.0, 20_000.0), (0.0, 1000.0)) {
-                    tilt_sum.0 += t;
-                    tilt_sum.1 += 1;
-                }
-                if let Some(m) = band_share(rules, energies, (4000.0, 8000.0), (1000.0, 4000.0)) {
-                    mid_sum.0 += m;
-                    mid_sum.1 += 1;
-                }
-            }
-
             if role == Some(ChannelRole::FrontLeft) {
                 self.stereo_left_display = self.stereo_left_display * 0.8 + energy * 0.2;
                 self.stereo_left_color_rgb = resolve_color(rules, energies);
@@ -407,8 +575,9 @@ impl RadarState {
                 }
             }
 
+            // Pierścień „transient” z tego samego detektora co wskaźniki kierunku, nie z własnego skoku energii.
+            let transient = std::mem::take(&mut self.pending_transient[i]);
             let prev_ema = self.ema[i];
-            let transient = energy > prev_ema * TRANSIENT_RATIO + 0.05;
             self.ema[i] = prev_ema * 0.9 + energy * 0.1;
 
             if energy < 0.01 {
@@ -437,6 +606,59 @@ impl RadarState {
         while matches!(self.direction_markers.front(), Some(m) if now - m.spawned_at > DIRECTION_MARKER_LIFETIME_SECS) {
             self.direction_markers.pop_front();
         }
+        while matches!(self.steps.front(), Some(s) if now - s.spawned_at > STEP_MARKER_LIFETIME_SECS) {
+            self.steps.pop_front();
+        }
+    }
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::*;
+
+    fn timed(at: f64, angle_deg: f32) -> TimedDirectionEvent {
+        TimedDirectionEvent {
+            at,
+            event: DirectionEvent {
+                angle_deg,
+                intensity: 0.5,
+                color_rgb: (0, 0, 0),
+            },
+        }
+    }
+
+    /// Stare łuki L/R pokazują, po której stronie jest więcej dźwięku, nawet bez żadnych zdarzeń
+    /// (ciągły dźwięk, np. silnik podczas jazdy).
+    #[test]
+    fn stereo_history_follows_continuous_sound_without_events() {
+        let mut state = RadarState::new();
+        for i in 0..300 {
+            state.update(i as f64 * 0.016, 2, &[0.4, 0.1], &[vec![], vec![]], &[], 1.0, 1.0, &[]);
+        }
+        let left = state.stereo_left_history.back().copied().unwrap_or(0.0);
+        let right = state.stereo_right_history.back().copied().unwrap_or(0.0);
+        assert!(left > right + 0.2, "więcej z lewej: {left} / {right}");
+    }
+
+    /// Gdy jedna strona ma wyraźną przewagę, słabsza się chowa. Przy niemal równych obie są widoczne.
+    #[test]
+    fn weaker_side_is_hidden_only_with_a_clear_lead() {
+        assert_eq!(visible_sides(0.6, 0.2, 0.05), [true, false], "lewa przeważa");
+        assert_eq!(visible_sides(0.2, 0.6, 0.05), [false, true], "prawa przeważa");
+        assert_eq!(visible_sides(0.5, 0.48, 0.05), [true, true], "prawie równo");
+        assert_eq!(visible_sides(0.01, 0.02, 0.05), [true, true], "cisza");
+    }
+
+    /// Pierścień „transient” dostaje tylko kanał, na którym detektor wykrył zdarzenie.
+    #[test]
+    fn detector_event_marks_the_matching_channel_only() {
+        let mut state = RadarState::new();
+        // Zdarzenie z lewej (−45°, przedni lewy). Kanał 0 to FL, kanał 1 to FR.
+        state.update(1.0, 2, &[0.5, 0.5], &[vec![], vec![]], &[], 1.0, 1.0, &[timed(1.0, -45.0)]);
+        let left = state.dots[0].back().expect("kropka lewego kanału");
+        let right = state.dots[1].back().expect("kropka prawego kanału");
+        assert!(left.transient, "lewy kanał: zdarzenie z lewej");
+        assert!(!right.transient, "prawy kanał bez zdarzenia");
     }
 }
 
@@ -449,6 +671,13 @@ const DOMINANT_OUTLINE_RGB: (u8, u8, u8) = (255, 40, 40);
 /// Ile energii (0.0..=1.0) jeden kanał musi przewyższać drugi, żeby zostać
 /// uznanym za dominujący i dostać czerwony obrys.
 const DOMINANCE_MARGIN: f32 = 0.05;
+
+/// Jak bardzo lewy i prawy kanał (0.0..=1.0) mogą się różnić, żeby uznać je za
+/// równe (L=R) i pokazać czerwoną obwódkę przodu.
+const BALANCE_TOLERANCE: f32 = 0.03;
+
+/// Poniżej tego poziomu obu kanałów równość L/R się nie liczy (cisza).
+const BALANCE_MIN_LEVEL: f32 = 0.05;
 
 /// Rysuje minimalistyczny radar audio: tło, okręgi skali, krzyż kierunków,
 /// opcjonalne sektory 7.1, kropki kanałów (z zanikiem w czasie), osobny
@@ -466,6 +695,12 @@ pub fn draw_radar<C: RadarCanvas>(
     use crate::sound::devices::VisualizationMode;
 
     state.prune(now, cfg.decay_secs);
+    state.layer_bars.prune(now, cfg.decay_secs);
+
+    if cfg.visualization_mode == VisualizationMode::LayerBars {
+        draw_layer_bars(canvas, center, cfg, state, now);
+        return;
+    }
 
     // Sprawdzamy tryb wyświetlania
     let show_radar = matches!(cfg.visualization_mode, VisualizationMode::OnlyRadar | VisualizationMode::Both);
@@ -651,12 +886,14 @@ pub fn draw_radar<C: RadarCanvas>(
                 cfg.stereo_right_color,
                 fg,
                 lt,
+                [true, true],
             );
         }
     }
 
     if cfg.spatial_audio_view && show_bars {
-        draw_spatial_arcs(canvas, center, r, state, fg, lt);
+        draw_spatial_arcs(canvas, center, r, state, now, fg, lt);
+        draw_step_flashes(canvas, center, r, state, now, fg, lt);
     }
 
     if split_layouts && show_radar {
@@ -673,6 +910,187 @@ pub fn draw_radar<C: RadarCanvas>(
     }
 }
 
+/// Zestaw 3+3 w stylu łuków L/P: po jednym łuku na stronę (lewy przy 270°, prawy przy 90°)
+/// i na warstwę. Warstwy są współśrodkowe jak cebula, a każda para ma własny kolor. Długość
+/// łuku rośnie z poziomu tej strony. Zawsze jedna para jest podświetlona. Czerwona obwódka leży
+/// na wyższym łuku tej pary, gdy jest aktywny.
+fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, state: &RadarState, now: f64) {
+    const MAX_HALF_SPAN_DEG: f32 = 70.0;
+
+    let r = cfg.radius;
+    let fg = cfg.fg_alpha;
+    let thickness = (r * 0.06).clamp(3.0, 9.0) * cfg.line_thickness.max(0.5);
+    let inner = r * cfg.layer_arc_inner;
+    let spacing = r * cfg.layer_arc_spacing;
+    let highlighted = state.layer_bars.highlighted_layer();
+    let focus = state.layer_bars.focus_side(now, cfg.decay_secs);
+
+    // Każda warstwa (para L i P) ma swój kolor. Czerwony zostaje na obwódkę.
+    let layer_rgb = |layer: Layer| -> (u8, u8, u8) {
+        if cfg.high_contrast {
+            return (255, 255, 255);
+        }
+        let c = match layer {
+            Layer::Shots => cfg.layer_shots_color,
+            Layer::Steps => cfg.layer_steps_color,
+            Layer::Rest => cfg.layer_rest_color,
+        };
+        (c[0], c[1], c[2])
+    };
+    let rgba = |rgb: (u8, u8, u8), alpha: f32| {
+        Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, (alpha * fg).clamp(0.0, 255.0) as u8)
+    };
+
+    // Strzały i kroki jako łuki w środku. Reszta jest rysowana starymi wskaźnikami (patrz niżej).
+    for layer in [Layer::Shots, Layer::Steps] {
+        let radius = inner + layer.index() as f32 * spacing;
+        let rgb = layer_rgb(layer);
+        let is_highlighted = layer == highlighted;
+        // Każda para ma własne wzmocnienie widoczności z ustawień.
+        let gain = match layer {
+            Layer::Shots => cfg.layer_shots_gain,
+            Layer::Steps => cfg.layer_steps_gain,
+            Layer::Rest => cfg.layer_rest_gain,
+        };
+        let heights = [0usize, 1].map(|side| (state.layer_bars.height(side, layer, now, cfg.decay_secs) * gain).clamp(0.0, 1.0));
+        let visible = visible_sides(heights[0], heights[1], 0.05);
+        for (side, mid_deg) in [(0usize, 270.0_f32), (1, 90.0)] {
+            if !visible[side] {
+                continue;
+            }
+            // Ślad całego łuku, żeby było widać zakres. Podświetlona para ma szerszy.
+            let track = if is_highlighted { thickness * 2.2 } else { thickness };
+            let track_alpha = if is_highlighted { 45.0 } else { 22.0 };
+            draw_arc(canvas, center, mid_deg, MAX_HALF_SPAN_DEG, radius, Stroke::new(track, rgba(rgb, track_alpha)));
+
+            let height = heights[side];
+            let half_span = MAX_HALF_SPAN_DEG * height;
+            if is_highlighted && focus == Some(side) {
+                let (ro, go, bo) = DOMINANT_OUTLINE_RGB;
+                let outline = Color32::from_rgba_unmultiplied(ro, go, bo, (230.0 * fg).clamp(0.0, 255.0) as u8);
+                draw_arc(canvas, center, mid_deg, half_span, radius, Stroke::new(thickness + 3.0, outline));
+            }
+            draw_arc(canvas, center, mid_deg, half_span, radius, Stroke::new(thickness, rgba(rgb, 120.0 + 135.0 * height)));
+        }
+    }
+
+    // Reszta: stare wskaźniki L/R i przód/tył wokół tarczy, zasilane ciągłym tłem stereo,
+    // więc działają też podczas jazdy, gdy nie ma wyraźnych zdarzeń.
+    let lt = cfg.line_thickness.max(0.0);
+    // Reszta: stare wskaźniki z własnym wzmocnieniem i kolorem pary.
+    let rest_gain = cfg.layer_rest_gain;
+    let scale = |history: &VecDeque<f32>| -> VecDeque<f32> {
+        history.iter().map(|v| (v * rest_gain).clamp(0.0, 1.0)).collect()
+    };
+    let left_history = scale(&state.stereo_left_history);
+    let right_history = scale(&state.stereo_right_history);
+    let left_now = left_history.back().copied().unwrap_or(0.0);
+    let right_now = right_history.back().copied().unwrap_or(0.0);
+    let (rr, rg, rb) = layer_rgb(Layer::Rest);
+    draw_stereo_indicators(
+        canvas,
+        center,
+        r,
+        &left_history,
+        &right_history,
+        [rr, rg, rb],
+        [rr, rg, rb],
+        fg,
+        lt,
+        visible_sides(left_now, right_now, 0.05),
+    );
+    // Przód i tył jak w starym widoku: łuki i odbicia kroków, gdy włączony jest widok przestrzenny.
+    draw_spatial_arcs(canvas, center, r, state, now, fg, lt);
+
+    // Legenda: kolor każdej warstwy pod radarem.
+    for layer in Layer::ALL {
+        let x = center.x + (layer.index() as f32 - 1.0) * r * 0.55;
+        canvas.text(
+            Pos2::new(x, center.y + r * 1.3),
+            Align2::CENTER_CENTER,
+            layer.label(),
+            FontId::proportional(10.0),
+            rgba(layer_rgb(layer), 200.0),
+        );
+    }
+}
+
+/// Tekstowy zrzut tego, co widać na radarze 3+3 w chwili `now`. Liczby są te same, z których
+/// rysuje `draw_layer_bars`: wysokości łuków po wzmocnieniu, widoczność stron, podświetlenie,
+/// czerwona obwódka i kolory.
+pub fn layer_text(state: &RadarState, cfg: &RadarConfig, now: f64) -> String {
+    let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+    let color = |layer: Layer| match layer {
+        Layer::Shots => cfg.layer_shots_color,
+        Layer::Steps => cfg.layer_steps_color,
+        Layer::Rest => cfg.layer_rest_color,
+    };
+    let gain = |layer: Layer| match layer {
+        Layer::Shots => cfg.layer_shots_gain,
+        Layer::Steps => cfg.layer_steps_gain,
+        Layer::Rest => cfg.layer_rest_gain,
+    };
+    let highlighted = state.layer_bars.highlighted_layer();
+    let focus = state.layer_bars.focus_side(now, cfg.decay_secs);
+    let side_name = |side: usize| if side == 0 { "L" } else { "P" };
+
+    let mut out = String::new();
+    for layer in [Layer::Shots, Layer::Steps] {
+        let h = [0usize, 1].map(|side| {
+            (state.layer_bars.height(side, layer, now, cfg.decay_secs) * gain(layer)).clamp(0.0, 1.0)
+        });
+        let vis = visible_sides(h[0], h[1], 0.05);
+        let shown = |side: usize| if vis[side] { "" } else { " (ukryta)" };
+        let mark = if layer == highlighted { " <- podświetlona" } else { "" };
+        out.push_str(&format!(
+            "{:<8} L {:.2}{:<10} P {:.2}{:<10} kolor {}{}\n",
+            layer.label(),
+            h[0],
+            shown(0),
+            h[1],
+            shown(1),
+            hex(color(layer)),
+            mark
+        ));
+        if layer == highlighted {
+            if let Some(side) = focus {
+                out.push_str(&format!("         czerwona obwódka: {}\n", side_name(side)));
+            }
+        }
+    }
+
+    let (left, right) = state.stereo_now();
+    let rest_gain = cfg.layer_rest_gain;
+    let (l, r) = ((left * rest_gain).clamp(0.0, 1.0), (right * rest_gain).clamp(0.0, 1.0));
+    let vis = visible_sides(l, r, 0.05);
+    let shown = |side: usize| if vis[side] { "" } else { " (ukryta)" };
+    out.push_str(&format!(
+        "{:<8} L {:.2}{:<10} P {:.2}{:<10} kolor {}\n",
+        Layer::Rest.label(),
+        l,
+        shown(0),
+        r,
+        shown(1),
+        hex(color(Layer::Rest))
+    ));
+    out
+}
+
+/// Które strony (lewa, prawa) pokazać. Gdy jedna ma wyraźną przewagę, słabsza się chowa.
+/// Przewaga to co najmniej 1,1-krotność drugiej strony. Poniżej `min` obie strony są widoczne.
+fn visible_sides(left: f32, right: f32, min: f32) -> [bool; 2] {
+    const DOMINANCE_RATIO: f32 = 1.1;
+    if left.max(right) < min {
+        [true, true]
+    } else if left > right * DOMINANCE_RATIO {
+        [true, false]
+    } else if right > left * DOMINANCE_RATIO {
+        [false, true]
+    } else {
+        [true, true]
+    }
+}
+
 fn draw_lfe_indicator<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, level: f32, fg: f32, rgb: (u8, u8, u8)) {
     let w = (r * 0.5).clamp(30.0, 70.0);
     let h = 6.0;
@@ -685,18 +1103,30 @@ fn draw_lfe_indicator<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, level: f
     canvas.rect_filled(egui::Rect::from_min_size(top_left, Vec2::new(fill_w, h)), 2.0, fill);
 }
 
+/// Czy lewy i prawy kanał grają równo — dźwięk stoi na środku, czyli z przodu
+/// albo z tyłu. Oba poziomy muszą być słyszalne, żeby cisza nie liczyła się jako „równo”.
+fn stereo_balanced(left: f32, right: f32) -> bool {
+    left.max(right) >= BALANCE_MIN_LEVEL && (left - right).abs() <= BALANCE_TOLERANCE
+}
+
 /// Przód i tył jako dwa łuki (góra/dół) w stylu łuków L/R. Długość = odchylenie
-/// przód/tył, jasność = wysokość. Znika w ciszy.
+/// przód/tył (z ostatniego kroku, a między krokami — z ciągłego estymatora),
+/// jasność = wysokość. Znika w ciszy. Gdy L i P grają równo, złoty łuk „przód”
+/// dostaje czerwoną obwódkę.
 fn draw_spatial_arcs<C: RadarCanvas>(
     canvas: &C,
     center: Pos2,
     r: f32,
     state: &RadarState,
+    now: f64,
     fg: f32,
     lt: f32,
 ) {
     // Łuki L/R zajmują 20°–160° i 200°–340°, więc P/T muszą mieścić się w ±20°.
     const MAX_HALF_SPAN_DEG: f32 = 18.0;
+    // Najmniejsza połowa rozpiętości obwódki przy L=R, żeby czerwony obrys był
+    // widoczny także wtedy, gdy złoty łuk jest krótki albo właśnie zgasł.
+    const BALANCE_OUTLINE_MIN_HALF_SPAN_DEG: f32 = 8.0;
     if state.spatial_energy < 0.005 {
         return;
     }
@@ -704,16 +1134,18 @@ fn draw_spatial_arcs<C: RadarCanvas>(
     let thickness = stereo_arc_thickness(r, lt);
     let arc_r = r + 4.0 + thickness * 0.5;
     let brightness = 0.75 + 0.25 * state.spatial_height.clamp(-1.0, 1.0);
-    let front = state.spatial_front_back.max(0.0);
-    let back = (-state.spatial_front_back).max(0.0);
+    let front_back = state.displayed_front_back(now);
+    let front = front_back.max(0.0);
+    let back = (-front_back).max(0.0);
+    let balanced = stereo_balanced(state.stereo_left_display, state.stereo_right_display);
     let font = FontId::proportional((thickness * 1.8).clamp(10.0, 14.0));
 
     const SHIFT_PX: f32 = 10.0;
-    const FRONT_RGB: (u8, u8, u8) = (255, 230, 60);
-    const BACK_RGB: (u8, u8, u8) = (200, 80, 255);
-    for (mid_deg, value, label, dy, rgb) in [
-        (0.0_f32, front, "P", -SHIFT_PX, FRONT_RGB),
-        (180.0_f32, back, "T", SHIFT_PX, BACK_RGB),
+    const FRONT_RGB: (u8, u8, u8) = (255, 225, 0);
+    const BACK_RGB: (u8, u8, u8) = (170, 60, 255);
+    for (mid_deg, value, label, dy, rgb, outlined) in [
+        (0.0_f32, front, "P", -SHIFT_PX, FRONT_RGB, balanced),
+        (180.0_f32, back, "T", SHIFT_PX, BACK_RGB, false),
     ] {
         let rgba = |a: f32| {
             let alpha = (a * fg * brightness).clamp(0.0, 255.0) as u8;
@@ -724,9 +1156,55 @@ fn draw_spatial_arcs<C: RadarCanvas>(
         let c = center + Vec2::new(0.0, dy);
         draw_arc(canvas, c, mid_deg, MAX_HALF_SPAN_DEG, arc_r, Stroke::new(thickness, rgba(60.0)));
         draw_arc(canvas, c, mid_deg, half_span, arc_r, Stroke::new(thickness * 2.2, rgba(80.0 + 80.0 * value)));
+        if outlined {
+            // Obrys jak dominujący łuk L/R: szerszy czerwony pas pod złotym.
+            let (ro, go, bo) = DOMINANT_OUTLINE_RGB;
+            let outline = Color32::from_rgba_unmultiplied(ro, go, bo, (230.0 * fg) as u8);
+            let outline_span = half_span.max(BALANCE_OUTLINE_MIN_HALF_SPAN_DEG);
+            draw_arc(canvas, c, mid_deg, outline_span, arc_r, Stroke::new(thickness + 4.0, outline));
+        }
         draw_arc(canvas, c, mid_deg, half_span, arc_r, Stroke::new(thickness, rgba(160.0 + 95.0 * value)));
         let label_pos = c + screen_direction(mid_deg) * (arc_r + thickness + 8.0);
         canvas.text(label_pos, Align2::CENTER_CENTER, label, font.clone(), rgba(180.0 + 75.0 * value));
+    }
+}
+
+/// Błysk na łukach L/R w chwili kroku: biały łuk po stronie, z której przyszedł
+/// krok, gaśnie w ciągu [`STEP_MARKER_LIFETIME_SECS`]. Krok pośrodku (balans ≈ 0)
+/// błyska na obu łukach po połowie. Każdy krok to osobny impuls w rytmie chodu.
+fn draw_step_flashes<C: RadarCanvas>(
+    canvas: &C,
+    center: Pos2,
+    r: f32,
+    state: &RadarState,
+    now: f64,
+    fg: f32,
+    lt: f32,
+) {
+    // Ta sama rozpiętość i promień co łuki L/R (patrz `draw_stereo_indicators`).
+    const FLASH_MAX_HALF_SPAN_DEG: f32 = 70.0;
+    // Kąt głośnika FL/FR — skrajny balans L/R uderzenia (patrz `stereo_onset_angle_deg`).
+    const FRONT_SPEAKER_DEG: f32 = 45.0;
+
+    let thickness = stereo_arc_thickness(r, lt);
+    let arc_r = r + 4.0 + thickness * 0.5;
+    let lifetime = STEP_MARKER_LIFETIME_SECS as f32;
+    for step in &state.steps {
+        let age = (now - step.spawned_at) as f32;
+        if age < 0.0 || age > lifetime {
+            continue;
+        }
+        let alpha_frac = 1.0 - age / lifetime;
+        let half_span = FLASH_MAX_HALF_SPAN_DEG * (0.4 + 0.6 * step.intensity);
+        let right_share = (step.pan_deg / FRONT_SPEAKER_DEG * 0.5 + 0.5).clamp(0.0, 1.0);
+        for (mid_deg, share) in [(270.0_f32, 1.0 - right_share), (90.0_f32, right_share)] {
+            let alpha = (255.0 * fg * alpha_frac * share).clamp(0.0, 255.0) as u8;
+            if alpha == 0 {
+                continue;
+            }
+            let color = Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+            draw_arc(canvas, center, mid_deg, half_span, arc_r, Stroke::new(thickness * 2.0, color));
+        }
     }
 }
 
@@ -832,6 +1310,7 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     right_rgb: [u8; 3],
     fg: f32,
     lt: f32,
+    visible: [bool; 2],
 ) {
     const MAX_HALF_SPAN_DEG: f32 = 70.0;
 
@@ -849,6 +1328,10 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     ];
 
     for (mid_deg, history, rgb, label, dominant) in channels {
+        let side = if mid_deg < 180.0 { 0 } else { 1 };
+        if !visible[side] {
+            continue;
+        }
         let energy = history.back().copied().unwrap_or(0.0).clamp(0.0, 1.0);
         let peak = history.iter().copied().fold(0.0_f32, f32::max).clamp(0.0, 1.0);
         let rgba = |a: f32| Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], (a * fg).clamp(0.0, 255.0) as u8);
@@ -1022,5 +1505,92 @@ mod tests {
         assert_eq!(dominant_speaker(layout, &[0.5, 0.5, 0.1, 0.9, 0.1, 0.1]), None);
         // Cisza poniżej progu → brak obrysu.
         assert_eq!(dominant_speaker(layout, &[0.01, 0.0, 0.0, 0.0, 0.0, 0.0]), None);
+    }
+
+    #[test]
+    fn stereo_balanced_needs_equal_levels_and_an_audible_signal() {
+        assert!(stereo_balanced(0.60, 0.61), "prawie równe i głośne");
+        assert!(!stereo_balanced(0.60, 0.40), "wyraźnie nierówne");
+        assert!(!stereo_balanced(0.01, 0.01), "równe, ale cisza — nic nie stoi na środku");
+    }
+
+    /// Onset o podanej chwili i kącie, z mocą 0,8 i kolorem czerwonym.
+    fn timed(at: f64, angle_deg: f32) -> TimedDirectionEvent {
+        TimedDirectionEvent {
+            at,
+            event: DirectionEvent { angle_deg, intensity: 0.8, color_rgb: (255, 0, 0) },
+        }
+    }
+
+    #[test]
+    fn walking_rhythm_records_steps_and_a_lone_hit_does_not() {
+        let mut state = RadarState::new();
+        let hit = |at: f64| [timed(at, -30.0)];
+        state.update(0.0, 2, &[0.0, 0.0], &[], &[], 2.5, 20.0, &hit(0.0));
+        assert!(state.steps.is_empty(), "pierwsze uderzenie nie jest krokiem");
+        state.update(0.5, 2, &[0.0, 0.0], &[], &[], 2.5, 20.0, &hit(0.5));
+        assert_eq!(state.steps.len(), 1, "drugie uderzenie w rytmie 0,5 s to krok");
+        assert!(state.steps[0].pan_deg < 0.0, "balans z lewej strony");
+    }
+
+    #[test]
+    fn bright_step_over_a_darker_background_is_placed_in_front() {
+        let rules = crate::sound::spectrum::default_color_rules();
+        let event = DirectionEvent { angle_deg: 0.0, intensity: 0.5, color_rgb: (0, 0, 0) };
+        // Kanały L/R z tym samym widmem: wysokie pasma dominują (jasny krok) albo
+        // niskie (ciemne tło). Linia bazowa stoi pośrodku.
+        let bright = vec![vec![0.0, 0.0, 0.0, 0.5, 0.5]; 2];
+        let dark = vec![vec![0.5, 0.5, 0.0, 0.0, 0.0]; 2];
+
+        let mut state = RadarState::new();
+        state.spatial_tilt_baseline = 0.5;
+        state.spatial_baseline_ready = true;
+        let (tilt, _) = front_band_shares(2, &rules, &bright);
+        state.push_step(1.0, &event, tilt);
+        assert!(state.steps.back().unwrap().front_back > 0.0, "jasny krok = przód");
+
+        let (tilt, _) = front_band_shares(2, &rules, &dark);
+        state.push_step(2.0, &event, tilt);
+        assert!(state.steps.back().unwrap().front_back < 0.0, "ciemny krok = tył");
+    }
+}
+
+#[cfg(test)]
+mod timed_queue_tests {
+    use super::*;
+
+    fn event(angle_deg: f32) -> DirectionEvent {
+        DirectionEvent { angle_deg, intensity: 0.8, color_rgb: (255, 0, 0) }
+    }
+
+    #[test]
+    fn events_from_one_callback_share_one_time() {
+        let captured = Instant::now();
+        let queued = [
+            QueuedDirectionEvent { captured_at: captured, event: event(-30.0) },
+            QueuedDirectionEvent { captured_at: captured, event: event(10.0) },
+        ];
+        let timed = timed_from_queue(5.0, &queued);
+        assert_eq!(timed[0].at, timed[1].at, "ta sama chwila dla jednego callbacku");
+        assert!(timed[0].at <= 5.0 && timed[0].at > 4.9, "chwila przed `now`: {}", timed[0].at);
+    }
+
+    #[test]
+    fn events_from_two_callbacks_in_one_frame_count_as_two_hits() {
+        // Dwa callbacki w jednej klatce UI, 0,5 s od siebie: to dwa uderzenia i krok.
+        let mut state = RadarState::new();
+        let batch = [
+            TimedDirectionEvent { at: 0.0, event: event(-30.0) },
+            TimedDirectionEvent { at: 0.5, event: event(-30.0) },
+        ];
+        state.update(0.5, 2, &[0.0, 0.0], &[], &[], 2.5, 20.0, &batch);
+        assert_eq!(state.steps.len(), 1, "drugi callback w klatce to osobne uderzenie");
+    }
+
+    #[test]
+    fn timed_now_puts_synthetic_events_at_the_frame_time() {
+        let timed = timed_now(3.0, &[event(0.0), event(45.0)]);
+        assert!(timed.iter().all(|t| t.at == 3.0));
+        assert_eq!(timed[1].event.angle_deg, 45.0);
     }
 }

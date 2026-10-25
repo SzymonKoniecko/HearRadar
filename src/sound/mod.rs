@@ -1,6 +1,14 @@
+pub mod binaural;
+pub mod channel_test;
+pub mod clip_analysis;
 pub mod color_profiles;
 pub mod devices;
 pub mod direction;
+pub mod footsteps;
+pub mod layers;
 pub mod mono_router;
+pub mod playback;
+pub mod recorder;
 pub mod sample_logger;
 pub mod spectrum;
+pub mod video;
