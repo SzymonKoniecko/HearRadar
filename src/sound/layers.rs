@@ -262,6 +262,9 @@ pub struct LayerTracker {
     last_event_frame: Option<u64>,
     /// Klasa ostatnio podjętej decyzji, do reguły granatu.
     last_class: Option<Class>,
+    /// Początek ramki, w której poziom przeszedł przez próg (jak w `detect_events.py`) i nie
+    /// został jeszcze wzięty przez zewnętrzny detektor.
+    last_crossing: Option<u64>,
     /// Gdy `true`, zdarzenia zgłasza zewnętrzny, szybki detektor (`add_onset`), a reguła z Pythona
     /// jest wyłączona. Tak działa mikser na żywo.
     external_onsets: bool,
@@ -280,6 +283,7 @@ impl Default for LayerTracker {
             pending: VecDeque::new(),
             last_event_frame: None,
             last_class: None,
+            last_crossing: None,
             external_onsets: false,
         }
     }
@@ -329,11 +333,12 @@ impl LayerTracker {
         if self.levels.len() > BASELINE_FRAMES {
             self.levels.pop_front();
         }
-        // Przy zewnętrznym detektorze reguła z Pythona nie zgłasza zdarzeń, tylko tło jest liczone.
-        if self.external_onsets {
+        if !crossed || level < DETECT_MIN_LEVEL_DBFS {
             return;
         }
-        if !crossed || level < DETECT_MIN_LEVEL_DBFS {
+        // Przy zewnętrznym detektorze zapamiętujemy tylko przejście, zdarzenie zgłasza detektor.
+        if self.external_onsets {
+            self.last_crossing = Some(start);
             return;
         }
         self.register_onset(start);
@@ -356,16 +361,12 @@ impl LayerTracker {
         });
     }
 
-    /// Czy zewnętrzny onset przechodzi regułę z Pythona: poziom ostatniej pełnej ramki co najmniej
-    /// −40 dBFS i 9 dB ponad minimum z 0,5 s przed nią. Odrzuca szum przy starcie i ogon dźwięku.
+    /// Czy zewnętrzny detektor może teraz zgłosić zdarzenie: poziom przeszedł przez próg reguły
+    /// z Pythona (9 dB ponad tło, co najmniej −40 dBFS) w ostatnich 60 ms. Jedno przejście to
+    /// jedno zdarzenie, więc odrzuca szum przy starcie i ogon dźwięku.
     pub fn onset_allowed(&self) -> bool {
-        let Some(&level) = self.levels.back() else {
-            return false;
-        };
-        let Some(base) = self.levels.iter().rev().skip(1).copied().reduce(f32::min) else {
-            return false;
-        };
-        level >= DETECT_MIN_LEVEL_DBFS && level - base >= DETECT_THRESHOLD_DB
+        let window = 15 * (FRAME_S * self.rate).round() as u64;
+        self.last_crossing.is_some_and(|start| self.total_frames < start + window)
     }
 
     /// Tryb dla miksera na żywo: zdarzenia zgłasza szybki detektor kanałów przez `add_onset`,
@@ -383,8 +384,9 @@ impl LayerTracker {
     /// Zgłasza zdarzenie z zewnętrznego detektora w bieżącej chwili (koniec ostatnio dopisanych
     /// próbek). Dla trybu z `with_external_onsets`.
     pub fn add_onset(&mut self) {
-        let at = self.total_frames;
-        self.register_onset(at);
+        if let Some(start) = self.last_crossing.take() {
+            self.register_onset(start);
+        }
     }
 
     /// Zwraca decyzje dla zdarzeń, którym minęło już okno szczytu i jasności.
@@ -672,17 +674,19 @@ mod tests {
     }
 
     #[test]
-    fn external_onsets_must_rise_above_the_background() {
+    fn external_onsets_need_a_threshold_crossing() {
         let mut tracker = LayerTracker::default().with_external_onsets();
         assert!(!tracker.onset_allowed(), "na starcie nie ma tła");
         let silence = vec![0.0f32; 2 * 28_800];
         tracker.push_frames(&silence, 2, RATE);
-        let loud: Vec<f32> = noise(0.2, 4_800).iter().flat_map(|&s| [s, s]).collect();
+        let loud: Vec<f32> = noise(0.2, 480).iter().flat_map(|&s| [s, s]).collect();
         tracker.push_frames(&loud, 2, RATE);
-        assert!(tracker.onset_allowed(), "głośny dźwięk nad ciszą przechodzi");
+        assert!(tracker.onset_allowed(), "przejście przez próg nad ciszą przechodzi");
+        tracker.add_onset();
+        assert!(!tracker.onset_allowed(), "jedno przejście to jedno zdarzenie");
         let quiet: Vec<f32> = noise(0.001, 4_800).iter().flat_map(|&s| [s, s]).collect();
         tracker.push_frames(&quiet, 2, RATE);
-        assert!(!tracker.onset_allowed(), "poniżej −40 dBFS odrzucamy");
+        assert!(!tracker.onset_allowed(), "poniżej −40 dBFS nie ma przejścia");
     }
 
     #[test]
@@ -691,11 +695,11 @@ mod tests {
         let stereo: Vec<f32> = mono.iter().flat_map(|&s| [s, s]).collect();
         let mut tracker = LayerTracker::default().with_external_onsets();
         let mut hits = Vec::new();
-        for (index, frame) in stereo.chunks(480 * 2).enumerate() {
-            if index == 20 {
-                tracker.add_onset(); // zdarzenie w 0,2 s zgłoszone z zewnątrz
-            }
+        for frame in stereo.chunks(480 * 2) {
             tracker.push_frames(frame, 2, RATE);
+            if tracker.onset_allowed() {
+                tracker.add_onset(); // zdarzenie w 0,2 s zgłoszone przez zewnętrzny detektor
+            }
             hits.extend(tracker.take_ready());
         }
         assert_eq!(hits.len(), 1);
