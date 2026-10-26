@@ -362,10 +362,10 @@ impl LayerTracker {
     }
 
     /// Czy zewnętrzny detektor może teraz zgłosić zdarzenie: poziom przeszedł przez próg reguły
-    /// z Pythona (9 dB ponad tło, co najmniej −40 dBFS) w ostatnich 60 ms. Jedno przejście to
+    /// z Pythona (9 dB ponad tło, co najmniej −40 dBFS) w ostatnich 150 ms. Jedno przejście to
     /// jedno zdarzenie, więc odrzuca szum przy starcie i ogon dźwięku.
     pub fn onset_allowed(&self) -> bool {
-        let window = 15 * (FRAME_S * self.rate).round() as u64;
+        let window = (0.15 * self.rate).round() as u64;
         self.last_crossing.is_some_and(|start| self.total_frames < start + window)
     }
 

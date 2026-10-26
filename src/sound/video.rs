@@ -73,17 +73,19 @@ pub fn ffmpeg_args(output: &Path, source: &VideoSource, fps: u32) -> Vec<String>
         "-i".into(),
         input,
         "-c:v".into(),
-        "libx264".into(),
+        "h264_nvenc".into(),
         "-preset".into(),
-        "veryfast".into(),
-        "-crf".into(),
+        "p4".into(),
+        "-rc".into(),
+        "vbr".into(),
+        "-cq".into(),
         "23".into(),
         "-pix_fmt".into(),
         "yuv420p".into(),
-        // Bez tego x264 trzyma klatki w buforze wyprzedzającym (kilka sekund przy 22 fps),
-        // więc pierwsza zakodowana klatka pojawia się w raporcie za późno.
+        // Bez tego enkoder trzyma klatki w buforze wyprzedzającym (kilka sekund przy 22 fps),
+        // więc pierwsza zakodowana klatka pojawia się w raporcie za późno. `ll` to niskie opóźnienie NVENC.
         "-tune".into(),
-        "zerolatency".into(),
+        "ll".into(),
         "-progress".into(),
         "pipe:1".into(),
         "-stats_period".into(),
@@ -186,9 +188,10 @@ mod tests {
     }
 
     #[test]
-    fn encoder_runs_without_lookahead_so_the_first_frame_is_reported_early() {
+    fn encoder_is_nvenc_without_lookahead_so_the_first_frame_is_reported_early() {
         let args = ffmpeg_args(Path::new("out.mp4"), &VideoSource::Desktop, 30);
-        assert!(args.windows(2).any(|w| w == ["-tune", "zerolatency"]));
+        assert!(args.windows(2).any(|w| w == ["-c:v", "h264_nvenc"]));
+        assert!(args.windows(2).any(|w| w == ["-tune", "ll"]));
     }
 
     #[test]

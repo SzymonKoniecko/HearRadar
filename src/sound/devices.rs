@@ -938,8 +938,8 @@ pub fn fetch_audio_from_device(
             let a = analysis.clone();
             target_device.build_input_stream(
                 &config,
-                move |data: &[f32], _| {
-                    update_analysis(data, channels, sample_rate, &a);
+                move |data: &[f32], info| {
+                    update_analysis(data, channels, sample_rate, &a, Some(info.timestamp().capture));
                 },
                 err_fn,
                 None,
@@ -949,9 +949,9 @@ pub fn fetch_audio_from_device(
             let a = analysis.clone();
             target_device.build_input_stream(
                 &config,
-                move |data: &[i16], _| {
+                move |data: &[i16], info| {
                     let f: Vec<f32> = data.iter().map(|&s| direction::i16_to_f32(s)).collect();
-                    update_analysis(&f, channels, sample_rate, &a);
+                    update_analysis(&f, channels, sample_rate, &a, Some(info.timestamp().capture));
                 },
                 err_fn,
                 None,
@@ -961,9 +961,9 @@ pub fn fetch_audio_from_device(
             let a = analysis.clone();
             target_device.build_input_stream(
                 &config,
-                move |data: &[u16], _| {
+                move |data: &[u16], info| {
                     let f: Vec<f32> = data.iter().map(|&s| direction::u16_to_f32(s)).collect();
-                    update_analysis(&f, channels, sample_rate, &a);
+                    update_analysis(&f, channels, sample_rate, &a, Some(info.timestamp().capture));
                 },
                 err_fn,
                 None,
@@ -976,7 +976,13 @@ pub fn fetch_audio_from_device(
     Ok(stream)
 }
 
-pub(crate) fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32, analysis: &SharedAudioAnalysis) {
+pub(crate) fn update_analysis(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: f32,
+    analysis: &SharedAudioAnalysis,
+    captured: Option<cpal::StreamInstant>,
+) {
     let stats = analyze_channels(samples, channels);
 
     // Reguły kolorowania i czułość mogą się zmienić w dowolnym momencie z
@@ -1088,7 +1094,7 @@ pub(crate) fn update_analysis(samples: &[f32], channels: usize, sample_rate: f32
     // per-kanał, więc to nie zastępuje ich, tylko dokłada osobny strumień do
     // wyjścia.
     // Nagrywanie: kopia dwóch pierwszych kanałów. Bez trwającej sesji kończy od razu.
-    analysis.recorder.push(samples, channels);
+    analysis.recorder.push(samples, channels, captured);
     analysis.push_stereo_pan(&downmix_to_stereo_pan(samples, channels));
 }
 

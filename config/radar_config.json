@@ -5,7 +5,7 @@
   "bg_alpha": 1.0,
   "fg_alpha": 1.0,
   "high_contrast": false,
-  "decay_secs": 2.55,
+  "decay_secs": 1.75,
   "color_rules": [
     {
       "freq_min": 0.0,
@@ -64,8 +64,8 @@
     }
   ],
   "overlay_click_through": true,
-  "mono_boost_db": 12.0,
-  "mono_tone_db": 6.0,
+  "mono_boost_db": 16.5,
+  "mono_tone_db": 7.0,
   "radar_sensitivity": 13.0,
   "edge_glow_enabled": false,
   "speaker_layout_view": true,
@@ -86,9 +86,9 @@
   "visualization_mode": "LayerBars",
   "layer_arc_inner": 0.69,
   "layer_arc_spacing": 0.15,
-  "layer_steps_gain": 3.2,
-  "layer_shots_gain": 0.9,
-  "layer_rest_gain": 0.9,
+  "layer_steps_gain": 4.0,
+  "layer_shots_gain": 2.3,
+  "layer_rest_gain": 2.45,
   "layer_shots_color": [
     255,
     140,

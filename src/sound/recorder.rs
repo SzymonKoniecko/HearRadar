@@ -13,6 +13,7 @@
 //! odtworzyć do ostatniej sekundy. Status w `session.json` zostaje wtedy „recording”.
 
 use anyhow::{Context, Result, anyhow, bail};
+use cpal::StreamInstant;
 use cpal::traits::DeviceTrait;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
@@ -82,6 +83,15 @@ struct ActiveSession {
 const PAD_THRESHOLD_FRAMES: u64 = 4_800;
 /// Ciszę dopisujemy porcjami tej długości, żeby długa przerwa nie tworzyła ogromnej tablicy.
 const SILENCE_CHUNK_FRAMES: u64 = 48_000;
+/// Najmniejsza luka dopełniana od razu (1 ms przy 48 kHz). Krótsze kumulujemy, aż dojdą do tego progu.
+const MIN_GAP_FRAMES: u64 = 48;
+
+/// Oś czasu z WASAPI: koniec ostatniej porcji i luka, która jeszcze nie jest dopełniona ciszą.
+#[derive(Debug, Default)]
+struct CaptureClock {
+    end: Option<StreamInstant>,
+    owed_frames: u64,
+}
 
 #[derive(Debug)]
 pub struct Recorder {
@@ -93,6 +103,8 @@ pub struct Recorder {
     source_channels: AtomicU16,
     /// Chwila przyjęcia pierwszej ramki audio, czyli początku `audio.wav`.
     first_sample_at: Mutex<Option<Instant>>,
+    /// Oś czasu z czasów przechwycenia WASAPI, z której liczymy luki w dźwięku.
+    capture: Mutex<CaptureClock>,
     active: Mutex<Option<ActiveSession>>,
     tx: Mutex<Sender<Command>>,
 }
@@ -112,6 +124,7 @@ impl Recorder {
             sample_rate: AtomicU32::new(0),
             source_channels: AtomicU16::new(0),
             first_sample_at: Mutex::new(None),
+            capture: Mutex::new(CaptureClock::default()),
             active: Mutex::new(None),
             tx: Mutex::new(spawn_writer_thread()),
         }
@@ -183,6 +196,9 @@ impl Recorder {
         self.frames.store(0, Ordering::Relaxed);
         if let Ok(mut first) = self.first_sample_at.lock() {
             *first = None;
+        }
+        if let Ok(mut clock) = self.capture.lock() {
+            *clock = CaptureClock::default();
         }
         self.sample_rate.store(sample_rate, Ordering::Relaxed);
         self.source_channels.store(source_channels, Ordering::Relaxed);
@@ -276,8 +292,10 @@ impl Recorder {
         Some(t)
     }
 
-    /// Wołane z callbacku audio przy każdej ramce. Bez nagrywania kończy od razu.
-    pub fn push(&self, samples: &[f32], channels: usize) {
+    /// Wołane z callbacku audio przy każdej porcji. Bez nagrywania kończy od razu. `captured` to czas
+    /// przechwycenia pierwszej ramki porcji z WASAPI. `None` (odtwarzanie pliku) oznacza brak czasu,
+    /// wtedy luki liczymy zegarem.
+    pub fn push(&self, samples: &[f32], channels: usize, captured: Option<StreamInstant>) {
         if !self.is_recording() || channels == 0 {
             return;
         }
@@ -286,9 +304,13 @@ impl Recorder {
         }
         let recorded = channels.min(MAX_RECORDED_CHANNELS);
         let frames = samples.len() / channels;
-        // Loopback nie dostarcza próbek, gdy nic nie gra. Zanim dopiszemy porcję, dopełniamy ciszą
-        // do czasu zegara, żeby audio nie uciekało względem wideo.
-        let missing = self.missing_frames_at(Instant::now(), frames as u64, PAD_THRESHOLD_FRAMES);
+        // Loopback nie dostarcza próbek, gdy nic nie gra. Lukę dopełniamy ciszą w miejscu, w którym
+        // wystąpiła. Liczymy ją z czasu przechwycenia, a nie z zegara w callbacku, bo spóźniony
+        // callback nie jest przerwą w dźwięku.
+        let missing = match captured {
+            Some(at) => self.gap_before(at, frames),
+            None => self.missing_frames_at(Instant::now(), frames as u64, PAD_THRESHOLD_FRAMES),
+        };
         if self.send_silence(missing, recorded).is_err() {
             return;
         }
@@ -304,6 +326,28 @@ impl Recorder {
         }
         if let Ok(tx) = self.tx.lock() {
             let _ = tx.send(Command::Frames(chunk));
+        }
+    }
+
+    /// Ile ramek ciszy dopisać przed porcją, która zaczyna się w `at` (czas przechwycenia z WASAPI).
+    /// Luka liczy się od końca poprzedniej porcji. Luki krótsze niż [`MIN_GAP_FRAMES`] kumulują się,
+    /// aż przekroczą ten próg, i dopiero wtedy są dopełniane.
+    fn gap_before(&self, at: StreamInstant, frames: usize) -> u64 {
+        let rate = self.sample_rate.load(Ordering::Relaxed) as f64;
+        if rate <= 0.0 {
+            return 0;
+        }
+        let Ok(mut clock) = self.capture.lock() else {
+            return 0;
+        };
+        if let Some(gap) = clock.end.and_then(|end| at.duration_since(&end)) {
+            clock.owed_frames += (gap.as_secs_f64() * rate).round() as u64;
+        }
+        clock.end = at.add(Duration::from_secs_f64(frames as f64 / rate)).or(Some(at));
+        if clock.owed_frames >= MIN_GAP_FRAMES {
+            std::mem::take(&mut clock.owed_frames)
+        } else {
+            0
         }
     }
 
@@ -637,7 +681,7 @@ mod tests {
             .start(&base, "sesja", "CABLE Input", 8, SR, SessionMeta::default())
             .unwrap();
         let frame = [0.5, -0.25, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9];
-        rec.push(&interleaved(&frame, 100), 8);
+        rec.push(&interleaved(&frame, 100), 8, None);
         let frames = rec.stop().unwrap();
         assert_eq!(frames, 100);
 
@@ -655,7 +699,7 @@ mod tests {
         let dir = rec
             .start(&base, "sesja", "CABLE Input", 2, SR, SessionMeta::default())
             .unwrap();
-        rec.push(&interleaved(&[0.1, 0.2], 480), 2);
+        rec.push(&interleaved(&[0.1, 0.2], 480), 2, None);
         rec.stop().unwrap();
 
         let bytes = fs::read(dir.join(AUDIO_FILE)).unwrap();
@@ -679,7 +723,7 @@ mod tests {
         let dir = rec
             .start(&base, "sesja", "Mono device", 1, SR, SessionMeta::default())
             .unwrap();
-        rec.push(&interleaved(&[0.5], 50), 1);
+        rec.push(&interleaved(&[0.5], 50), 1, None);
         assert_eq!(rec.stop().unwrap(), 50);
         let bytes = fs::read(dir.join(AUDIO_FILE)).unwrap();
         assert_eq!(u16::from_le_bytes(bytes[22..24].try_into().unwrap()), 1);
@@ -694,7 +738,7 @@ mod tests {
         let dir = rec
             .start(&base, "sesja", "CABLE Input", 8, SR, SessionMeta::default())
             .unwrap();
-        rec.push(&interleaved(&[0.0; 8], 4_800), 8);
+        rec.push(&interleaved(&[0.0; 8], 4_800), 8, None);
         let t = rec.add_marker("strzał, z lewej").unwrap();
         assert!((t - 0.1).abs() < 1e-9, "t={t}");
         rec.stop().unwrap();
@@ -716,7 +760,7 @@ mod tests {
             ..SessionMeta::default()
         };
         let dir = rec.start(&base, "sesja", "CABLE Input", 8, SR, meta).unwrap();
-        rec.push(&interleaved(&[0.0; 8], 960), 8);
+        rec.push(&interleaved(&[0.0; 8], 960), 8, None);
         rec.stop().unwrap();
 
         let json: serde_json::Value =
@@ -737,7 +781,7 @@ mod tests {
     #[test]
     fn nothing_is_recorded_before_start() {
         let rec = Recorder::new();
-        rec.push(&interleaved(&[0.3; 8], 100), 8);
+        rec.push(&interleaved(&[0.3; 8], 100), 8, None);
         assert!(!rec.is_recording());
         assert!(rec.add_marker("nic").is_none());
         assert!(rec.stop().is_err());
@@ -891,5 +935,42 @@ mod padding_tests {
         let now = Instant::now();
         *rec.first_sample_at.lock().unwrap() = Some(now - Duration::from_millis(20));
         assert_eq!(rec.missing_frames_at(now, 0, PAD_THRESHOLD_FRAMES), 0);
+    }
+
+    fn recorder_at_48k() -> Recorder {
+        let rec = Recorder::new();
+        rec.sample_rate.store(48_000, Ordering::Relaxed);
+        rec
+    }
+
+    /// Spóźniony callback nie tworzy luki: porcje przychodzą później, ale ich czas przechwycenia
+    /// idzie dalej bez przerw, więc nic nie jest dopełniane.
+    #[test]
+    fn late_callbacks_with_contiguous_capture_times_add_no_silence() {
+        let rec = recorder_at_48k();
+        for k in 0..10u32 {
+            let at = StreamInstant::new(0, k * 10_000_000);
+            assert_eq!(rec.gap_before(at, 480), 0, "porcja {k}");
+        }
+    }
+
+    /// Prawdziwa cisza, w której nie było pakietów, wychodzi jako luka i jest dopełniona w swoim miejscu.
+    #[test]
+    fn a_real_silence_is_padded_where_it_happened() {
+        let rec = recorder_at_48k();
+        assert_eq!(rec.gap_before(StreamInstant::new(0, 0), 480), 0);
+        // Pierwsza porcja kończy się po 10 ms, następna zaczyna się po 500 ms: luka 490 ms.
+        assert_eq!(rec.gap_before(StreamInstant::new(0, 500_000_000), 480), 23_520);
+    }
+
+    /// Luki poniżej progu kumulują się, aż dojdą do 1 ms, i wtedy są dopełniane.
+    #[test]
+    fn sub_millisecond_gaps_accumulate_before_padding() {
+        let rec = recorder_at_48k();
+        assert_eq!(rec.gap_before(StreamInstant::new(0, 0), 480), 0);
+        // Luka 0,5 ms = 24 ramki: jeszcze poniżej progu.
+        assert_eq!(rec.gap_before(StreamInstant::new(0, 10_500_000), 480), 0);
+        // Druga luka 0,5 ms: razem 48 ramek, dopełniamy.
+        assert_eq!(rec.gap_before(StreamInstant::new(0, 21_000_000), 480), 48);
     }
 }

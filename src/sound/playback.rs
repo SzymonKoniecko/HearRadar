@@ -56,7 +56,7 @@ impl FilePlayer {
                 if let Some(wait) = due.checked_duration_since(Instant::now()) {
                     thread::sleep(wait);
                 }
-                devices::update_analysis(chunk, n, rate as f32, &analysis);
+                devices::update_analysis(chunk, n, rate as f32, &analysis, None);
             }
         });
         Ok(Self {
@@ -100,7 +100,7 @@ pub fn classify_recording(path: &Path) -> Result<Vec<LayerHit>> {
     let analysis = SharedAudioAnalysis::new();
     let chunk_len = ((rate as f64 * CHUNK_S).round().max(1.0) as usize) * n;
     for chunk in samples.chunks(chunk_len) {
-        devices::update_analysis(chunk, n, rate as f32, &analysis);
+        devices::update_analysis(chunk, n, rate as f32, &analysis, None);
     }
     let hits = analysis.lock().map(|mut g| g.drain_layer_hits()).unwrap_or_default();
     Ok(hits.into_iter().map(|queued| queued.hit).collect())
@@ -125,7 +125,7 @@ pub fn radar_dump(path: &Path, every_s: f64, steps_gain: f32) -> Result<String> 
     let mut out = String::new();
     let mut next_dump = 0.0;
     for (k, part) in samples.chunks(chunk_len).enumerate() {
-        devices::update_analysis(part, n, rate as f32, &analysis);
+        devices::update_analysis(part, n, rate as f32, &analysis, None);
         let now = (k + 1) as f64 * CHUNK_S;
         let (rms, energies, direction, layers) = analysis
             .lock()

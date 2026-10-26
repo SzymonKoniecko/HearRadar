@@ -298,6 +298,11 @@ pub struct RadarState {
     pub stereo_right_color_rgb: (u8, u8, u8),
     /// Historia energii kanału prawego (ostatnie 3 ramki dla warstwowania).
     stereo_right_history: VecDeque<f32>,
+    /// Strona reszty ukryta przez wygładzony balans L/P (0 = lewa, 1 = prawa). `None`, gdy obie są widoczne.
+    rest_hidden_side: Option<usize>,
+    /// Wolno wygładzony poziom L i P, z którego liczy się ukrywanie reszty (nie migocze przy skokach).
+    rest_level_left: f32,
+    rest_level_right: f32,
     direction_markers: VecDeque<DirectionMarker>,
     spatial_tilt_baseline: f32,
     spatial_mid_baseline: f32,
@@ -379,6 +384,36 @@ impl RadarState {
             self.stereo_left_history.back().copied().unwrap_or(0.0),
             self.stereo_right_history.back().copied().unwrap_or(0.0),
         )
+    }
+
+    /// Ukrywa słabszą stronę reszty na podstawie wolno wygładzonego balansu L/P. Ukrycie wymaga
+    /// przewagi [`DOMINANCE_RATIO`], a ukryta strona wraca, gdy przewaga spadnie poniżej
+    /// [`DOMINANCE_RELEASE_RATIO`]. Przy ciszy (poniżej [`REST_MIN_LEVEL`]) obie strony są widoczne.
+    fn update_rest_side(&mut self) {
+        const LEVEL_RATE: f32 = 0.05;
+        self.rest_level_left += (self.stereo_left_display - self.rest_level_left) * LEVEL_RATE;
+        self.rest_level_right += (self.stereo_right_display - self.rest_level_right) * LEVEL_RATE;
+        let (left, right) = (self.rest_level_left, self.rest_level_right);
+        self.rest_hidden_side = if left.max(right) < REST_MIN_LEVEL {
+            None
+        } else {
+            match self.rest_hidden_side {
+                Some(1) if left > right * DOMINANCE_RELEASE_RATIO => Some(1),
+                Some(0) if right > left * DOMINANCE_RELEASE_RATIO => Some(0),
+                _ if left > right * DOMINANCE_RATIO => Some(1),
+                _ if right > left * DOMINANCE_RATIO => Some(0),
+                _ => None,
+            }
+        };
+    }
+
+    /// Które strony reszty pokazać, według stanu z [`RadarState::update_rest_side`].
+    fn rest_visible(&self) -> [bool; 2] {
+        let mut visible = [true, true];
+        if let Some(side) = self.rest_hidden_side {
+            visible[side] = false;
+        }
+        visible
     }
 
     /// Zasila słupki warstw trafieniami z kolejki audio. Czas liczy się tak samo jak dla kropek.
@@ -593,6 +628,7 @@ impl RadarState {
         }
 
         self.update_spatial(tilt_sum, mid_sum);
+        self.update_rest_side();
     }
 
     /// Usuwa kropki starsze niż `decay_secs` (porządkuje pamięć dla kanałów
@@ -638,6 +674,40 @@ mod transient_tests {
         let left = state.stereo_left_history.back().copied().unwrap_or(0.0);
         let right = state.stereo_right_history.back().copied().unwrap_or(0.0);
         assert!(left > right + 0.2, "więcej z lewej: {left} / {right}");
+    }
+
+    /// Słabsza strona reszty chowa się przy wyraźnej przewadze, zostaje ukryta przy niewielkiej różnicy
+    /// i wraca dopiero przy remisie. Szybkie przeplatanie poziomów nie przełącza widoczności.
+    #[test]
+    fn rest_side_hides_with_hysteresis_and_no_flicker() {
+        fn feed(state: &mut RadarState, now: &mut f64, left: f32, right: f32, frames: usize) {
+            for _ in 0..frames {
+                *now += 0.05;
+                state.update(*now, 2, &[left, right], &[vec![], vec![]], &[], 1.0, 1.0, &[]);
+            }
+        }
+        let mut state = RadarState::new();
+        let mut now = 0.0;
+        feed(&mut state, &mut now, 0.5, 0.5, 200);
+        assert_eq!(state.rest_visible(), [true, true], "równo: obie widoczne");
+        feed(&mut state, &mut now, 0.6, 0.5, 200);
+        assert_eq!(state.rest_visible(), [true, false], "lewa mocniejsza: prawa się chowa");
+        feed(&mut state, &mut now, 0.52, 0.5, 200);
+        assert_eq!(state.rest_visible(), [true, false], "mała różnica: prawa dalej ukryta");
+        feed(&mut state, &mut now, 0.5, 0.5, 200);
+        assert_eq!(state.rest_visible(), [true, true], "remis: prawa wraca");
+
+        let mut flips = 0;
+        let mut last = state.rest_hidden_side;
+        for k in 0..200 {
+            let (left, right) = if k % 2 == 0 { (0.6, 0.45) } else { (0.45, 0.6) };
+            feed(&mut state, &mut now, left, right, 1);
+            if state.rest_hidden_side != last {
+                flips += 1;
+                last = state.rest_hidden_side;
+            }
+        }
+        assert_eq!(flips, 0, "przeplatanie poziomów nie przełącza widoczności");
     }
 
     /// Gdy jedna strona ma wyraźną przewagę, słabsza się chowa. Przy niemal równych obie są widoczne.
@@ -984,8 +1054,6 @@ fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, 
     };
     let left_history = scale(&state.stereo_left_history);
     let right_history = scale(&state.stereo_right_history);
-    let left_now = left_history.back().copied().unwrap_or(0.0);
-    let right_now = right_history.back().copied().unwrap_or(0.0);
     let (rr, rg, rb) = layer_rgb(Layer::Rest);
     draw_stereo_indicators(
         canvas,
@@ -997,7 +1065,7 @@ fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, 
         [rr, rg, rb],
         fg,
         lt,
-        visible_sides(left_now, right_now, 0.05),
+        state.rest_visible(),
     );
     // Przód i tył jak w starym widoku: łuki i odbicia kroków, gdy włączony jest widok przestrzenny.
     draw_spatial_arcs(canvas, center, r, state, now, fg, lt);
@@ -1062,7 +1130,7 @@ pub fn layer_text(state: &RadarState, cfg: &RadarConfig, now: f64) -> String {
     let (left, right) = state.stereo_now();
     let rest_gain = cfg.layer_rest_gain;
     let (l, r) = ((left * rest_gain).clamp(0.0, 1.0), (right * rest_gain).clamp(0.0, 1.0));
-    let vis = visible_sides(l, r, 0.05);
+    let vis = state.rest_visible();
     let shown = |side: usize| if vis[side] { "" } else { " (ukryta)" };
     out.push_str(&format!(
         "{:<8} L {:.2}{:<10} P {:.2}{:<10} kolor {}\n",
@@ -1073,13 +1141,29 @@ pub fn layer_text(state: &RadarState, cfg: &RadarConfig, now: f64) -> String {
         shown(1),
         hex(color(Layer::Rest))
     ));
+    let front_back = state.displayed_front_back(now);
+    let source = match state.steps.back() {
+        Some(step) if now - step.spawned_at <= STEP_MARKER_LIFETIME_SECS => "krok",
+        _ => "ciągły",
+    };
+    let arcs = if state.spatial_energy < 0.005 { "schowane" } else { "widoczne" };
+    out.push_str(&format!("przód/tył {front_back:+.2} (źródło: {source}), łuki {arcs}\n"));
     out
 }
+
+/// Przewaga, przy której słabsza strona reszty się chowa: 1,1 to 10% więcej niż druga strona.
+const DOMINANCE_RATIO: f32 = 1.1;
+
+/// Przewaga, poniżej której ukryta strona reszty wraca. Mniejsza niż [`DOMINANCE_RATIO`], więc przy
+/// poziomach blisko siebie stan nie migocze.
+const DOMINANCE_RELEASE_RATIO: f32 = 1.02;
+
+/// Poziom reszty (wygładzony, przed wzmocnieniem), poniżej którego obie strony są widoczne.
+const REST_MIN_LEVEL: f32 = 0.05;
 
 /// Które strony (lewa, prawa) pokazać. Gdy jedna ma wyraźną przewagę, słabsza się chowa.
 /// Przewaga to co najmniej 1,1-krotność drugiej strony. Poniżej `min` obie strony są widoczne.
 fn visible_sides(left: f32, right: f32, min: f32) -> [bool; 2] {
-    const DOMINANCE_RATIO: f32 = 1.1;
     if left.max(right) < min {
         [true, true]
     } else if left > right * DOMINANCE_RATIO {
@@ -1144,8 +1228,8 @@ fn draw_spatial_arcs<C: RadarCanvas>(
     const FRONT_RGB: (u8, u8, u8) = (255, 225, 0);
     const BACK_RGB: (u8, u8, u8) = (170, 60, 255);
     for (mid_deg, value, label, dy, rgb, outlined) in [
-        (0.0_f32, front, "P", -SHIFT_PX, FRONT_RGB, balanced),
-        (180.0_f32, back, "T", SHIFT_PX, BACK_RGB, false),
+        (0.0_f32, front, "PRZÓD", -SHIFT_PX, FRONT_RGB, balanced),
+        (180.0_f32, back, "TYŁ", SHIFT_PX, BACK_RGB, false),
     ] {
         let rgba = |a: f32| {
             let alpha = (a * fg * brightness).clamp(0.0, 255.0) as u8;
