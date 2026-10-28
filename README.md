@@ -242,3 +242,7 @@ katalogu tymczasowego.
 - Moduł ITD (`src/sound/binaural.rs`) nie jest podłączony do radaru. Działa tylko w testach.
 - W nagraniach zakładamy, że indeks 0 to lewy kanał. To jeszcze nie jest potwierdzone.
 - Dane sesji (`recordings/`) mogą zawierać dźwięk z gry. Nie udostępniaj ich.
+
+
+
+

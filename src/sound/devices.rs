@@ -96,6 +96,19 @@ pub struct RadarConfig {
     /// `mono_router::TONE_CROSSOVER_HZ`, a NIE zmiana wysokości dźwięku (pitch).
     #[serde(default)]
     pub mono_tone_db: f32,
+    /// Zmiana głośności w trybie mono z klasyfikacji radaru: strzały i wybuchy ciszej, kroki głośniej.
+    /// Dodaje opóźnienie wyjścia (0,25 s), bo klasyfikacja trwa chwilę po początku dźwięku. Domyślnie wyłączona.
+    #[serde(default)]
+    pub mono_class_gain: bool,
+    /// Wielkość zmiany klas w dB: strzały o tyle ciszej, kroki o tyle głośniej (0–12).
+    #[serde(default = "default_mono_class_gain_db")]
+    pub mono_class_gain_db: f32,
+    /// Dynamika Scout w mono: ciche wzmacnia, głośne ścisza. Domyślnie wyłączona.
+    #[serde(default)]
+    pub mono_scout: bool,
+    /// Siła dynamiki Scout od 0 do 1 (domyślnie 0,5).
+    #[serde(default = "default_mono_scout_amount")]
+    pub mono_scout_amount: f32,
     /// Czułość radaru — mnożnik RMS każdego kanału przed przeliczeniem na
     /// odległość/rozmiar kropki od środka tarczy (patrz
     /// `radar_egui::RadarState::update`). Wyżej = ciche dźwięki wyglądają na
@@ -196,6 +209,14 @@ fn default_overlay_click_through() -> bool {
     true
 }
 
+fn default_mono_scout_amount() -> f32 {
+    0.5
+}
+
+fn default_mono_class_gain_db() -> f32 {
+    MONO_CLASS_GAIN_DB_DEFAULT
+}
+
 fn default_radar_sensitivity() -> f32 {
     crate::sound::direction::INTENSITY_SCALE
 }
@@ -263,6 +284,10 @@ impl Default for RadarConfig {
             overlay_click_through: true,
             mono_boost_db: 0.0,
             mono_tone_db: 0.0,
+            mono_class_gain: false,
+            mono_class_gain_db: default_mono_class_gain_db(),
+            mono_scout: false,
+            mono_scout_amount: default_mono_scout_amount(),
             radar_sensitivity: default_radar_sensitivity(),
             edge_glow_enabled: false,
             speaker_layout_view: false,
@@ -476,17 +501,17 @@ impl AudioAnalysis {
     }
 }
 
-/// Pojemność bufora kołowego próbek mono — ~340ms przy 48kHz, zaokrąglone
-/// w górę do potęgi dwójki. To TWARDY limit pamięci (nigdy nie rośnie ponad
-/// to), NIE docelowe opóźnienie — patrz [`RING_TRIM_THRESHOLD_SAMPLES`] niżej,
-/// który utrzymuje faktyczną głębokość bufora dużo niżej na co dzień.
-const MONO_RING_CAPACITY: usize = 16_384;
+/// Pojemność bufora kołowego próbek mono — ok. 1,36 s przy 48 kHz (potęga dwójki). To TWARDY
+/// limit pamięci, NIE docelowe opóźnienie. Opóźnienie utrzymuje [`TARGET_RING_LATENCY_SAMPLES`].
+const MONO_RING_CAPACITY: usize = 65_536;
 
-/// Docelowa głębokość bufora kołowego w próbkach, do której [`SharedAudioAnalysis::push_stereo_pan`]
-/// aktywnie przycina, gdy przekroczy [`RING_TRIM_THRESHOLD_SAMPLES`] — margines
-/// na drobne (rzędu pojedynczej ramki audio) wahania tempa callbacków, nie na
-/// trwały dryf zegarów. ~50ms przy 48kHz.
+/// Docelowe opóźnienie wyjścia mono względem wejścia, w trybie zwykłym (50 ms przy 48 kHz).
+/// Z włączoną zmianą głośności klas używamy [`CLASS_GAIN_LATENCY_SAMPLES`].
 const TARGET_RING_LATENCY_SAMPLES: usize = 2_400;
+
+/// Opóźnienie wyjścia z włączoną zmianą głośności klas (0,25 s przy 48 kHz). Tyle trwa
+/// klasyfikacja zdarzenia (ok. 0,15 s) plus zapas, żeby zmiana zdążyła przed początkiem dźwięku.
+const CLASS_GAIN_LATENCY_SAMPLES: usize = 12_000;
 
 /// Próg, po przekroczeniu którego bufor jest od razu przycinany z powrotem do
 /// [`TARGET_RING_LATENCY_SAMPLES`], zamiast czekać, aż urośnie do
@@ -497,9 +522,141 @@ const TARGET_RING_LATENCY_SAMPLES: usize = 2_400;
 /// KAŻDA odtworzona próbka jest odtąd trwale spóźniona o tyle. Przycinanie
 /// dużo wcześniej, przy przekroczeniu tego niższego progu, utrzymuje
 /// opóźnienie blisko `TARGET_RING_LATENCY_SAMPLES` bez względu na kierunek
-/// dryfu. ~150ms przy 48kHz — trzykrotność celu, żeby nie przycinać przy
+/// dryfu. ~150 ms przy 48 kHz — trzykrotność celu, żeby nie przycinać przy
 /// zwykłym, chwilowym jitterze.
-const RING_TRIM_THRESHOLD_SAMPLES: usize = TARGET_RING_LATENCY_SAMPLES * 3;
+const RING_TRIM_FACTOR: usize = 3;
+
+/// Domyślna zmiana głośności na słuchawkach w trybie mono (dB): strzały i wybuchy o tyle ciszej,
+/// kroki o tyle głośniej. Suwak w panelu ustawia wartość z zakresu 0–12 dB.
+const MONO_CLASS_GAIN_DB_DEFAULT: f32 = 6.0;
+/// Jak długo po początku zdarzenia utrzymujemy jego zmianę głośności: 0,5 s przy 48 kHz.
+const CLASS_GAIN_HOLD_FRAMES: u64 = 24_000;
+/// Narastanie zmiany w dół (5 ms) i powrót do pełnej głośności (300 ms), w ramkach.
+const CLASS_GAIN_ATTACK_FRAMES: f32 = 240.0;
+const CLASS_GAIN_RELEASE_FRAMES: f32 = 14_400.0;
+/// Najwięcej zdarzeń czekających na obwiednię; starsze odrzucamy.
+const MAX_CLASS_GAIN_EVENTS: usize = 64;
+
+/// Dynamika "Scout" w mono: ciche dźwięki (poniżej −45 dBFS, ale nie szum poniżej −60 dBFS) są
+/// podbijane, a głośne (powyżej −15 dBFS) ściszane. Nachylenie 0,5 dB na dB; najwięcej zależy od siły.
+const SCOUT_QUIET_DB: f32 = -45.0;
+const SCOUT_FLOOR_DB: f32 = -60.0;
+const SCOUT_LOUD_DB: f32 = -15.0;
+const SCOUT_SLOPE: f32 = 0.5;
+const SCOUT_MAX_UP_DB: f32 = 12.0;
+const SCOUT_MAX_DOWN_DB: f32 = 6.0;
+/// Narastanie zmiany w dół (5 ms), wzmocnienia cichych i wygasanie obwiedni (150 ms), w ramkach.
+const SCOUT_ATTACK_FRAMES: f32 = 240.0;
+const SCOUT_RELEASE_FRAMES: f32 = 7_200.0;
+const SCOUT_ENV_RELEASE_FRAMES: f32 = 7_200.0;
+
+/// Bufor kołowy mono: ramki "ważonego mono", ich numery w osi wejścia i obwiednia zmian
+/// głośności z klasyfikacji. Wszystko pod jednym zamkiem, żeby numer ramki i zdarzenie zawsze
+/// odnosiły się do tej samej chwili.
+#[derive(Debug)]
+struct MonoRing {
+    frames: VecDeque<(f32, f32)>,
+    /// Numer ramki wejścia (od startu analizy), która stoi na przodzie `frames`.
+    front_index: u64,
+    /// Zdarzenia klas: (numer ramki początku, zmiana w dB), od najstarszego.
+    class_gains: VecDeque<(u64, f32)>,
+    /// Zdarzenie, które steruje głośnością teraz: (numer ramki początku, zmiana w dB).
+    current_event: Option<(u64, f32)>,
+    /// Bieżący mnożnik głośności (liniowo). Start na 1,0, czyli bez zmian.
+    gain: f32,
+    /// Czy zmiana głośności z klasyfikacji jest włączona (przełącznik w configu).
+    class_gain_enabled: bool,
+    /// Docelowe opóźnienie bufora w ramkach: zwykłe albo z włączoną zmianą klas.
+    target_samples: usize,
+    /// Wielkość zmiany głośności w dB (strzały −x, kroki +x), z suwaka w configu.
+    class_gain_db: f32,
+    /// Czy dynamika Scout jest włączona (przełącznik w configu).
+    scout_enabled: bool,
+    /// Siła Scout od 0 do 1 (suwak w configu).
+    scout_amount: f32,
+    /// Obwiednia szczytu do pomiaru poziomu Scout (liniowo).
+    scout_env: f32,
+    /// Bieżący mnożnik Scout (liniowo). Start na 1,0, czyli bez zmian.
+    scout_gain: f32,
+}
+
+impl Default for MonoRing {
+    fn default() -> Self {
+        Self {
+            frames: VecDeque::with_capacity(MONO_RING_CAPACITY),
+            front_index: 0,
+            class_gains: VecDeque::new(),
+            current_event: None,
+            gain: 1.0,
+            class_gain_enabled: false,
+            target_samples: TARGET_RING_LATENCY_SAMPLES,
+            class_gain_db: MONO_CLASS_GAIN_DB_DEFAULT,
+            scout_enabled: false,
+            scout_amount: 0.5,
+            scout_env: 0.0,
+            scout_gain: 1.0,
+        }
+    }
+}
+
+impl MonoRing {
+    /// Mnożnik głośności dla ramki o numerze `front_index`, z wygładzeniem narastania i powrotu.
+    fn next_gain(&mut self) -> f32 {
+        if !self.class_gain_enabled {
+            self.gain = 1.0;
+            return 1.0;
+        }
+        let frame = self.front_index;
+        while let Some(&(onset, db)) = self.class_gains.front() {
+            if onset > frame {
+                break;
+            }
+            self.class_gains.pop_front();
+            self.current_event = Some((onset, db));
+        }
+        // Zdarzenie zmienia głośność szybko (w górę i w dół), a powrót do pełnej głośności jest wolny.
+        let (target, frames) = match self.current_event {
+            Some((onset, db)) if frame < onset + CLASS_GAIN_HOLD_FRAMES => {
+                (10f32.powf(db / 20.0), CLASS_GAIN_ATTACK_FRAMES)
+            }
+            _ => (1.0, CLASS_GAIN_RELEASE_FRAMES),
+        };
+        self.gain += (target - self.gain) * (1.0 - (-1.0 / frames).exp());
+        self.gain
+    }
+
+    /// Dynamika Scout: podbija ciche i ścisza głośne. Oba kanały dostają ten sam mnożnik,
+    /// więc balans L/P zostaje. Gdy Scout jest wyłączony, ramka przechodzi bez zmian.
+    fn scout_frame(&mut self, l: f32, r: f32) -> (f32, f32) {
+        if !self.scout_enabled {
+            self.scout_gain = 1.0;
+            return (l, r);
+        }
+        let peak = l.abs().max(r.abs());
+        self.scout_env = peak.max(self.scout_env * (-1.0 / SCOUT_ENV_RELEASE_FRAMES).exp());
+        let level_db = 20.0 * self.scout_env.max(1e-6).log10();
+        let target = 10f32.powf(scout_target_db(level_db, self.scout_amount) / 20.0);
+        // Ściszanie głośnych ma być szybkie, a podbijanie cichych łagodne, żeby nie pompowało.
+        let frames = if target < self.scout_gain { SCOUT_ATTACK_FRAMES } else { SCOUT_RELEASE_FRAMES };
+        self.scout_gain += (target - self.scout_gain) * (1.0 - (-1.0 / frames).exp());
+        (l * self.scout_gain, r * self.scout_gain)
+    }
+}
+
+/// Zmiana głośności Scout w dB dla poziomu `level_db` i siły `amount` (0–1).
+fn scout_target_db(level_db: f32, amount: f32) -> f32 {
+    let up = if level_db < SCOUT_QUIET_DB && level_db > SCOUT_FLOOR_DB {
+        ((SCOUT_QUIET_DB - level_db) * SCOUT_SLOPE).min(SCOUT_MAX_UP_DB * amount)
+    } else {
+        0.0
+    };
+    let down = if level_db > SCOUT_LOUD_DB {
+        -((level_db - SCOUT_LOUD_DB) * SCOUT_SLOPE).min(SCOUT_MAX_DOWN_DB * amount)
+    } else {
+        0.0
+    };
+    up + down
+}
 
 #[derive(Debug, Clone)]
 pub struct SharedAudioAnalysis {
@@ -519,7 +676,7 @@ pub struct SharedAudioAnalysis {
     /// `fetch_output_devices`), a `mono_router` szukał ich tylko wśród
     /// `host.input_devices()`, więc lookup zawsze się nie powodził i routing
     /// w ogóle nie startował (błąd widoczny tylko w konsoli, niewidoczny w UI).
-    mono_ring: Arc<Mutex<VecDeque<(f32, f32)>>>,
+    mono_ring: Arc<Mutex<MonoRing>>,
     /// Ostatnia próbka realnie zdjęta z `mono_ring` przez [`Self::read_stereo_pan`]
     /// — trzymana, żeby przy podkręceniu bufora (patrz tam) powtórzyć ją
     /// zamiast wstawiać twarde zero.
@@ -556,7 +713,7 @@ impl Default for SharedAudioAnalysis {
     fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(AudioAnalysis::default())),
-            mono_ring: Arc::new(Mutex::new(VecDeque::with_capacity(MONO_RING_CAPACITY))),
+            mono_ring: Arc::new(Mutex::new(MonoRing::default())),
             last_pan: Arc::new(Mutex::new((0.0, 0.0))),
             onset_ema: Arc::new(Mutex::new(Vec::new())),
             band_ema: Arc::new(Mutex::new(Vec::new())),
@@ -593,21 +750,77 @@ impl SharedAudioAnalysis {
     pub(crate) fn push_stereo_pan(&self, samples: &[(f32, f32)]) {
         if let Ok(mut ring) = self.mono_ring.lock() {
             for &s in samples {
-                if ring.len() >= MONO_RING_CAPACITY {
-                    ring.pop_front();
+                if ring.frames.len() >= MONO_RING_CAPACITY {
+                    ring.frames.pop_front();
+                    ring.front_index += 1;
                 }
-                ring.push_back(s);
+                ring.frames.push_back(s);
             }
-            if ring.len() > RING_TRIM_THRESHOLD_SAMPLES {
-                let excess = ring.len() - TARGET_RING_LATENCY_SAMPLES;
+            if ring.frames.len() > ring.target_samples * RING_TRIM_FACTOR {
+                let excess = ring.frames.len() - ring.target_samples;
                 for _ in 0..excess {
-                    ring.pop_front();
+                    ring.frames.pop_front();
                 }
+                ring.front_index += excess as u64;
             }
         }
     }
 
-    /// Czyta dokładnie `count` próbek "ważonego mono". Wejście i wyjście to
+    /// Włącza albo wyłącza zmianę głośności z klasyfikacji w trybie mono. Włączona wymaga
+    /// opóźnienia [`CLASS_GAIN_LATENCY_SAMPLES`], żeby zdążyć przed początkiem dźwięku. Wyłączona
+    /// wraca do krótkiego opóźnienia i zerowej zmiany.
+    pub(crate) fn set_mono_class_gain(&self, enabled: bool, amount_db: f32) {
+        if let Ok(mut ring) = self.mono_ring.lock() {
+            ring.class_gain_db = amount_db.clamp(0.0, 12.0);
+            if ring.class_gain_enabled == enabled {
+                return;
+            }
+            ring.class_gain_enabled = enabled;
+            ring.target_samples = if enabled { CLASS_GAIN_LATENCY_SAMPLES } else { TARGET_RING_LATENCY_SAMPLES };
+            if !enabled {
+                ring.class_gains.clear();
+                ring.current_event = None;
+                ring.gain = 1.0;
+            }
+        }
+    }
+
+    /// Włącza albo wyłącza dynamikę Scout w trybie mono i ustawia jej siłę (0–1).
+    pub(crate) fn set_mono_scout(&self, enabled: bool, amount: f32) {
+        if let Ok(mut ring) = self.mono_ring.lock() {
+            ring.scout_amount = amount.clamp(0.0, 1.0);
+            if ring.scout_enabled != enabled {
+                ring.scout_enabled = enabled;
+                ring.scout_env = 0.0;
+                ring.scout_gain = 1.0;
+            }
+        }
+    }
+
+    /// Zapisuje zmiany głośności z klasyfikacji dla trybu mono: strzały w dół, kroki w górę.
+    /// Numer ramki liczymy z czasu początku zdarzenia i częstotliwości wejścia, tak jak bufor
+    /// liczy swoje ramki, więc zmiana trafia w ten sam dźwięk.
+    pub(crate) fn push_class_gains(&self, hits: &[layers::LayerHit], sample_rate: f32) {
+        if let Ok(mut ring) = self.mono_ring.lock() {
+            if !ring.class_gain_enabled {
+                return;
+            }
+            for hit in hits {
+                let db = match hit.layer {
+                    layers::Layer::Shots => -ring.class_gain_db,
+                    layers::Layer::Steps => ring.class_gain_db,
+                    layers::Layer::Rest => continue,
+                };
+                let frame = (hit.onset_s * f64::from(sample_rate)).round().max(0.0) as u64;
+                ring.class_gains.push_back((frame, db));
+            }
+            while ring.class_gains.len() > MAX_CLASS_GAIN_EVENTS {
+                ring.class_gains.pop_front();
+            }
+        }
+    }
+
+    /// Czyta dokładnie `count` próbek "ważonego mono" ze zmianą głośności z klasyfikacji. Wejście i wyjście to
     /// dwa NIEZALEŻNE zegary sprzętowe (osobne urządzenia audio) — nawet przy
     /// tej samej nominalnej częstotliwości próbkowania powoli się rozjeżdżają,
     /// więc bufor kołowy co jakiś czas na chwilę wysycha (podkręcanie), zanim
@@ -624,14 +837,17 @@ impl SharedAudioAnalysis {
         let mut last = self.last_pan.lock().map(|g| *g).unwrap_or((0.0, 0.0));
         if let Ok(mut ring) = self.mono_ring.lock() {
             for _ in 0..count {
-                let sample = match ring.pop_front() {
+                let sample = match ring.frames.pop_front() {
                     Some(s) => {
                         last = s;
-                        s
+                        let gain = ring.next_gain();
+                        ring.front_index += 1;
+                        ring.scout_frame(s.0 * gain, s.1 * gain)
                     }
                     None => {
                         last = (last.0 * HOLD_DECAY, last.1 * HOLD_DECAY);
-                        last
+                        let mult = ring.gain * ring.scout_gain;
+                        (last.0 * mult, last.1 * mult)
                     }
                 };
                 out.push(sample);
@@ -1028,6 +1244,9 @@ pub(crate) fn update_analysis(
         (tracker.take_ready(), accepted)
     };
 
+    // Zmiana głośności w trybie mono: strzały ciszej, kroki głośniej (patrz `push_class_gains`).
+    analysis.push_class_gains(&layer_hits, sample_rate);
+
     // Wskaźniki kierunku i kroki idą z tego samego, szybkiego detektora kanałów.
     let direction_events: Vec<DirectionEvent> = channel_activity
         .iter()
@@ -1214,6 +1433,98 @@ mod tests {
         }
     }
 
+    fn class_hit(layer: layers::Layer, onset_s: f64) -> layers::LayerHit {
+        layers::LayerHit {
+            layer,
+            class: Some(layers::Class::A),
+            pan: 0.0,
+            peak_dbfs: -10.0,
+            brightness_db: None,
+            gap_s: None,
+            onset_s,
+        }
+    }
+
+    #[test]
+    fn shot_lowers_and_step_raises_the_mono_output_after_the_event() {
+        // Strzał: 0,5 ciszej po zdarzeniu (ok. −6 dB), a przed nim bez zmian.
+        let quiet = SharedAudioAnalysis::new();
+        quiet.set_mono_class_gain(true, MONO_CLASS_GAIN_DB_DEFAULT);
+        quiet.push_stereo_pan(&vec![(0.5, 0.5); 4_000]);
+        quiet.push_class_gains(&[class_hit(layers::Layer::Shots, 0.01)], 48_000.0); // ramka 480
+        let out = quiet.read_stereo_pan(3_000);
+        assert_eq!(out[100], (0.5, 0.5), "przed zdarzeniem bez zmian");
+        assert!((out[2_000].0 - 0.25).abs() < 0.02, "strzał ok. −6 dB: {}", out[2_000].0);
+
+        // Krok: głośniej po zdarzeniu (ok. +6 dB).
+        let loud = SharedAudioAnalysis::new();
+        loud.set_mono_class_gain(true, MONO_CLASS_GAIN_DB_DEFAULT);
+        loud.push_stereo_pan(&vec![(0.3, 0.3); 4_000]);
+        loud.push_class_gains(&[class_hit(layers::Layer::Steps, 0.01)], 48_000.0);
+        let out = loud.read_stereo_pan(3_000);
+        assert!(out[2_000].0 > 0.55, "krok ok. +6 dB: {}", out[2_000].0);
+    }
+
+    #[test]
+    fn scout_boosts_quiet_and_tames_loud_sounds() {
+        let mut quiet = MonoRing { scout_enabled: true, scout_amount: 1.0, ..MonoRing::default() };
+        let mut last = (0.0, 0.0);
+        for _ in 0..20_000 {
+            last = quiet.scout_frame(0.0032, 0.0032); // ok. −50 dBFS
+        }
+        assert!(last.0 > 0.0038, "ciche podbite, ma {}", last.0);
+
+        let mut loud = MonoRing { scout_enabled: true, scout_amount: 1.0, ..MonoRing::default() };
+        let mut last = (0.0, 0.0);
+        for _ in 0..1_000 {
+            last = loud.scout_frame(0.9, 0.9); // ok. −1 dBFS
+        }
+        assert!(last.0 < 0.6, "głośne ściszone, ma {}", last.0);
+    }
+
+    #[test]
+    fn scout_keeps_silence_silent_and_is_a_no_op_when_off() {
+        let mut ring = MonoRing { scout_enabled: true, scout_amount: 1.0, ..MonoRing::default() };
+        for _ in 0..5_000 {
+            assert_eq!(ring.scout_frame(0.0, 0.0), (0.0, 0.0), "cisza zostaje ciszą");
+        }
+        let mut off = MonoRing::default();
+        assert_eq!(off.scout_frame(0.3, -0.2), (0.3, -0.2), "wyłączony Scout nie zmienia sygnału");
+    }
+
+    #[test]
+    fn class_gain_amount_follows_the_slider() {
+        // Suwak 12 dB: strzał ok. 0,5 × 10^(−12/20) ≈ 0,125.
+        let analysis = SharedAudioAnalysis::new();
+        analysis.set_mono_class_gain(true, 12.0);
+        analysis.push_stereo_pan(&vec![(0.5, 0.5); 4_000]);
+        analysis.push_class_gains(&[class_hit(layers::Layer::Shots, 0.01)], 48_000.0);
+        let out = analysis.read_stereo_pan(3_000);
+        assert!((out[2_000].0 - 0.126).abs() < 0.02, "strzał przy 12 dB: {}", out[2_000].0);
+    }
+
+    #[test]
+    fn class_gain_is_off_by_default_and_keeps_the_short_latency() {
+        let analysis = SharedAudioAnalysis::new();
+        analysis.push_stereo_pan(&vec![(0.5, 0.5); 4_000]);
+        analysis.push_class_gains(&[class_hit(layers::Layer::Shots, 0.01)], 48_000.0);
+        let out = analysis.read_stereo_pan(3_000);
+        assert_eq!(out[2_000], (0.5, 0.5), "domyślnie strzał nie jest ciszej");
+    }
+
+    #[test]
+    fn class_gain_returns_to_full_level_after_the_hold() {
+        let mut ring = MonoRing::default();
+        ring.class_gain_enabled = true;
+        ring.class_gains.push_back((0, -MONO_CLASS_GAIN_DB_DEFAULT));
+        let mut last = 1.0;
+        for _ in 0..60_000 {
+            last = ring.next_gain();
+            ring.front_index += 1;
+        }
+        assert!(last > 0.95, "po wygaśnięciu zdarzenia głośność wraca do pełnej: {last}");
+    }
+
     #[test]
     fn push_stereo_pan_trims_back_to_target_instead_of_growing_to_hard_capacity() {
         // Regresja dla "prawie sekundowego opóźnienia": gdy wejście trwale
@@ -1228,9 +1539,9 @@ mod tests {
             analysis.push_stereo_pan(&chunk); // 50 * 500 = 25 000 próbek wepchniętych, bez ani jednego odczytu
         }
 
-        let ring_len = analysis.mono_ring.lock().unwrap().len();
+        let ring_len = analysis.mono_ring.lock().unwrap().frames.len();
         assert!(
-            ring_len <= RING_TRIM_THRESHOLD_SAMPLES,
+            ring_len <= TARGET_RING_LATENCY_SAMPLES * RING_TRIM_FACTOR,
             "bufor nie powinien urosnąć powyżej progu przycinania, ma {ring_len}"
         );
         assert!(

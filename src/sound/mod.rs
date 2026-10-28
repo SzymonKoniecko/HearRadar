@@ -11,4 +11,5 @@ pub mod playback;
 pub mod recorder;
 pub mod sample_logger;
 pub mod spectrum;
+pub mod sync_tone;
 pub mod video;

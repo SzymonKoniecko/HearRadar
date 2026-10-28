@@ -25,6 +25,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sound::channel_test::find_output_device;
+use crate::sound::sync_tone;
 use crate::sound::devices::{SharedAudioAnalysis, fetch_audio_from_device};
 use crate::sound::video::{self, VIDEO_FILE, VideoCapture, VideoOptions};
 
@@ -380,6 +381,7 @@ pub fn run(
     meta: SessionMeta,
     duration: Option<Duration>,
     video: Option<VideoOptions>,
+    sync_tone: bool,
 ) -> Result<()> {
     if let Some(options) = &video {
         video::check_ffmpeg(&options.ffmpeg)?;
@@ -407,6 +409,18 @@ pub fn run(
             return Err(err);
         }
     };
+
+    // Sygnał synchronizacji: pół sekundy tonu na wyjściu, który łapią oba nagrania. Strumień wyjścia
+    // gasi się zaraz po tonie, żeby nie wysyłał ciszy przez cały czas nagrywania.
+    if sync_tone {
+        match sync_tone::play(device_name) {
+            Ok(tone) => {
+                std::thread::sleep(Duration::from_secs_f32(sync_tone::SYNC_TONE_S + 0.2));
+                drop(tone);
+            }
+            Err(err) => eprintln!("Ostrzeżenie: sygnał synchronizacji nie zagrał: {err}"),
+        }
+    }
 
     let capture = match &video {
         Some(options) => {

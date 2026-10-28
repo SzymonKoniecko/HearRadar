@@ -1,11 +1,11 @@
 {
   "anchor_x": 0.5,
-  "anchor_y": 0.52,
-  "radius": 65.0,
-  "bg_alpha": 1.0,
-  "fg_alpha": 1.0,
+  "anchor_y": 0.91,
+  "radius": 165.0,
+  "bg_alpha": 0.45,
+  "fg_alpha": 0.78,
   "high_contrast": false,
-  "decay_secs": 1.75,
+  "decay_secs": 2.6,
   "color_rules": [
     {
       "freq_min": 0.0,
@@ -64,9 +64,10 @@
     }
   ],
   "overlay_click_through": true,
-  "mono_boost_db": 16.5,
-  "mono_tone_db": 7.0,
-  "radar_sensitivity": 13.0,
+  "mono_boost_db": 12.0,
+  "mono_tone_db": 6.0,
+  "mono_class_gain": true,
+  "radar_sensitivity": 20.0,
   "edge_glow_enabled": false,
   "speaker_layout_view": true,
   "stereo_left_color": [
@@ -80,14 +81,14 @@
     50
   ],
   "spatial_audio_view": false,
-  "line_thickness": 1.35,
-  "mono_cue_style": "Dark",
+  "line_thickness": 0.9,
+  "mono_cue_style": "Squeaky",
   "direction_contrast_enabled": false,
   "visualization_mode": "LayerBars",
-  "layer_arc_inner": 0.69,
-  "layer_arc_spacing": 0.15,
+  "layer_arc_inner": 0.54,
+  "layer_arc_spacing": 0.3,
   "layer_steps_gain": 4.0,
-  "layer_shots_gain": 2.3,
+  "layer_shots_gain": 2.7,
   "layer_rest_gain": 2.45,
   "layer_shots_color": [
     255,

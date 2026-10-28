@@ -682,6 +682,51 @@ impl HearRadarApp {
             self.write_radar_config();
         }
 
+        // Zmiana głośności z klasyfikacji: strzały ciszej, kroki głośniej. Wymaga opóźnienia
+        // wyjścia mono (`devices::CLASS_GAIN_LATENCY_SAMPLES`), więc jest domyślnie wyłączona.
+        if ui
+            .checkbox(
+                &mut self.radar_config.mono_class_gain,
+                "Strzały ciszej, kroki głośniej (+0,25 s opóźnienia)",
+            )
+            .on_hover_text("Na podstawie klasyfikacji radaru: strzały i wybuchy ciszej, kroki głośniej.")
+            .changed()
+        {
+            self.write_radar_config();
+        }
+
+        // Wielkość zmiany klas: strzały i wybuchy o tyle ciszej, kroki o tyle głośniej.
+        if ui
+            .add_enabled(
+                self.radar_config.mono_class_gain,
+                egui::Slider::new(&mut self.radar_config.mono_class_gain_db, 0.0..=12.0)
+                    .text("Zmiana klas (strzały ↓, kroki ↑)")
+                    .suffix(" dB"),
+            )
+            .changed()
+        {
+            self.write_radar_config();
+        }
+
+        // Scout: podbija ciche (kroki, przeładowanie) i ścisza głośne (wybuchy) w mono.
+        if ui
+            .checkbox(&mut self.radar_config.mono_scout, "Scout: wzmocnij ciche, ścisz głośne (mono)")
+            .changed()
+        {
+            self.write_radar_config();
+        }
+        if ui
+            .add_enabled(
+                self.radar_config.mono_scout,
+                egui::Slider::new(&mut self.radar_config.mono_scout_amount, 0.0..=1.0)
+                    .text("Siła Scout")
+                    .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+            )
+            .changed()
+        {
+            self.write_radar_config();
+        }
+
         let is_routing = self.mono_router.is_some();
         let can_start = capturing && !self.mono_sel_out.is_empty();
         ui.add_enabled_ui(can_start || is_routing, |ui| {

@@ -341,7 +341,7 @@ fn soft_limit(x: f32) -> f32 {
 /// wysokich to `+x/2` na wysokich i `-x/2` na niskich (pochylenie, a nie
 /// sama głośność).
 fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
-    let (ear, boost_db, cue_style, tone_db) = analysis
+    let (ear, boost_db, cue_style, tone_db, class_gain, class_gain_db, scout, scout_amount) = analysis
         .lock()
         .map(|g| {
             (
@@ -349,9 +349,16 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
                 g.radar_config.mono_boost_db,
                 g.radar_config.mono_cue_style,
                 g.radar_config.mono_tone_db,
+                g.radar_config.mono_class_gain,
+                g.radar_config.mono_class_gain_db,
+                g.radar_config.mono_scout,
+                g.radar_config.mono_scout_amount,
             )
         })
-        .unwrap_or((MonoEar::Off, 0.0, MonoCueStyle::Off, 0.0));
+        .unwrap_or((MonoEar::Off, 0.0, MonoCueStyle::Off, 0.0, false, 0.0, false, 0.0));
+    // Przełączniki i siły idą do bufora; zastosują się od następnego callbacku.
+    analysis.set_mono_class_gain(class_gain, class_gain_db);
+    analysis.set_mono_scout(scout, scout_amount);
     OutputSettings {
         ear,
         gain: db_to_linear(boost_db),

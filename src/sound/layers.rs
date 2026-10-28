@@ -26,9 +26,9 @@ const LEVEL_CEIL_DBFS: f32 = -5.0;
 /// Długość ramki analizy (jak `FRAME_S` w `detect_events.py`).
 const FRAME_S: f32 = 0.01;
 /// Reguła wykrywania zdarzeń, ta sama co w `detect_events.py`: poziom musi wzrosnąć o 9 dB
-/// ponad tło, czyli minimum z ostatnich 0,5 s (50 ramek), i być co najmniej −40 dBFS.
+/// ponad tło, czyli minimum z ostatnich 0,5 s (50 ramek), i być co najmniej −55 dBFS.
 const DETECT_THRESHOLD_DB: f32 = 9.0;
-const DETECT_MIN_LEVEL_DBFS: f32 = -40.0;
+const DETECT_MIN_LEVEL_DBFS: f32 = -55.0;
 const BASELINE_FRAMES: usize = 50;
 /// Onset krótszy niż to od poprzedniego zdarzenia to ten sam dźwięk (jak `refractory_s` w `detect_events.py`).
 const EVENT_REFRACTORY_S: f32 = 0.15;
@@ -323,7 +323,7 @@ impl LayerTracker {
 
     /// Jedna pełna ramka zaczynająca się w `start`. Reguła z `detect_events.py`: przekroczenie
     /// tła o 9 dB (przy wejściu w przekroczenie, nie przez cały czas), poziom co najmniej
-    /// −40 dBFS i odstęp co najmniej 0,15 s od poprzedniego zdarzenia.
+    /// −55 dBFS i odstęp co najmniej 0,15 s od poprzedniego zdarzenia.
     fn on_frame(&mut self, level: f32, start: u64) {
         let base = self.levels.iter().copied().reduce(f32::min).unwrap_or(level);
         let rise = level - base;
@@ -362,7 +362,7 @@ impl LayerTracker {
     }
 
     /// Czy zewnętrzny detektor może teraz zgłosić zdarzenie: poziom przeszedł przez próg reguły
-    /// z Pythona (9 dB ponad tło, co najmniej −40 dBFS) w ostatnich 150 ms. Jedno przejście to
+    /// z Pythona (9 dB ponad tło, co najmniej −55 dBFS) w ostatnich 150 ms. Jedno przejście to
     /// jedno zdarzenie, więc odrzuca szum przy starcie i ogon dźwięku.
     pub fn onset_allowed(&self) -> bool {
         let window = (0.15 * self.rate).round() as u64;
@@ -686,7 +686,7 @@ mod tests {
         assert!(!tracker.onset_allowed(), "jedno przejście to jedno zdarzenie");
         let quiet: Vec<f32> = noise(0.001, 4_800).iter().flat_map(|&s| [s, s]).collect();
         tracker.push_frames(&quiet, 2, RATE);
-        assert!(!tracker.onset_allowed(), "poniżej −40 dBFS nie ma przejścia");
+        assert!(!tracker.onset_allowed(), "poniżej −55 dBFS nie ma przejścia");
     }
 
     #[test]

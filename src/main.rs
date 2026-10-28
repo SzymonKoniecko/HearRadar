@@ -40,7 +40,8 @@ fn listen_cable(seconds: u64) -> anyhow::Result<()> {
 
 /// Wspólna obsługa `--recordSample` i `--recordVideo`. `pos` to indeks nazwy komendy.
 /// Opcje: --device, --game, --scene, --mode, --output, --spatial, --game-volume,
-/// --windows-volume, --seconds; dla wideo także --ffmpeg, --window, --fps.
+/// --windows-volume, --seconds, --sygnal (flaga: pół sekundy tonu na starcie); dla wideo także
+/// --ffmpeg, --window, --fps.
 fn record_command(args: &[String], pos: usize, with_video: bool) {
     let command = if with_video { "--recordVideo" } else { "--recordSample" };
     let Some(name) = args.get(pos + 1) else {
@@ -88,7 +89,8 @@ fn record_command(args: &[String], pos: usize, with_video: bool) {
             fps,
         }
     });
-    if let Err(err) = sound::recorder::run(name, device, meta, duration, video) {
+    let sync_tone = args.iter().any(|a| a == "--sygnal");
+    if let Err(err) = sound::recorder::run(name, device, meta, duration, video, sync_tone) {
         eprintln!("Błąd: {err}");
         std::process::exit(1);
     }
