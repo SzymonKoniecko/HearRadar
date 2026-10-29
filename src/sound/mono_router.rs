@@ -90,19 +90,109 @@ const BRIGHT_HIGHPASS_CUTOFF_HZ: f32 = 800.0;
 /// przesterowania przy typowych, niegłośnych sygnałach z radaru.
 const BRIGHT_BOOST_GAIN: f32 = 1.5;
 
+/// Parametry nowych wskazówek (patrz warianty `MonoCueStyle::Comb`…`PitchWobble`). Opóźnienia
+/// w sekundach, odcięcia w Hz, wzmocnienia liniowo (0,794 ≈ −2 dB itd.).
+const MAX_DELAY_SAMPLES: usize = 2_048;
+const COMB_DELAY_S: f32 = 0.0012;
+const COMB_HPF_HZ: f32 = 150.0;
+const COMB_GAIN: f32 = 0.794;
+const ECHO_DELAY_S: f32 = 0.018;
+const ECHO_LOW_HZ: f32 = 3_500.0;
+const ECHO_HPF_HZ: f32 = 120.0;
+const ECHO_GAIN: f32 = 0.708;
+const TREMOLO_HZ: f32 = 4.0;
+const TREMOLO_DEPTH: f32 = 0.4;
+const TREMOLO_HPF_HZ: f32 = 300.0;
+const TREMOLO_LPF_HZ: f32 = 4_000.0;
+const NOTCH_HPF_HZ: f32 = 200.0;
+const NOTCH_LOW_HZ: f32 = 1_500.0;
+const NOTCH_HIGH_HZ: f32 = 5_000.0;
+const NOTCH_GAIN: f32 = 0.891;
+const WOBBLE_BASE_S: f32 = 0.005;
+const WOBBLE_DEPTH_S: f32 = 0.0015;
+const WOBBLE_HZ: f32 = 2.0;
+const WOBBLE_LPF_HZ: f32 = 4_500.0;
+const WOBBLE_HPF_HZ: f32 = 100.0;
+
+/// Bufor opóźnienia: zapisuje próbkę i zwraca tę sprzed `delay_samples` (interpolacja liniowa).
+#[inline]
+fn delay_line_step(buf: &mut [f32], pos: &mut usize, sample: f32, delay_samples: f32) -> f32 {
+    let len = buf.len();
+    buf[*pos] = sample;
+    let here = *pos as f32;
+    *pos = (*pos + 1) % len;
+    let read = (here - delay_samples).rem_euclid(len as f32);
+    let i0 = read.floor() as usize % len;
+    let i1 = (i0 + 1) % len;
+    let frac = read - read.floor();
+    buf[i0] * (1.0 - frac) + buf[i1] * frac
+}
+
+#[cfg(test)]
+mod cue_style_tests {
+    use super::*;
+
+    #[test]
+    fn echo_delays_the_opposite_side_by_eighteen_ms() {
+        let sample_rate = 48_000.0;
+        let mut state = CueState::default();
+        let out: Vec<f32> = (0..2_000)
+            .map(|i| apply_cue(MonoCueStyle::Echo, if i == 0 { 1.0 } else { 0.0 }, sample_rate, &mut state))
+            .collect();
+        let peak_at = out
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        assert!((peak_at as i32 - 864).abs() <= 4, "odbicie 18 ms: szczyt w próbce {peak_at}");
+    }
+
+    #[test]
+    fn new_styles_stay_finite_and_bounded() {
+        for style in [
+            MonoCueStyle::Comb,
+            MonoCueStyle::Echo,
+            MonoCueStyle::Tremolo,
+            MonoCueStyle::Notch,
+            MonoCueStyle::PitchWobble,
+        ] {
+            let mut state = CueState::default();
+            for i in 0..10_000 {
+                let x = (i as f32 * 0.01).sin() * 0.8;
+                let y = apply_cue(style, x, 48_000.0, &mut state);
+                assert!(y.is_finite() && y.abs() < 2.0, "{style:?}: {y}");
+            }
+        }
+    }
+}
+
 /// Stan efektu DSP nakładanego na stronę przeciwną (patrz
 /// [`apply_cue`]/[`fill_output_f32`]), trzymany przez wywołującego MIĘDZY
 /// kolejnymi wywołaniami callbacku wyjściowego — inaczej faza oscylatora
 /// (`phase`) i stan filtra (`lp`) resetowałyby się co bufor, dając trzaski na
 /// granicach zamiast płynnego efektu.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct CueState {
-    /// Faza oscylatora (0.0..=1.0) dla `Buzz`/`Squeaky`/`Pulse`.
+    /// Faza oscylatora (0.0..=1.0) dla `Buzz`/`Squeaky`/`Pulse`, a także LFO dla
+    /// `Tremolo` i `PitchWobble`.
     phase: f32,
     /// Stan filtra dolnoprzepustowego jednobiegunowego dla
     /// `Muffled`/`Dark`/`Bright` (ten ostatni używa go pośrednio, przez
-    /// [`highpass_component`]).
+    /// [`highpass_component`]) oraz pierwszego filtru nowych stylów.
     lp: f32,
+    /// Drugi i trzeci filtr jednobiegunowy (np. górnoprzepustowy jako x − LP(x)).
+    lp2: f32,
+    lp3: f32,
+    /// Pozycja zapisu w buforze opóźnienia dla `Comb`, `Echo` i `PitchWobble`.
+    pos: usize,
+    delay: Vec<f32>,
+}
+
+impl Default for CueState {
+    fn default() -> Self {
+        Self { phase: 0.0, lp: 0.0, lp2: 0.0, lp3: 0.0, pos: 0, delay: vec![0.0; MAX_DELAY_SAMPLES] }
+    }
 }
 
 /// Jeden krok oscylatora modulacji amplitudy: przesuwa `state.phase` o
@@ -150,6 +240,37 @@ fn apply_cue(style: MonoCueStyle, sample: f32, sample_rate: f32, state: &mut Cue
         }
         MonoCueStyle::Muffled => one_pole_lowpass_step(sample, sample_rate, MUFFLED_CUTOFF_HZ, &mut state.lp),
         MonoCueStyle::Dark => one_pole_lowpass_step(sample, sample_rate, DARK_CUTOFF_HZ, &mut state.lp),
+        MonoCueStyle::Comb => {
+            let delayed = delay_line_step(&mut state.delay, &mut state.pos, sample, COMB_DELAY_S * sample_rate);
+            let mixed = 0.5 * sample + 0.5 * delayed;
+            let bass = one_pole_lowpass_step(mixed, sample_rate, COMB_HPF_HZ, &mut state.lp);
+            (mixed - bass) * COMB_GAIN
+        }
+        MonoCueStyle::Echo => {
+            let delayed = delay_line_step(&mut state.delay, &mut state.pos, sample, ECHO_DELAY_S * sample_rate);
+            let shaped = one_pole_lowpass_step(delayed, sample_rate, ECHO_LOW_HZ, &mut state.lp);
+            let bass = one_pole_lowpass_step(shaped, sample_rate, ECHO_HPF_HZ, &mut state.lp2);
+            (shaped - bass) * ECHO_GAIN
+        }
+        MonoCueStyle::Tremolo => {
+            let modulated = am_modulate(sample, TREMOLO_HZ, TREMOLO_DEPTH, sample_rate, &mut state.phase);
+            let bass = one_pole_lowpass_step(modulated, sample_rate, TREMOLO_HPF_HZ, &mut state.lp2);
+            one_pole_lowpass_step(modulated - bass, sample_rate, TREMOLO_LPF_HZ, &mut state.lp)
+        }
+        MonoCueStyle::Notch => {
+            let bass = one_pole_lowpass_step(sample, sample_rate, NOTCH_HPF_HZ, &mut state.lp2);
+            let low = one_pole_lowpass_step(sample - bass, sample_rate, NOTCH_LOW_HZ, &mut state.lp);
+            let high = sample - one_pole_lowpass_step(sample, sample_rate, NOTCH_HIGH_HZ, &mut state.lp3);
+            (low + high) * NOTCH_GAIN
+        }
+        MonoCueStyle::PitchWobble => {
+            state.phase = (state.phase + WOBBLE_HZ / sample_rate).fract();
+            let delay_s = WOBBLE_BASE_S + WOBBLE_DEPTH_S * (state.phase * std::f32::consts::TAU).sin();
+            let delayed = delay_line_step(&mut state.delay, &mut state.pos, sample, delay_s * sample_rate);
+            let shaped = one_pole_lowpass_step(delayed, sample_rate, WOBBLE_LPF_HZ, &mut state.lp);
+            let bass = one_pole_lowpass_step(shaped, sample_rate, WOBBLE_HPF_HZ, &mut state.lp2);
+            shaped - bass
+        }
         MonoCueStyle::Bright => {
             // Dopełnienie filtra dolnoprzepustowego (`sample - lowpass`) to
             // składowa wysokotonowa — dodajemy ją z powrotem do oryginału ze

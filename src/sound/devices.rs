@@ -367,6 +367,17 @@ pub enum MonoCueStyle {
     /// Mocniejszy filtr dolnoprzepustowy niż `Muffled` (niższe odcięcie) —
     /// strona przeciwna brzmi wyraźnie ciemniej/głucho.
     Dark,
+    /// Grzebieniowy: krótkie opóźnienie 1,2 ms zmieszane z sygnałem daje wycięcia (pierwsze ok.
+    /// 416 Hz) i "pustą", przestrzenną barwę. Bez modulacji.
+    Comb,
+    /// Odbicie od ściany: opóźnienie 18 ms, tylko strona przeciwna, stłumiona powyżej 3,5 kHz.
+    Echo,
+    /// Oddech: wolna modulacja głośności 4 Hz (głębokość 40 %) w paśmie 300 Hz – 4 kHz.
+    Tremolo,
+    /// Wycięcie środka: ubytek pasma 1,5 – 5 kHz, zostaje dół i góra.
+    Notch,
+    /// Falowanie: opóźnienie 5 ms ± 1,5 ms przy 2 Hz, czyli delikatne pływanie wysokości.
+    PitchWobble,
 }
 
 impl MonoCueStyle {
@@ -378,6 +389,11 @@ impl MonoCueStyle {
         Self::Muffled,
         Self::Bright,
         Self::Dark,
+        Self::Comb,
+        Self::Echo,
+        Self::Tremolo,
+        Self::Notch,
+        Self::PitchWobble,
     ];
 
     pub fn label(self) -> &'static str {
@@ -389,6 +405,11 @@ impl MonoCueStyle {
             Self::Muffled => "Stłumiony",
             Self::Bright => "Jasny",
             Self::Dark => "Ciemny",
+            Self::Comb => "Grzebień",
+            Self::Echo => "Odbicie",
+            Self::Tremolo => "Oddech",
+            Self::Notch => "Wycięcie środka",
+            Self::PitchWobble => "Falowanie",
         }
     }
 }
@@ -549,6 +570,9 @@ const SCOUT_MAX_DOWN_DB: f32 = 6.0;
 const SCOUT_ATTACK_FRAMES: f32 = 240.0;
 const SCOUT_RELEASE_FRAMES: f32 = 7_200.0;
 const SCOUT_ENV_RELEASE_FRAMES: f32 = 7_200.0;
+/// Wyprzedzenie obwiedni Scout (ramki): zmiana głośności startuje tyle przed szczytem, żeby
+/// narastanie 5 ms zdążyło przed uderzeniem. 5 ms przy 48 kHz.
+const SCOUT_LOOKAHEAD_FRAMES: usize = 240;
 
 /// Bufor kołowy mono: ramki "ważonego mono", ich numery w osi wejścia i obwiednia zmian
 /// głośności z klasyfikacji. Wszystko pod jednym zamkiem, żeby numer ramki i zdarzenie zawsze
@@ -578,6 +602,9 @@ struct MonoRing {
     scout_env: f32,
     /// Bieżący mnożnik Scout (liniowo). Start na 1,0, czyli bez zmian.
     scout_gain: f32,
+    /// Docelowa zmiana Scout w dB dla każdej ramki w kolejce, równolegle do `frames`. Liczona
+    /// przy wejściu, więc odczyt widzi ją z wyprzedzeniem.
+    scout_targets: VecDeque<f32>,
 }
 
 impl Default for MonoRing {
@@ -595,6 +622,7 @@ impl Default for MonoRing {
             scout_amount: 0.5,
             scout_env: 0.0,
             scout_gain: 1.0,
+            scout_targets: VecDeque::new(),
         }
     }
 }
@@ -625,17 +653,31 @@ impl MonoRing {
         self.gain
     }
 
-    /// Dynamika Scout: podbija ciche i ścisza głośne. Oba kanały dostają ten sam mnożnik,
-    /// więc balans L/P zostaje. Gdy Scout jest wyłączony, ramka przechodzi bez zmian.
-    fn scout_frame(&mut self, l: f32, r: f32) -> (f32, f32) {
+    /// Wejście: poziom ramki i zmiana Scout w dB dla niej. Przy wyłączonym Scout zwraca 0 dB.
+    fn scout_level_db(&mut self, l: f32, r: f32) -> f32 {
+        let peak = l.abs().max(r.abs());
+        self.scout_env = peak.max(self.scout_env * (-1.0 / SCOUT_ENV_RELEASE_FRAMES).exp());
+        if !self.scout_enabled {
+            return 0.0;
+        }
+        let level_db = 20.0 * self.scout_env.max(1e-6).log10();
+        scout_target_db(level_db, self.scout_amount)
+    }
+
+    /// Wyjście: stosuje Scout do ramki. `own_db` to jej zmiana, a ramki w kolejce dają
+    /// wyprzedzenie: bierzemy najmocniejsze ściszenie z oknem [`SCOUT_LOOKAHEAD_FRAMES`]. Oba
+    /// kanały dostają ten sam mnożnik, więc balans L/P zostaje.
+    fn scout_apply(&mut self, l: f32, r: f32, own_db: f32) -> (f32, f32) {
         if !self.scout_enabled {
             self.scout_gain = 1.0;
             return (l, r);
         }
-        let peak = l.abs().max(r.abs());
-        self.scout_env = peak.max(self.scout_env * (-1.0 / SCOUT_ENV_RELEASE_FRAMES).exp());
-        let level_db = 20.0 * self.scout_env.max(1e-6).log10();
-        let target = 10f32.powf(scout_target_db(level_db, self.scout_amount) / 20.0);
+        let ahead = self
+            .scout_targets
+            .iter()
+            .take(SCOUT_LOOKAHEAD_FRAMES - 1)
+            .fold(own_db, |m, &t| m.min(t));
+        let target = 10f32.powf(ahead / 20.0);
         // Ściszanie głośnych ma być szybkie, a podbijanie cichych łagodne, żeby nie pompowało.
         let frames = if target < self.scout_gain { SCOUT_ATTACK_FRAMES } else { SCOUT_RELEASE_FRAMES };
         self.scout_gain += (target - self.scout_gain) * (1.0 - (-1.0 / frames).exp());
@@ -752,14 +794,18 @@ impl SharedAudioAnalysis {
             for &s in samples {
                 if ring.frames.len() >= MONO_RING_CAPACITY {
                     ring.frames.pop_front();
+                    ring.scout_targets.pop_front();
                     ring.front_index += 1;
                 }
+                let db = ring.scout_level_db(s.0, s.1);
                 ring.frames.push_back(s);
+                ring.scout_targets.push_back(db);
             }
             if ring.frames.len() > ring.target_samples * RING_TRIM_FACTOR {
                 let excess = ring.frames.len() - ring.target_samples;
                 for _ in 0..excess {
                     ring.frames.pop_front();
+                    ring.scout_targets.pop_front();
                 }
                 ring.front_index += excess as u64;
             }
@@ -842,7 +888,8 @@ impl SharedAudioAnalysis {
                         last = s;
                         let gain = ring.next_gain();
                         ring.front_index += 1;
-                        ring.scout_frame(s.0 * gain, s.1 * gain)
+                        let own_db = ring.scout_targets.pop_front().unwrap_or(0.0);
+                        ring.scout_apply(s.0 * gain, s.1 * gain, own_db)
                     }
                     None => {
                         last = (last.0 * HOLD_DECAY, last.1 * HOLD_DECAY);
@@ -1467,29 +1514,45 @@ mod tests {
 
     #[test]
     fn scout_boosts_quiet_and_tames_loud_sounds() {
-        let mut quiet = MonoRing { scout_enabled: true, scout_amount: 1.0, ..MonoRing::default() };
+        let quiet = SharedAudioAnalysis::new();
+        quiet.set_mono_scout(true, 1.0);
         let mut last = (0.0, 0.0);
-        for _ in 0..20_000 {
-            last = quiet.scout_frame(0.0032, 0.0032); // ok. −50 dBFS
+        for _ in 0..10 {
+            quiet.push_stereo_pan(&vec![(0.0032, 0.0032); 2_000]); // ok. −50 dBFS
+            last = *quiet.read_stereo_pan(2_000).last().unwrap();
         }
         assert!(last.0 > 0.0038, "ciche podbite, ma {}", last.0);
 
-        let mut loud = MonoRing { scout_enabled: true, scout_amount: 1.0, ..MonoRing::default() };
-        let mut last = (0.0, 0.0);
-        for _ in 0..1_000 {
-            last = loud.scout_frame(0.9, 0.9); // ok. −1 dBFS
-        }
-        assert!(last.0 < 0.6, "głośne ściszone, ma {}", last.0);
+        let loud = SharedAudioAnalysis::new();
+        loud.set_mono_scout(true, 1.0);
+        loud.push_stereo_pan(&vec![(0.9, 0.9); 2_000]); // ok. −1 dBFS
+        let out = loud.read_stereo_pan(2_000);
+        assert!(out[1_999].0 < 0.6, "głośne ściszone, ma {}", out[1_999].0);
     }
 
     #[test]
     fn scout_keeps_silence_silent_and_is_a_no_op_when_off() {
-        let mut ring = MonoRing { scout_enabled: true, scout_amount: 1.0, ..MonoRing::default() };
-        for _ in 0..5_000 {
-            assert_eq!(ring.scout_frame(0.0, 0.0), (0.0, 0.0), "cisza zostaje ciszą");
-        }
-        let mut off = MonoRing::default();
-        assert_eq!(off.scout_frame(0.3, -0.2), (0.3, -0.2), "wyłączony Scout nie zmienia sygnału");
+        let silent = SharedAudioAnalysis::new();
+        silent.set_mono_scout(true, 1.0);
+        silent.push_stereo_pan(&vec![(0.0, 0.0); 5_000]);
+        assert!(silent.read_stereo_pan(5_000).iter().all(|&s| s == (0.0, 0.0)), "cisza zostaje ciszą");
+        let off = SharedAudioAnalysis::new();
+        off.push_stereo_pan(&[(0.3, -0.2)]);
+        assert_eq!(off.read_stereo_pan(1)[0], (0.3, -0.2), "wyłączony Scout nie zmienia sygnału");
+    }
+
+    #[test]
+    fn scout_lookahead_turns_down_a_shot_before_its_peak() {
+        let analysis = SharedAudioAnalysis::new();
+        analysis.set_mono_scout(true, 1.0);
+        let mut input = vec![(0.005, 0.005); 2_000];
+        input.extend(vec![(0.9, 0.9); 240]); // strzał
+        input.extend(vec![(0.005, 0.005); 2_000]);
+        analysis.push_stereo_pan(&input);
+        let out = analysis.read_stereo_pan(input.len());
+        let peak = out[2_000..2_240].iter().map(|s| s.0).fold(0.0f32, f32::max);
+        // Bez wyprzedzenia szczyt zostałby ok. 0,93; z wyprzedzeniem jest ściszony już w trakcie narastania.
+        assert!(peak < 0.72, "szczyt strzału ściszony zanim dojdzie: {peak}");
     }
 
     #[test]
