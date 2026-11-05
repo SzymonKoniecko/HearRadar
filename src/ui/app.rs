@@ -1454,6 +1454,7 @@ impl eframe::App for HearRadarApp {
                         &self.analysis,
                         &self.radar_config,
                         self.out_devices.as_deref().unwrap_or(&[]),
+                        self.mono_router.is_some() && self.mono_ear != MonoEar::Off,
                     );
                     cols[0].separator();
                     self.ui_config_panel(&mut cols[0]);

@@ -23,6 +23,10 @@ use cpal::{
     traits::{DeviceTrait, StreamTrait},
 };
 use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_4};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// Kierunki testu w konwencji radaru.
 pub const DIRECTIONS_DEG: [f32; 8] = [-135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0];
@@ -30,6 +34,36 @@ pub const DIRECTIONS_DEG: [f32; 8] = [-135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135
 /// Kanały wejścia radaru symulowane, gdy nic akurat nie przechwytuje. `8` to 7.1, jak przy
 /// kablu wirtualnym (CABLE Input). Sygnał idzie na FL/FR, reszta kanałów zostaje cicha.
 pub const DEFAULT_CHANNELS: usize = 8;
+
+/// Częstotliwość próbkowania toru na żywo (przechwycone audio i mono router).
+pub const MONO_RATE: f32 = 48_000.0;
+
+/// Tor dźwięku próby: prosto na wybrane wyjście, albo wpuszczona w analizę na żywo, skąd idzie
+/// przez mono router (z jego ustawieniami ucha, wskazówki, tonu, Scouta, zmiany klas i wzmocnienia).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    Direct,
+    Mono,
+}
+
+impl Route {
+    pub const ALL: [Route; 2] = [Route::Direct, Route::Mono];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Route::Direct => "Bezpośrednio",
+            Route::Mono => "Przez mono router",
+        }
+    }
+
+    /// Nazwa w pliku CSV.
+    pub fn key(self) -> &'static str {
+        match self {
+            Route::Direct => "direct",
+            Route::Mono => "mono",
+        }
+    }
+}
 
 /// Odstęp między kawałkami analizy, jak w `playback` i w typowym buforze cpal.
 const CHUNK_S: f64 = 0.01;
@@ -275,13 +309,14 @@ pub struct RowContext {
     pub unix_ts_ms: u128,
     pub trial_no: usize,
     pub signal: Signal,
+    pub route: Route,
     /// `true` przy wskazaniu myszką, `false` przy przycisku kierunku.
     pub pointer: bool,
     pub channels: usize,
     pub sensitivity: f32,
 }
 
-pub const CSV_HEADER: &str = "unix_ts_ms,trial,signal,answer,channels,sensitivity,expected_deg,perceived_deg,perceived_err_deg,radar_deg,radar_err_deg,radar_events,radar_all\n";
+pub const CSV_HEADER: &str = "unix_ts_ms,trial,signal,route,answer,channels,sensitivity,expected_deg,perceived_deg,perceived_err_deg,radar_deg,radar_err_deg,radar_events,radar_all\n";
 
 /// Jeden wiersz CSV. Błędy to różnice ze znakiem, w `(-180, 180]`. Brakujące wartości zostają puste.
 pub fn csv_row(ctx: &RowContext, trial: &Trial) -> String {
@@ -295,10 +330,11 @@ pub fn csv_row(ctx: &RowContext, trial: &Trial) -> String {
         .map(|(angle, weight)| format!("{angle:.1}:{weight:.2}"))
         .collect();
     format!(
-        "{},{},{},{},{},{:.2},{:.1},{},{},{},{},{},{}\n",
+        "{},{},{},{},{},{},{:.2},{:.1},{},{},{},{},{},{}\n",
         ctx.unix_ts_ms,
         ctx.trial_no,
         ctx.signal.key(),
+        ctx.route.key(),
         if ctx.pointer { "pointer" } else { "button" },
         ctx.channels,
         ctx.sensitivity,
@@ -366,6 +402,50 @@ fn summarize_group(group: &[&Trial], expected_deg: Option<f32>) -> Summary {
 
 fn mean(values: &[f32]) -> Option<f32> {
     (!values.is_empty()).then(|| values.iter().sum::<f32>() / values.len() as f32)
+}
+
+/// Wpuszcza próbę w analizę na żywo w czasie rzeczywistym, tak jak przechwycone audio z gry:
+/// `live` dostaje ją przez `update_analysis`, więc mono router gra ją ze swoimi ustawieniami, a radar
+/// pokazuje kropki. Równolegle `probe` liczy zdarzenia do wyniku. Wątek kończy się po próbie (albo
+/// gdy `stop` zostanie ustawione) i zwraca zdarzenia `(kąt, intensywność)`.
+pub fn feed_through_radar(
+    input: Vec<f32>,
+    channels: usize,
+    rate: f32,
+    live: SharedAudioAnalysis,
+    probe: SharedAudioAnalysis,
+    config: RadarConfig,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<Vec<(f32, f32)>> {
+    thread::spawn(move || {
+        let channels = channels.max(1);
+        let chunk = ((rate as f64 * CHUNK_S).round().max(1.0) as usize) * channels;
+        if let Ok(mut g) = probe.lock() {
+            g.radar_config = config;
+        }
+        let started = Instant::now();
+        let mut events = Vec::new();
+        for (k, part) in input.chunks(chunk).enumerate() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            // Tempo od startu, a nie suma `sleep`, żeby błędy nie narastały.
+            let due = started + Duration::from_secs_f64(k as f64 * CHUNK_S);
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                thread::sleep(wait);
+            }
+            devices::update_analysis(part, channels, rate, &live, None);
+            devices::update_analysis(part, channels, rate, &probe, None);
+            if let Ok(mut g) = probe.lock() {
+                events.extend(
+                    g.drain_direction_events()
+                        .into_iter()
+                        .map(|queued| (queued.event.angle_deg, queued.event.intensity)),
+                );
+            }
+        }
+        events
+    })
 }
 
 #[cfg(test)]
@@ -468,6 +548,7 @@ mod tests {
             unix_ts_ms: 1,
             trial_no: 2,
             signal: Signal::Itd,
+            route: Route::Direct,
             pointer: true,
             channels: 8,
             sensitivity: 20.0,
@@ -475,7 +556,7 @@ mod tests {
         let trial = Trial { expected_deg: 90.0, perceived_deg: None, radar_events: vec![(45.0, 0.5)] };
         let row = csv_row(&ctx, &trial);
         assert_eq!(row.matches(',').count(), CSV_HEADER.matches(',').count());
-        assert_eq!(row, "1,2,itd,pointer,8,20.00,90.0,,,45.0,-45.0,1,45.0:0.50\n");
+        assert_eq!(row, "1,2,itd,direct,pointer,8,20.00,90.0,,,45.0,-45.0,1,45.0:0.50\n");
     }
 
     #[test]
@@ -485,6 +566,31 @@ mod tests {
         let events = measure(&samples, DEFAULT_CHANNELS, RATE, &probe, &RadarConfig::default());
         let reading = radar_reading(&events).expect("próba z prawej powinna dać zdarzenie");
         assert!(reading > 0.0, "radar: {reading}");
+    }
+
+    #[test]
+    fn feeding_through_the_live_analysis_measures_what_measuring_directly_does() {
+        let input = probe_input(&burst_stereo(90.0, Signal::Level, RATE), DEFAULT_CHANNELS, RATE);
+        let direct = measure(&input, DEFAULT_CHANNELS, RATE, &SharedAudioAnalysis::new(), &RadarConfig::default());
+        assert!(!direct.is_empty(), "próba z prawej powinna dać zdarzenie");
+
+        let live = SharedAudioAnalysis::new();
+        let worker = feed_through_radar(
+            input,
+            DEFAULT_CHANNELS,
+            RATE,
+            live.clone(),
+            SharedAudioAnalysis::new(),
+            RadarConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let through = worker.join().expect("wątek próby nie powinien paść");
+
+        assert_eq!(through.len(), direct.len());
+        for (a, b) in through.iter().zip(&direct) {
+            assert!((a.0 - b.0).abs() < 1e-4 && (a.1 - b.1).abs() < 1e-4, "{a:?} vs {b:?}");
+        }
+        assert_eq!(live.lock().unwrap().channel_count, DEFAULT_CHANNELS);
     }
 
     /// Raport do ręcznego odczytu: co radar pokazuje dla każdego kierunku i sygnału.

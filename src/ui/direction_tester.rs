@@ -1,19 +1,24 @@
-//! Panel „Test kierunków” w oknie głównym. Odtwarza próby przez wybrane wyjście, zbiera
-//! odpowiedzi i zapisuje każdą próbę do pliku CSV w katalogu configu (patrz
-//! `sound::direction_test`).
+//! Panel „Test kierunków” w oknie głównym. Odtwarza próby i zbiera odpowiedzi; każda próba trafia
+//! do pliku CSV w katalogu configu (patrz `sound::direction_test`).
 //!
-//! Dwa sposoby odpowiedzi: przycisk jednego z ośmiu kierunków albo ustawienie myszki na kompasie
-//! w stronę, z której dźwięk przyszedł (kliknięcie zapisuje kąt). Kierunek nie jest pokazywany
-//! przed odpowiedzią, żeby nie podpowiadać.
+//! Tor dźwięku: „Bezpośrednio” gra surowy sygnał na wybranym wyjściu. „Przez mono router” wpuszcza
+//! próbę w analizę na żywo, więc słyszysz ją przez mono router z jego ustawieniami (ucho, wskazówka,
+//! ton, Scout, zmiana klas, wzmocnienie). Radar liczy kierunek przed routerem, jak w grze.
+//!
+//! Dwa sposoby odpowiedzi: przycisk kierunku albo kompas (kliknięcie zapisuje kąt). Kierunek nie
+//! jest pokazywany przed odpowiedzią, żeby nie podpowiadać.
 
 use crate::config_store;
 use crate::sound::devices::{RadarConfig, SharedAudioAnalysis, SoundDevice};
-use crate::sound::direction_test::{self as dt, RowContext, Signal, Trial};
+use crate::sound::direction_test::{self as dt, Route, RowContext, Signal, Trial};
 use anyhow::Result;
 use eframe::egui;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const COMPASS_SIZE: f32 = 230.0;
@@ -34,17 +39,26 @@ enum Answer {
     Pointer,
 }
 
+/// Próba w trakcie odtwarzania przez mono router: wątek wpuszcza ją w analizę na żywo.
+struct Pending {
+    worker: JoinHandle<Vec<(f32, f32)>>,
+    stop: Arc<AtomicBool>,
+}
+
 /// Sesja w toku: kolejka prób, wyniki, plik CSV i stan bieżącej próby.
 struct Session {
     queue: Vec<f32>,
     index: usize,
     trials: Vec<Trial>,
     signal: Signal,
+    route: Route,
     answer: Answer,
     channels: usize,
     sensitivity: f32,
     /// Zdarzenia radaru z już odtworzonej próby, która czeka na odpowiedź.
     heard: Option<Vec<(f32, f32)>>,
+    /// Próba w trakcie odtwarzania przez mono router.
+    pending: Option<Pending>,
     last: Option<String>,
     file: File,
     path: PathBuf,
@@ -54,6 +68,7 @@ struct Session {
 struct Report {
     trials: Vec<Trial>,
     path: PathBuf,
+    route: Route,
 }
 
 /// Akcja z panelu, wykonywana po narysowaniu klatki (żeby nie pożyczać `self` w trakcie rysowania).
@@ -65,13 +80,14 @@ enum Action {
 }
 
 pub struct DirectionTester {
-    /// Osobna analiza, którą karmimy próbami. Nie zabiera zdarzeń radarowi.
-    probe: SharedAudioAnalysis,
     output: String,
     signal: Signal,
+    route: Route,
     answer: Answer,
     repeats: usize,
-    /// Strumień bieżącej próby. Upuszczenie go przerywa dźwięk.
+    /// Czy mono router teraz gra (routing włączony i ucho wybrane). Ustawiane przy każdym `ui`.
+    mono_audible: bool,
+    /// Strumień bezpośredniej próby. Upuszczenie go przerywa dźwięk.
     playing: Option<cpal::Stream>,
     session: Option<Session>,
     report: Option<Report>,
@@ -81,11 +97,12 @@ pub struct DirectionTester {
 impl DirectionTester {
     pub fn new() -> Self {
         Self {
-            probe: SharedAudioAnalysis::new(),
             output: String::new(),
             signal: Signal::Level,
+            route: Route::Direct,
             answer: Answer::Buttons,
             repeats: 2,
+            mono_audible: false,
             playing: None,
             session: None,
             report: None,
@@ -96,15 +113,17 @@ impl DirectionTester {
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
-        shared: &SharedAudioAnalysis,
+        live: &SharedAudioAnalysis,
         config: &RadarConfig,
         outputs: &[SoundDevice],
+        mono_audible: bool,
     ) {
         ui.heading("Test kierunków (słuchawki)");
         ui.label(
-            "Radar dostaje ten sam dźwięk, który słyszysz. Posłuchaj, skąd przyszedł, wskaż \
-             kierunek. Wynik trafia do pliku CSV razem z tym, co pokazał radar.",
+            "Posłuchaj, skąd przyszedł dźwięk, i wskaż kierunek. Wynik trafia do pliku CSV razem z tym, \
+             co pokazał radar.",
         );
+        self.mono_audible = mono_audible;
 
         if !outputs.iter().any(|d| d.name == self.output) {
             self.output = outputs
@@ -115,14 +134,16 @@ impl DirectionTester {
                 .unwrap_or_default();
         }
 
+        self.collect_pending(ui.ctx());
+
         let action = if self.session.is_some() {
             self.ui_session(ui)
         } else {
-            self.ui_setup(ui, shared, outputs)
+            self.ui_setup(ui, live, outputs)
         };
         match action {
-            Some(Action::Start) => self.start_session(shared, config),
-            Some(Action::Play) => self.play_current(config),
+            Some(Action::Start) => self.start_session(live, config),
+            Some(Action::Play) => self.play_current(live, config),
             Some(Action::Answer(angle)) => self.answer(angle),
             Some(Action::Finish) => self.finish_session(),
             None => {}
@@ -136,23 +157,62 @@ impl DirectionTester {
         }
     }
 
+    /// Odbiera wynik próby, którą wątek skończył wpuszczać w analizę.
+    fn collect_pending(&mut self, ctx: &egui::Context) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let Some(pending) = session.pending.take() else {
+            return;
+        };
+        if pending.worker.is_finished() {
+            session.heard = Some(pending.worker.join().unwrap_or_default());
+        } else {
+            session.pending = Some(pending);
+            ctx.request_repaint();
+        }
+    }
+
     fn ui_setup(
         &mut self,
         ui: &mut egui::Ui,
-        shared: &SharedAudioAnalysis,
+        live: &SharedAudioAnalysis,
         outputs: &[SoundDevice],
     ) -> Option<Action> {
-        // Osobny klucz niż w mono routerze (ta sama etykieta dałaby wspólny stan rozwijania).
         ui.horizontal(|ui| {
-            ui.label("Wyjście (słuchawki)");
-            egui::ComboBox::from_id_salt("direction_test_output")
-                .selected_text(self.output.clone())
-                .show_ui(ui, |ui| {
-                    for dev in outputs {
-                        ui.selectable_value(&mut self.output, dev.name.clone(), &dev.name);
-                    }
-                });
+            ui.label("Tor dźwięku:");
+            for route in Route::ALL {
+                ui.selectable_value(&mut self.route, route, route.label());
+            }
         });
+        match self.route {
+            Route::Direct => {
+                // `from_id_salt`, nie `from_label`: ta sama etykieta co w mono routerze dałaby wspólny stan.
+                ui.horizontal(|ui| {
+                    ui.label("Wyjście (słuchawki)");
+                    egui::ComboBox::from_id_salt("direction_test_output")
+                        .selected_text(self.output.clone())
+                        .show_ui(ui, |ui| {
+                            for dev in outputs {
+                                ui.selectable_value(&mut self.output, dev.name.clone(), &dev.name);
+                            }
+                        });
+                });
+            }
+            Route::Mono => {
+                if self.mono_audible {
+                    ui.weak(
+                        "Próba idzie przez mono router, więc działają jego ustawienia. Wycisz grę \
+                         na czas testu, bo jej dźwięk miesza się z próbą.",
+                    );
+                } else {
+                    ui.colored_label(
+                        ERROR,
+                        "Mono router nie gra: włącz routing i wybierz ucho, żeby usłyszeć próbę.",
+                    );
+                }
+            }
+        }
 
         ui.horizontal(|ui| {
             ui.label("Sygnał:");
@@ -170,9 +230,13 @@ impl DirectionTester {
         let prompts = dt::DIRECTIONS_DEG.len() * self.repeats;
         ui.weak(format!(
             "{prompts} prób · radar liczy wejście jako {} kanałów",
-            self.channels(shared)
+            self.channels(live)
         ));
-        ui.add_enabled(!self.output.is_empty(), egui::Button::new("▶ Start sesji"))
+        let can_start = match self.route {
+            Route::Direct => !self.output.is_empty(),
+            Route::Mono => self.mono_audible,
+        };
+        ui.add_enabled(can_start, egui::Button::new("▶ Start sesji"))
             .clicked()
             .then_some(Action::Start)
     }
@@ -180,19 +244,22 @@ impl DirectionTester {
     fn ui_session(&self, ui: &mut egui::Ui) -> Option<Action> {
         let session = self.session.as_ref()?;
         let total = session.queue.len();
+        let playing = session.pending.is_some();
         let played = session.heard.is_some();
         let mut action = None;
 
         ui.strong(format!("Próba {} z {total}", (session.index + 1).min(total)));
         ui.horizontal(|ui| {
-            if ui.button("▶ Odtwórz próbę").clicked() {
+            if ui.add_enabled(!playing, egui::Button::new("▶ Odtwórz próbę")).clicked() {
                 action = Some(Action::Play);
             }
             if ui.button("Zakończ sesję").clicked() {
                 action = Some(Action::Finish);
             }
         });
-        if !played {
+        if playing {
+            ui.weak("Próba leci przez mono router…");
+        } else if !played {
             ui.weak("Najpierw odtwórz próbę, potem wskaż kierunek.");
         }
 
@@ -236,16 +303,15 @@ impl DirectionTester {
 
     /// Liczba kanałów, z jaką analizowana jest próba: tyle co przechwytywane wejście, a w razie
     /// jego braku domyślne 7.1.
-    fn channels(&self, shared: &SharedAudioAnalysis) -> usize {
-        shared
-            .lock()
+    fn channels(&self, live: &SharedAudioAnalysis) -> usize {
+        live.lock()
             .map(|g| g.channel_count)
             .ok()
             .filter(|&count| count > 0)
             .unwrap_or(dt::DEFAULT_CHANNELS)
     }
 
-    fn start_session(&mut self, shared: &SharedAudioAnalysis, config: &RadarConfig) {
+    fn start_session(&mut self, live: &SharedAudioAnalysis, config: &RadarConfig) {
         match open_log() {
             Ok((file, path)) => {
                 let seed = SystemTime::now()
@@ -257,10 +323,12 @@ impl DirectionTester {
                     index: 0,
                     trials: Vec::new(),
                     signal: self.signal,
+                    route: self.route,
                     answer: self.answer,
-                    channels: self.channels(shared),
+                    channels: self.channels(live),
                     sensitivity: config.radar_sensitivity,
                     heard: None,
+                    pending: None,
                     last: None,
                     file,
                     path,
@@ -273,30 +341,56 @@ impl DirectionTester {
         }
     }
 
-    fn play_current(&mut self, config: &RadarConfig) {
+    fn play_current(&mut self, live: &SharedAudioAnalysis, config: &RadarConfig) {
         let Some(session) = self.session.as_mut() else {
             return;
         };
         let Some(&angle) = session.queue.get(session.index) else {
             return;
         };
-        // Świeża analiza na każdą próbę: bez ciszy przed dźwiękiem średnia krocząca z poprzedniej
-        // próby (też sekundowej) tłumiłaby początek następnej.
-        self.probe = SharedAudioAnalysis::new();
-        match dt::play(&self.output, angle, session.signal) {
-            Ok(burst) => {
-                let samples = dt::probe_input(&burst.frames, session.channels, burst.rate as f32);
-                session.heard = Some(dt::measure(
-                    &samples,
+        // Każda próba zaczyna się od świeżej analizy. Bez ciszy przed dźwiękiem średnia krocząca
+        // z poprzedniej (sekundowej) próby tłumiłaby początek następnej.
+        let probe = SharedAudioAnalysis::new();
+        match session.route {
+            Route::Direct => match dt::play(&self.output, angle, session.signal) {
+                Ok(burst) => {
+                    let samples = dt::probe_input(&burst.frames, session.channels, burst.rate as f32);
+                    session.heard = Some(dt::measure(
+                        &samples,
+                        session.channels,
+                        burst.rate as f32,
+                        &probe,
+                        config,
+                    ));
+                    self.playing = Some(burst.stream);
+                    self.status = None;
+                }
+                Err(e) => self.status = Some(format!("Nie udało się odtworzyć próby: {e}")),
+            },
+            Route::Mono => {
+                if !self.mono_audible {
+                    self.status = Some("Mono router nie gra: włącz routing i wybierz ucho.".into());
+                    return;
+                }
+                if let Some(old) = session.pending.take() {
+                    old.stop.store(true, Ordering::Relaxed);
+                }
+                session.heard = None;
+                let frames = dt::burst_stereo(angle, session.signal, dt::MONO_RATE);
+                let input = dt::probe_input(&frames, session.channels, dt::MONO_RATE);
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker = dt::feed_through_radar(
+                    input,
                     session.channels,
-                    burst.rate as f32,
-                    &self.probe,
-                    config,
-                ));
-                self.playing = Some(burst.stream);
+                    dt::MONO_RATE,
+                    live.clone(),
+                    probe,
+                    config.clone(),
+                    Arc::clone(&stop),
+                );
+                session.pending = Some(Pending { worker, stop });
                 self.status = None;
             }
-            Err(e) => self.status = Some(format!("Nie udało się odtworzyć próby: {e}")),
         }
     }
 
@@ -316,6 +410,7 @@ impl DirectionTester {
             unix_ts_ms: unix_ms(),
             trial_no: session.index + 1,
             signal: session.signal,
+            route: session.route,
             pointer: session.answer == Answer::Pointer,
             channels: session.channels,
             sensitivity: session.sensitivity,
@@ -333,10 +428,14 @@ impl DirectionTester {
 
     fn finish_session(&mut self) {
         if let Some(session) = self.session.take() {
+            if let Some(pending) = session.pending {
+                pending.stop.store(true, Ordering::Relaxed);
+            }
             if !session.trials.is_empty() {
                 self.report = Some(Report {
                     trials: session.trials,
                     path: session.path,
+                    route: session.route,
                 });
             }
         }
@@ -390,7 +489,7 @@ fn point_on_circle(center: egui::Pos2, radius: f32, angle_deg: f32) -> egui::Pos
 fn ui_report(ui: &mut egui::Ui, report: &Report) {
     ui.separator();
     ui.strong("Wyniki ostatniej sesji");
-    ui.weak(format!("Zapisano: {}", report.path.display()));
+    ui.weak(format!("Tor: {} · zapisano: {}", report.route.label(), report.path.display()));
     egui::Grid::new("direction_test_summary")
         .striped(true)
         .show(ui, |ui| {
