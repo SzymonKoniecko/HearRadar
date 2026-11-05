@@ -16,6 +16,7 @@ use crate::sound::direction;
 use crate::sound::mono_router::{self, MonoRouter};
 use crate::sound::playback::{self, FilePlayer, PlayableFile};
 use crate::sound::spectrum;
+use crate::ui::direction_tester::DirectionTester;
 use crate::ui::radar_egui::{RadarState, TestScenario, draw_radar, timed_from_queue, timed_now};
 #[cfg(not(windows))]
 use crate::ui::radar_egui::draw_edge_glow_indicators;
@@ -116,6 +117,9 @@ pub struct HearRadarApp {
     file_player: Option<FilePlayer>,
     /// Błąd ostatniej próby odtworzenia pliku.
     playback_error: Option<String>,
+
+    /// Panel testu kierunków (słuchawki + zapis wyników do CSV).
+    direction_tester: DirectionTester,
 }
 
 impl HearRadarApp {
@@ -180,6 +184,7 @@ impl HearRadarApp {
             playable_selected: 0,
             file_player: None,
             playback_error: None,
+            direction_tester: DirectionTester::new(),
         }
     }
 
@@ -1438,6 +1443,13 @@ impl eframe::App for HearRadarApp {
                     self.ui_device_selector(&mut cols[0]);
                     cols[0].separator();
                     self.ui_test_panel(&mut cols[0]);
+                    cols[0].separator();
+                    self.direction_tester.ui(
+                        &mut cols[0],
+                        &self.analysis,
+                        &self.radar_config,
+                        self.out_devices.as_deref().unwrap_or(&[]),
+                    );
                     cols[0].separator();
                     self.ui_config_panel(&mut cols[0]);
                     cols[0].separator();
