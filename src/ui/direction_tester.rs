@@ -280,9 +280,12 @@ impl DirectionTester {
         let Some(&angle) = session.queue.get(session.index) else {
             return;
         };
+        // Świeża analiza na każdą próbę: bez ciszy przed dźwiękiem średnia krocząca z poprzedniej
+        // próby (też sekundowej) tłumiłaby początek następnej.
+        self.probe = SharedAudioAnalysis::new();
         match dt::play(&self.output, angle, session.signal) {
             Ok(burst) => {
-                let samples = dt::to_channels(&burst.frames, session.channels);
+                let samples = dt::probe_input(&burst.frames, session.channels, burst.rate as f32);
                 session.heard = Some(dt::measure(
                     &samples,
                     session.channels,

@@ -33,15 +33,14 @@ pub const DEFAULT_CHANNELS: usize = 8;
 
 /// Odstęp między kawałkami analizy, jak w `playback` i w typowym buforze cpal.
 const CHUNK_S: f64 = 0.01;
-/// Cisza przed dźwiękiem: czas na rozgrzanie średniej kroczącej onsetów.
-const LEAD_S: f32 = 0.4;
-const BURST_S: f32 = 0.08;
-/// Cisza po dźwięku: czas na wygaszenie średniej kroczącej przed następną próbą.
-const TAIL_S: f32 = 0.6;
-const PEAK: f32 = 0.4;
-/// Impuls jak strzał: szybki narost i wykładniczy zanik.
-const ATTACK_S: f32 = 0.002;
-const DECAY_S: f32 = 0.025;
+/// Każda próba i jej dźwięk trwają dokładnie tyle samo: sekundę szumu.
+pub const SOUND_S: f32 = 1.0;
+/// Krótki narost i zanik, żeby początek i koniec nie trzaskały.
+const FADE_S: f32 = 0.01;
+/// Cisza wpuszczona tylko do analizy przed próbą. Detektor zdarzeń widzi początek dźwięku dopiero
+/// na tle spokojnego poziomu, a słuchawki tej ciszy nie dostają.
+const PROBE_WARMUP_S: f32 = 0.3;
+const PEAK: f32 = 0.25;
 const NOISE_SEED: u32 = 0x9E37_79B9;
 
 /// Sposób, w jaki różnica między uszami trafia do sygnału.
@@ -77,11 +76,10 @@ pub fn wrap_deg(angle: f32) -> f32 {
     (angle + 180.0).rem_euclid(360.0) - 180.0
 }
 
-/// Próba jako stereo `[lewy, prawy]` o częstotliwości `rate`: cisza, szumowy impuls, cisza.
+/// Próba jako stereo `[lewy, prawy]` o częstotliwości `rate`: sekunda szumu z kierunkiem.
 pub fn burst_stereo(angle_deg: f32, signal: Signal, rate: f32) -> Vec<[f32; 2]> {
-    let lead = (LEAD_S * rate).round() as usize;
-    let burst_len = (BURST_S * rate).round() as usize;
-    let mut frames = vec![[0.0f32; 2]; lead + burst_len + (TAIL_S * rate).round() as usize];
+    let len = (SOUND_S * rate).round() as usize;
+    let mut frames = vec![[0.0f32; 2]; len];
 
     let theta = angle_deg.to_radians();
     let itd_samples = DEFAULT_EAR_DISTANCE_M * theta.sin() / SPEED_OF_SOUND_M_S * rate;
@@ -99,18 +97,22 @@ pub fn burst_stereo(angle_deg: f32, signal: Signal, rate: f32) -> Vec<[f32; 2]> 
         }
     };
 
-    let attack = (ATTACK_S * rate).max(1.0);
-    let decay = DECAY_S * rate;
+    let fade = (FADE_S * rate).max(1.0);
     let mut seed = NOISE_SEED;
-    for i in 0..burst_len {
+    for i in 0..len {
         seed ^= seed << 13;
         seed ^= seed >> 17;
         seed ^= seed << 5;
         let noise = (seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
-        let t = i as f32;
-        let sample = noise * (t / attack).min(1.0) * (-t / decay).exp() * PEAK;
-        frames[lead + i + late_l][0] += gain_l * sample;
-        frames[lead + i + late_r][1] += gain_r * sample;
+        let envelope = (i as f32 / fade).min((len - i) as f32 / fade).min(1.0);
+        let sample = noise * envelope * PEAK;
+        // Ucho opóźnione kończy się kilka próbek wcześniej, za krótko, żeby było słychać.
+        if let Some(frame) = frames.get_mut(i + late_l) {
+            frame[0] += gain_l * sample;
+        }
+        if let Some(frame) = frames.get_mut(i + late_r) {
+            frame[1] += gain_r * sample;
+        }
     }
     frames
 }
@@ -130,6 +132,13 @@ pub fn to_channels(frames: &[[f32; 2]], channels: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// Wejście analizy dla próby: [`PROBE_WARMUP_S`] ciszy, potem próba, na `channels` kanałach.
+pub fn probe_input(frames: &[[f32; 2]], channels: usize, rate: f32) -> Vec<f32> {
+    let mut padded = vec![[0.0f32; 2]; (PROBE_WARMUP_S * rate).round() as usize];
+    padded.extend_from_slice(frames);
+    to_channels(&padded, channels)
 }
 
 /// Kąt wskazany myszką względem środka kompasu (`dx`, `dy` w pikselach, `y` rośnie w dół).
@@ -374,6 +383,15 @@ mod tests {
     }
 
     #[test]
+    fn every_trial_sound_lasts_exactly_one_second() {
+        for signal in Signal::ALL {
+            for angle in DIRECTIONS_DEG {
+                assert_eq!(burst_stereo(angle, signal, RATE).len(), RATE as usize);
+            }
+        }
+    }
+
+    #[test]
     fn level_signal_sends_a_hard_right_source_to_the_right_ear_only() {
         let frames = burst_stereo(90.0, Signal::Level, RATE);
         assert!(energy(&frames, 0) < 1e-6 * energy(&frames, 1));
@@ -463,7 +481,7 @@ mod tests {
     #[test]
     fn a_hard_right_level_burst_is_heard_on_the_right_of_the_radar() {
         let probe = SharedAudioAnalysis::new();
-        let samples = to_channels(&burst_stereo(90.0, Signal::Level, RATE), DEFAULT_CHANNELS);
+        let samples = probe_input(&burst_stereo(90.0, Signal::Level, RATE), DEFAULT_CHANNELS, RATE);
         let events = measure(&samples, DEFAULT_CHANNELS, RATE, &probe, &RadarConfig::default());
         let reading = radar_reading(&events).expect("próba z prawej powinna dać zdarzenie");
         assert!(reading > 0.0, "radar: {reading}");
@@ -478,7 +496,7 @@ mod tests {
             println!("sygnał: {}", signal.label());
             for &angle in &DIRECTIONS_DEG {
                 let probe = SharedAudioAnalysis::new();
-                let samples = to_channels(&burst_stereo(angle, signal, RATE), DEFAULT_CHANNELS);
+                let samples = probe_input(&burst_stereo(angle, signal, RATE), DEFAULT_CHANNELS, RATE);
                 let events = measure(&samples, DEFAULT_CHANNELS, RATE, &probe, &RadarConfig::default());
                 let reading = radar_reading(&events).map_or("brak".to_string(), |r| format!("{r:+.1}°"));
                 let dots: Vec<String> = events.iter().map(|(a, w)| format!("{a:+.0}°/{w:.2}")).collect();
