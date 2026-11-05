@@ -612,13 +612,18 @@ impl HearRadarApp {
             );
         }
 
-        egui::ComboBox::from_label("Wyjście (słuchawki)")
-            .selected_text(self.mono_sel_out.clone())
-            .show_ui(ui, |ui| {
-                for dev in &out_devices {
-                    ui.selectable_value(&mut self.mono_sel_out, dev.name.clone(), &dev.name);
-                }
-            });
+        // `from_id_salt`, nie `from_label`: etykieta jest też kluczem egui, a panel testu
+        // kierunków ma tę samą etykietę — wspólny klucz psuje otwieranie obu list.
+        ui.horizontal(|ui| {
+            ui.label("Wyjście (słuchawki)");
+            egui::ComboBox::from_id_salt("mono_output_device")
+                .selected_text(self.mono_sel_out.clone())
+                .show_ui(ui, |ui| {
+                    for dev in &out_devices {
+                        ui.selectable_value(&mut self.mono_sel_out, dev.name.clone(), &dev.name);
+                    }
+                });
+        });
 
         ui.horizontal(|ui| {
             ui.label("Ucho:");

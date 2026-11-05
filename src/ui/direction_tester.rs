@@ -142,13 +142,17 @@ impl DirectionTester {
         shared: &SharedAudioAnalysis,
         outputs: &[SoundDevice],
     ) -> Option<Action> {
-        egui::ComboBox::from_label("Wyjście (słuchawki)")
-            .selected_text(self.output.clone())
-            .show_ui(ui, |ui| {
-                for dev in outputs {
-                    ui.selectable_value(&mut self.output, dev.name.clone(), &dev.name);
-                }
-            });
+        // Osobny klucz niż w mono routerze (ta sama etykieta dałaby wspólny stan rozwijania).
+        ui.horizontal(|ui| {
+            ui.label("Wyjście (słuchawki)");
+            egui::ComboBox::from_id_salt("direction_test_output")
+                .selected_text(self.output.clone())
+                .show_ui(ui, |ui| {
+                    for dev in outputs {
+                        ui.selectable_value(&mut self.output, dev.name.clone(), &dev.name);
+                    }
+                });
+        });
 
         ui.horizontal(|ui| {
             ui.label("Sygnał:");
