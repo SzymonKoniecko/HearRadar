@@ -5,7 +5,7 @@
   "bg_alpha": 0.45,
   "fg_alpha": 0.78,
   "high_contrast": false,
-  "decay_secs": 1.05,
+  "decay_secs": 1.57,
   "color_rules": [
     {
       "freq_min": 0.0,
@@ -71,7 +71,13 @@
   "mono_scout": true,
   "mono_scout_amount": 0.6,
   "radar_sensitivity": 20.0,
-  "edge_glow_enabled": false,
+  "edge_glow_enabled": true,
+  "edge_glow_strength": 1.9,
+  "edge_glow_style": "Vignette",
+  "edge_vignette_width": 0.27,
+  "radar_glow_style": "Line",
+  "glow_line_width": 1.0,
+  "glow_min_visibility": 0.55,
   "speaker_layout_view": true,
   "stereo_left_color": [
     0,
@@ -84,16 +90,16 @@
     50
   ],
   "spatial_audio_view": false,
-  "line_thickness": 1.7,
+  "line_thickness": 1.0,
   "mono_cue_style": "Tremolo",
   "direction_contrast_enabled": false,
-  "visualization_mode": "OnlyRadar",
+  "visualization_mode": "LayerBars",
   "speaker_setup": "Stereo",
-  "layer_arc_inner": 0.55,
+  "layer_arc_inner": 0.62,
   "layer_arc_spacing": 0.175,
   "layer_steps_gain": 4.0,
-  "layer_shots_gain": 3.1,
-  "layer_rest_gain": 3.1,
+  "layer_shots_gain": 3.35,
+  "layer_rest_gain": 2.6,
   "layer_shots_color": [
     255,
     140,
@@ -109,6 +115,7 @@
     170,
     255
   ],
+  "layer_side_glow": 1.0,
   "mode_appearance": {
     "OnlyRadar": {
       "radius": 115.0,
@@ -150,7 +157,8 @@
         80,
         170,
         255
-      ]
+      ],
+      "layer_side_glow": 1.0
     },
     "OnlyBars": {
       "radius": 115.0,
@@ -192,7 +200,8 @@
         80,
         170,
         255
-      ]
+      ],
+      "layer_side_glow": 1.0
     },
     "Both": {
       "radius": 115.0,
@@ -234,16 +243,17 @@
         80,
         170,
         255
-      ]
+      ],
+      "layer_side_glow": 1.0
     },
     "LayerBars": {
       "radius": 115.0,
       "bg_alpha": 0.45,
       "fg_alpha": 0.78,
       "high_contrast": false,
-      "decay_secs": 1.05,
+      "decay_secs": 1.57,
       "radar_sensitivity": 20.0,
-      "line_thickness": 1.7,
+      "line_thickness": 1.0,
       "speaker_layout_view": true,
       "spatial_audio_view": false,
       "direction_contrast_enabled": false,
@@ -257,10 +267,10 @@
         200,
         50
       ],
-      "layer_arc_inner": 0.55,
+      "layer_arc_inner": 0.62,
       "layer_arc_spacing": 0.175,
       "layer_steps_gain": 4.0,
-      "layer_shots_gain": 3.1,
+      "layer_shots_gain": 3.35,
       "layer_rest_gain": 2.6,
       "layer_shots_color": [
         255,
@@ -276,7 +286,8 @@
         80,
         170,
         255
-      ]
+      ],
+      "layer_side_glow": 1.0
     },
     "LayerBars22": {
       "radius": 115.0,
@@ -318,7 +329,8 @@
         80,
         170,
         255
-      ]
+      ],
+      "layer_side_glow": 1.0
     }
   }
 }

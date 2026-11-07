@@ -29,6 +29,8 @@ pub struct PlayableFile {
 /// Odtwarza jeden plik w osobnym wątku. Zatrzymuje się sam na końcu nagrania albo przy `Drop`.
 pub struct FilePlayer {
     name: String,
+    /// Liczba kanałów odtwarzanego pliku, od niej zależą kolumny logu radaru.
+    channels: usize,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -41,7 +43,9 @@ impl FilePlayer {
         if n == 0 || channels[0].is_empty() {
             bail!("pusty plik: {}", file.path.display());
         }
-        let samples = interleave(&channels);
+        let mut samples = interleave(&channels);
+        // Cisza na końcu, żeby zdążyły się rozstrzygnąć ostatnie zdarzenia (okno szczytu ok. 0,35 s).
+        samples.resize(samples.len() + (rate as usize / 2) * n, 0.0);
         let chunk_len = ((rate as f64 * CHUNK_S).round().max(1.0) as usize) * n;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_worker = Arc::clone(&stop);
@@ -61,6 +65,7 @@ impl FilePlayer {
         });
         Ok(Self {
             name: file.label.clone(),
+            channels: n,
             stop,
             worker: Some(worker),
         })
@@ -68,6 +73,11 @@ impl FilePlayer {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Liczba kanałów odtwarzanego pliku.
+    pub fn channels(&self) -> usize {
+        self.channels
     }
 
     /// `true`, gdy odtwarzanie dobiegło końca (albo wątek już nie działa).

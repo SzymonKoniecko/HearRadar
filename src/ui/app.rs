@@ -15,9 +15,12 @@ use crate::sound::devices::{self, MonoCueStyle, MonoEar, RadarConfig, SharedAudi
 use crate::sound::direction;
 use crate::sound::mono_router::{self, MonoRouter};
 use crate::sound::playback::{self, FilePlayer, PlayableFile};
+use crate::sound::radar_log::{self, RadarLogSession};
 use crate::sound::spectrum;
 use crate::ui::direction_tester::DirectionTester;
-use crate::ui::radar_egui::{RadarState, TestScenario, draw_radar, timed_from_queue, timed_now};
+use crate::ui::radar_egui::{
+    RadarState, TestScenario, draw_radar, overlay_padding_needed, timed_from_queue, timed_now,
+};
 #[cfg(not(windows))]
 use crate::ui::radar_egui::draw_edge_glow_indicators;
 use eframe::egui;
@@ -117,6 +120,14 @@ pub struct HearRadarApp {
     file_player: Option<FilePlayer>,
     /// Błąd ostatniej próby odtworzenia pliku.
     playback_error: Option<String>,
+    /// Log radaru przy odsłuchu (patrz `sound::radar_log`), otwarty na czas odtwarzania.
+    radar_log: Option<RadarLogSession>,
+    /// Checkbox „Zapisuj log radaru przy odsłuchu”.
+    radar_log_enabled: bool,
+    /// Ostatni komunikat o logu: ścieżka, zamknięcie albo błąd.
+    radar_log_status: Option<String>,
+    /// Czas UI, po którym log zamyka się po końcu odtwarzania, żeby zdążyć z ostatnimi zdarzeniami.
+    radar_log_close_at: Option<f64>,
 
     /// Panel testu kierunków (słuchawki + zapis wyników do CSV).
     direction_tester: DirectionTester,
@@ -184,6 +195,10 @@ impl HearRadarApp {
             playable_selected: 0,
             file_player: None,
             playback_error: None,
+            radar_log: None,
+            radar_log_enabled: false,
+            radar_log_status: None,
+            radar_log_close_at: None,
             direction_tester: DirectionTester::new(),
         }
     }
@@ -280,6 +295,7 @@ impl HearRadarApp {
             self.radar_config.radar_sensitivity,
             &direction_events,
         );
+        self.write_radar_log(now, &layer_queued, &channel_rms);
     }
 
     /// Generuje prawdziwą sinusoidę o częstotliwości `test_freq_hz` na
@@ -551,6 +567,14 @@ impl HearRadarApp {
             }
         });
 
+        ui.checkbox(&mut self.radar_log_enabled, "Zapisuj log radaru przy odsłuchu")
+            .on_hover_text(
+                "Plik config/odsluch/radar_log_<nazwa>_<nr>.csv: jeden wiersz na zdarzenie warstwy. Kolumny są takie, \
+                 jakie pokazuje aktywny tryb, a każdy wiersz ma opis dźwięku i opis tego, co radar pokazał.",
+            );
+        if let Some(status) = &self.radar_log_status {
+            ui.weak(status.as_str());
+        }
         if let Some(player) = self.file_player.as_ref().filter(|p| !p.is_finished()) {
             ui.label(format!("▶ odtwarza: {}", player.name()));
         }
@@ -567,13 +591,77 @@ impl HearRadarApp {
         };
         self.active_stream = None;
         self.file_player = None;
+        if self.radar_log.is_some() {
+            self.close_radar_log("log zamknięty: rozpoczęto nowe odtwarzanie");
+        }
+        // Czas startu w osi strumienia analizy, zanim wątek odtwarzania wpuści pierwszą próbkę.
+        let start_s = self.analysis.layer_stream_seconds();
         match FilePlayer::start(&file, self.analysis.clone()) {
             Ok(player) => {
+                if self.radar_log_enabled {
+                    self.open_radar_log(&file.path, start_s, player.channels());
+                }
                 self.file_player = Some(player);
                 self.playback_error = None;
             }
             Err(err) => self.playback_error = Some(format!("Nie udało się odtworzyć: {err}")),
         }
+    }
+
+    /// Zapisuje do logu radaru zdarzenia warstw z tej klatki. Zamyka log, gdy zmienił się tryb albo
+    /// włączono przechwytywanie na żywo (kolumny i źródło by się rozjechały), a po końcu odtwarzania
+    /// po krótkiej chwili, żeby zdążyć z ostatnimi zdarzeniami.
+    /// Otwiera log radaru dla odtwarzania pliku. `start_s` to czas strumienia analizy w chwili startu,
+    /// a `channels` to liczba kanałów pliku.
+    fn open_radar_log(&mut self, audio: &std::path::Path, start_s: f64, channels: usize) {
+        match RadarLogSession::open(&radar_log::log_dir(), audio, &self.radar_config, start_s, channels) {
+            Ok(log) => {
+                self.radar_log_status = Some(format!("Log radaru: {}", log.path().display()));
+                self.radar_log = Some(log);
+            }
+            Err(err) => {
+                self.radar_log = None;
+                self.radar_log_status = Some(format!("Nie udało się otworzyć logu radaru: {err}"));
+            }
+        }
+    }
+
+    fn write_radar_log(&mut self, now: f64, hits: &[devices::QueuedLayerHit], channel_rms: &[f32]) {
+        if self.radar_log.is_none() {
+            return;
+        }
+        if self.active_stream.is_some() {
+            self.close_radar_log("log zamknięty: włączono przechwytywanie na żywo");
+            return;
+        }
+        if self.radar_log.as_ref().is_some_and(|log| !log.matches(&self.radar_config)) {
+            self.close_radar_log("log zamknięty: zmieniono tryb albo widok przestrzenny");
+            return;
+        }
+        let finished = self.file_player.as_ref().map_or(true, FilePlayer::is_finished);
+        if finished {
+            let close_at = *self.radar_log_close_at.get_or_insert(now + 1.0);
+            if now >= close_at {
+                self.close_radar_log("log zamknięty: koniec odtwarzania");
+                return;
+            }
+        }
+        if hits.is_empty() {
+            return;
+        }
+        let view = crate::ui::radar_egui::view_snapshot(&self.radar_state, &self.radar_config, now);
+        let Some(log) = self.radar_log.as_mut() else { return };
+        if let Err(err) = log.log_hits(hits, &view, channel_rms) {
+            self.close_radar_log(&format!("błąd zapisu logu: {err}"));
+        }
+    }
+
+    /// Zamyka log radaru i zostawia w statusie, ile zdarzeń zapisano i gdzie leży plik.
+    fn close_radar_log(&mut self, reason: &str) {
+        if let Some(log) = self.radar_log.take() {
+            self.radar_log_status = Some(format!("{reason}: {} zdarzeń, {}", log.rows(), log.path().display()));
+        }
+        self.radar_log_close_at = None;
     }
 
     // ── Panel: mono router ────────────────────────────────────────────────
@@ -950,6 +1038,9 @@ impl HearRadarApp {
             self.overlay_reposition_pending = true;
         }
         changed |= edge_glow_changed;
+        if setup == devices::SpeakerSetup::Stereo {
+            changed |= self.ui_glow_settings(ui);
+        }
 
         ui.separator();
         changed |= ui
@@ -995,6 +1086,100 @@ impl HearRadarApp {
         if changed {
             self.write_radar_config();
         }
+    }
+
+    /// Poświaty w stereo: na radarze warstw (po stronie z czerwienią) i na krawędzi ekranu (po stronie
+    /// przewagi łuku wszystko). Styl, moc, grubość linii, zasięg winiety i widoczność przy małej przewadze.
+    fn ui_glow_settings(&mut self, ui: &mut egui::Ui) -> bool {
+        let mode = self.radar_config.visualization_mode;
+        let mut changed = false;
+        // Zmiany, od których zależy rozmiar okna overlay wokół radaru (patrz `overlay_dial_size`).
+        let mut resize = false;
+        egui::CollapsingHeader::new("Poświaty (stereo)")
+            .id_salt("stereo_glow_section")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.strong("Na radarze");
+                if mode.shows_layers() {
+                    ui.horizontal(|ui| {
+                        ui.label("Styl:");
+                        for style in devices::RadarGlowStyle::ALL {
+                            resize |= ui
+                                .radio_value(&mut self.radar_config.radar_glow_style, *style, style.label())
+                                .changed();
+                        }
+                    });
+                    resize |= ui
+                        .add(
+                            egui::Slider::new(&mut self.radar_config.layer_side_glow, 0.0..=2.0)
+                                .text("Moc (0 = wyłączona)"),
+                        )
+                        .on_hover_text(
+                            "Czerwona poświata za zewnętrznym łukiem, po stronie z czerwienią. Stronę wybierają \
+                             najpierw strzały i kroki, a gdy nie mają przewagi, łuk wszystko. Moc zapisuje się \
+                             osobno dla każdego trybu.",
+                        )
+                        .changed();
+                    if self.radar_config.radar_glow_style == devices::RadarGlowStyle::Line {
+                        resize |= ui
+                            .add(
+                                egui::Slider::new(&mut self.radar_config.glow_line_width, 0.3..=3.0)
+                                    .text("Linia: grubość"),
+                            )
+                            .changed();
+                    }
+                } else {
+                    ui.weak("Poświata radaru jest w trybach warstw 3+3 i 2+2.");
+                }
+
+                ui.strong("Na krawędzi ekranu");
+                if self.radar_config.edge_glow_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("Styl:");
+                        for style in devices::EdgeGlowStyle::ALL {
+                            changed |= ui
+                                .radio_value(&mut self.radar_config.edge_glow_style, *style, style.label())
+                                .changed();
+                        }
+                    });
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.radar_config.edge_glow_strength, 0.0..=2.0)
+                                .text("Moc (0 = wyłączona)"),
+                        )
+                        .on_hover_text(
+                            "Zapala się na lewej albo prawej krawędzi ekranu, po stronie, gdzie przewagę ma łuk wszystko.",
+                        )
+                        .changed();
+                    if self.radar_config.edge_glow_style == devices::EdgeGlowStyle::Vignette {
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut self.radar_config.edge_vignette_width, 0.03..=0.5)
+                                    .text("Winieta: zasięg w głąb ekranu")
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                            )
+                            .on_hover_text("Jak daleko od krawędzi sięga najszerszy pas winiety, w procentach szerokości ekranu.")
+                            .changed();
+                    }
+                } else {
+                    ui.weak("Zaznacz wyżej „Poświata na krawędzi ekranu”, żeby ją włączyć.");
+                }
+
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.radar_config.glow_min_visibility, 0.0..=1.0)
+                            .text("Widoczność przy małej przewadze"),
+                    )
+                    .on_hover_text(
+                        "Jak mocno świecą obie poświaty, gdy przewaga ledwo przekracza próg. 0: rosną od zera, \
+                         1: od razu pełne. Przy dużej przewadze zawsze są pełne, a moc mnoży to dalej.",
+                    )
+                    .changed();
+            });
+        if resize {
+            self.overlay_reposition_pending = true;
+        }
+        changed || resize
     }
 
     /// Sekcje dla stereo (2.0): słupki L/R i warstwy, każda w osobnej, zwijanej części.
@@ -1333,10 +1518,16 @@ impl HearRadarApp {
         }
     }
 
+    /// Bok okna overlay wokół tarczy: średnica radaru plus margines. Margines rośnie, gdy poświata 2+2
+    /// sięga dalej niż zwykłe [`OVERLAY_PADDING`], żeby nie ucinała się na bokach okna.
+    fn overlay_dial_size(&self) -> f32 {
+        self.radar_config.radius * 2.0 + OVERLAY_PADDING.max(overlay_padding_needed(&self.radar_config))
+    }
+
     // ── Panel: podgląd radaru (mały obszar rysowania w głównym oknie) ────
     fn ui_radar_preview(&mut self, ui: &mut egui::Ui) {
         ui.heading("Podgląd radaru");
-        let size = self.radar_config.radius * 2.0 + 40.0;
+        let size = self.radar_config.radius * 2.0 + 40.0_f32.max(overlay_padding_needed(&self.radar_config));
         let (rect, _response) =
             ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
         let painter = ui.painter_at(rect);
@@ -1421,7 +1612,7 @@ impl HearRadarApp {
             }
         }
 
-        let overlay_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
+        let overlay_size = self.overlay_dial_size();
         if let Some(overlay) = self.win_overlay.as_mut() {
             overlay.render_and_present(
                 overlay_size,
@@ -1447,7 +1638,7 @@ impl HearRadarApp {
         let mut close_requested = false;
         let now = ctx.input(|i| i.time);
         let channels = self.current_channels;
-        let dial_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
+        let dial_size = self.overlay_dial_size();
         let click_through = self.radar_config.overlay_click_through;
         let edge_glow = self.radar_config.edge_glow_enabled;
 
@@ -1483,7 +1674,7 @@ impl HearRadarApp {
                     now,
                 );
                 if edge_glow {
-                    draw_edge_glow_indicators(painter, rect, &self.radar_state, now, &self.radar_config);
+                    draw_edge_glow_indicators(painter, rect, &mut self.radar_state, now, &self.radar_config);
                 }
 
                 // W trybie przezroczystym dla kliknięć okno w ogóle nie
@@ -1617,7 +1808,7 @@ impl eframe::App for HearRadarApp {
             // `overlay_window_geometry` — `overlay_reposition_pending`
             // (ustawiane też przy każdej zmianie tej flagi w ustawieniach)
             // i tak zaraz doda dokładną pozycję/rozmiar przez komendy viewportu.
-            let dial_size = self.radar_config.radius * 2.0 + OVERLAY_PADDING;
+            let dial_size = self.overlay_dial_size();
             let initial_size = if self.radar_config.edge_glow_enabled {
                 ctx.input(|i| i.viewport().monitor_size)
                     .unwrap_or(egui::vec2(dial_size, dial_size))

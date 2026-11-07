@@ -319,6 +319,24 @@ pub struct RadarState {
     steps: VecDeque<StepMarker>,
     /// Słupki warstw 3+3 (tryb `VisualizationMode::LayerBars`), patrz `sound::layers`.
     pub layer_bars: LayerBars,
+    /// Strona z przewagą w 2+2, z przytrzymaniem (patrz [`next_side_focus`]). Tam leży cała czerwień
+    /// i poświata. Liczona przy rysowaniu, w [`RadarState::update_side_focus`].
+    side_focus: Option<SideFocus>,
+    /// Strona poświaty na krawędzi ekranu w stereo: tam, gdzie przewagę ma łuk wszystko, z tym samym
+    /// przytrzymaniem co `side_focus`. Liczona w [`draw_edge_glow_indicators`].
+    edge_focus: Option<SideFocus>,
+}
+
+/// Strona z przewagą w radarze warstw (3+3, 2+2) albo na krawędzi ekranu: tam jest cała czerwień
+/// i poświata.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SideFocus {
+    /// 0 lewa, 1 prawa.
+    side: usize,
+    /// Przewaga łuku, który zdecydował: różnica wysokości L i P, 0..1.
+    lead: f32,
+    /// Ostatnia chwila (s UI), w której przewaga tej strony była potwierdzona.
+    at: f64,
 }
 
 /// Udział energii pasma `num` w sumie energii pasm `num` i `den`, liczony z
@@ -414,6 +432,13 @@ impl RadarState {
             visible[side] = false;
         }
         visible
+    }
+
+    /// Wybiera stronę z przewagą dla 2+2 w chwili `now`, z przytrzymaniem. Wołane przy rysowaniu,
+    /// po wygaszeniu starych trafień, więc widzi te same wysokości łuków co rysunek.
+    fn update_side_focus(&mut self, now: f64, cfg: &RadarConfig) {
+        let decided = decide_side(self, now, cfg);
+        self.side_focus = next_side_focus(self.side_focus, decided, now);
     }
 
     /// Zasila słupki warstw trafieniami z kolejki audio. Czas liczy się tak samo jak dla kropek.
@@ -768,10 +793,12 @@ pub fn draw_radar<C: RadarCanvas>(
     state.layer_bars.prune(now, cfg.decay_secs);
 
     if cfg.visualization_mode == VisualizationMode::LayerBars {
+        state.update_side_focus(now, cfg);
         draw_layer_bars(canvas, center, cfg, state, now);
         return;
     }
     if cfg.visualization_mode == VisualizationMode::LayerBars22 {
+        state.update_side_focus(now, cfg);
         draw_layer_bars_2x2(canvas, center, cfg, state, now);
         return;
     }
@@ -961,6 +988,7 @@ pub fn draw_radar<C: RadarCanvas>(
                 fg,
                 lt,
                 [true, true],
+                stereo_dominance(state.stereo_now()),
             );
         }
     }
@@ -986,8 +1014,9 @@ pub fn draw_radar<C: RadarCanvas>(
 
 /// Zestaw 3+3 w stylu łuków L/P: po jednym łuku na stronę (lewy przy 270°, prawy przy 90°)
 /// i na warstwę. Warstwy są współśrodkowe jak cebula, a każda para ma własny kolor. Długość
-/// łuku rośnie z poziomu tej strony. Zawsze jedna para jest podświetlona. Czerwona obwódka leży
-/// na wyższym łuku tej pary, gdy jest aktywny.
+/// łuku rośnie z poziomu tej strony. Zawsze jedna para jest podświetlona (szerszy ślad). Cała czerwień
+/// jest po jednej stronie (patrz [`decide_side`]): obrys na każdym widocznym, zapalonym łuku tej
+/// strony i poświata na zewnątrz radaru.
 fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, state: &RadarState, now: f64) {
     const MAX_HALF_SPAN_DEG: f32 = 70.0;
 
@@ -997,12 +1026,20 @@ fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, 
     let inner = r * cfg.layer_arc_inner;
     let spacing = r * cfg.layer_arc_spacing;
     let highlighted = state.layer_bars.highlighted_layer();
-    let focus = state.layer_bars.focus_side(now, cfg.decay_secs);
+    let focus = state.side_focus.map(|f| f.side);
 
     // Każda warstwa (para L i P) ma swój kolor. Czerwony zostaje na obwódkę.
     let rgba = |rgb: (u8, u8, u8), alpha: f32| {
         Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, (alpha * fg).clamp(0.0, 255.0) as u8)
     };
+
+    // Poświata leży za pierścieniem wszystko, w tym samym miejscu co w 2+2.
+    if let Some(f) = state.side_focus {
+        let rim_thickness = stereo_arc_thickness(r, cfg.line_thickness.max(0.0));
+        let rim_edge = r + 4.0 + rim_thickness;
+        let height = everything_heights(state, cfg, now)[f.side];
+        draw_radar_glow(canvas, center, cfg, f, rim_edge, rim_thickness, height, now);
+    }
 
     // Kroki i strzały jako łuki w środku, kroki najbliżej. Zewnętrzny łuk to wszystko, rysowany osobno.
     for layer in [Layer::Steps, Layer::Shots] {
@@ -1024,7 +1061,7 @@ fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, 
 
             let height = heights[side];
             let half_span = MAX_HALF_SPAN_DEG * height;
-            if is_highlighted && focus == Some(side) {
+            if focus == Some(side) && height >= DOMINANT_MIN_HEIGHT {
                 let (ro, go, bo) = DOMINANT_OUTLINE_RGB;
                 let outline = Color32::from_rgba_unmultiplied(ro, go, bo, (230.0 * fg).clamp(0.0, 255.0) as u8);
                 draw_arc(canvas, center, mid_deg, half_span, radius, Stroke::new(thickness + 3.0, outline));
@@ -1033,7 +1070,7 @@ fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, 
         }
     }
 
-    draw_rest_ring(canvas, center, r, cfg, state);
+    draw_rest_ring(canvas, center, r, cfg, state, focus);
     draw_spatial_extras(canvas, center, r, cfg, state, now);
     draw_layer_legend(
         canvas,
@@ -1061,29 +1098,36 @@ fn ring_index(layer: Layer) -> usize {
 const INNER_LAYERS: [Layer; 2] = [Layer::Shots, Layer::Steps];
 
 /// Zestaw 2+2: po dwa łuki na stronę. Wewnętrzny to strzały, wybuchy i kroki (silniejsza z dwóch
-/// warstw). Zewnętrzny to wszystko naraz, w kolorze najsilniejszej warstwy tej strony. Czerwony obrys
-/// dostaje strona z przewagą, osobno na każdym z obu łuków.
+/// warstw). Zewnętrzny to wszystko naraz, w kolorze najsilniejszej warstwy tej strony. Cała czerwień
+/// jest po jednej stronie (patrz [`decide_side`]): obrys na każdym zapalonym łuku tej strony
+/// i poświata na zewnątrz radaru, o mocy z ustawień.
 fn draw_layer_bars_2x2<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, state: &RadarState, now: f64) {
     let r = cfg.radius;
     let fg = cfg.fg_alpha;
     let thickness = (r * 0.06).clamp(3.0, 9.0) * cfg.line_thickness.max(0.5);
     let inner = r * cfg.layer_arc_inner;
-
-    let inner_groups = [0usize, 1].map(|side| strongest_layer(state, side, now, cfg, &INNER_LAYERS));
-    let inner_focus = dominant_side(inner_groups.map(|(_, height)| height));
-    for (side, mid_deg) in [(0usize, 270.0_f32), (1, 90.0)] {
-        let (layer, height) = inner_groups[side];
-        draw_level_arc(canvas, center, mid_deg, inner, thickness, layer_rgb(cfg, layer), height, inner_focus == Some(side), fg);
-    }
-
     // Zewnętrzny łuk leży na obwodzie, tam gdzie stare wskaźniki reszty.
     let rim_thickness = stereo_arc_thickness(r, cfg.line_thickness.max(0.0));
     let rim_radius = r + 4.0 + rim_thickness * 0.5;
+    let inner_groups = [0usize, 1].map(|side| strongest_layer(state, side, now, cfg, &INNER_LAYERS));
     let outer_groups = [0usize, 1].map(|side| strongest_layer(state, side, now, cfg, &Layer::ALL));
-    let outer_focus = dominant_side(outer_groups.map(|(_, height)| height));
+    let focus = state.side_focus.map(|f| f.side);
+
+    // Poświata pod łukami w kolejności rysowania, ale leży na zewnątrz zewnętrznego łuku.
+    if let Some(f) = state.side_focus {
+        let rim_edge = rim_radius + rim_thickness * 0.5;
+        draw_radar_glow(canvas, center, cfg, f, rim_edge, rim_thickness, outer_groups[f.side].1, now);
+    }
+
+    for (side, mid_deg) in [(0usize, 270.0_f32), (1, 90.0)] {
+        let (layer, height) = inner_groups[side];
+        let outlined = focus == Some(side) && height >= DOMINANT_MIN_HEIGHT;
+        draw_level_arc(canvas, center, mid_deg, inner, thickness, layer_rgb(cfg, layer), height, outlined, fg);
+    }
     for (side, mid_deg) in [(0usize, 270.0_f32), (1, 90.0)] {
         let (layer, height) = outer_groups[side];
-        draw_level_arc(canvas, center, mid_deg, rim_radius, rim_thickness, layer_rgb(cfg, layer), height, outer_focus == Some(side), fg);
+        let outlined = focus == Some(side) && height >= DOMINANT_MIN_HEIGHT;
+        draw_level_arc(canvas, center, mid_deg, rim_radius, rim_thickness, layer_rgb(cfg, layer), height, outlined, fg);
     }
 
     draw_spatial_extras(canvas, center, r, cfg, state, now);
@@ -1155,17 +1199,212 @@ fn side_height(state: &RadarState, side: usize, layer: Layer, now: f64, cfg: &Ra
 /// Poniżej tej wysokości łuk się nie liczy do przewagi (cisza albo szum).
 const DOMINANT_MIN_HEIGHT: f32 = 0.05;
 
-/// Strona z przewagą: ta z wyższym łukiem, o ile obie są ponad progiem ciszy i nie są równe.
-/// Inaczej `None`, żeby nie migać czerwonym obrysem przy remisie.
-fn dominant_side(heights: [f32; 2]) -> Option<usize> {
+/// Jak długo strona z przewagą w 2+2 trzyma się po utracie przewagi albo gdy przewagę łapie druga
+/// strona. Dzięki temu czerwień i poświata nie migają między klatkami.
+const SIDE_HOLD_SECS: f64 = 0.15;
+
+/// Strona z wyraźną przewagą na jednej parze łuków i wielkość tej przewagi. Wyższy łuk wygrywa,
+/// o ile jest ponad progiem ciszy, a różnica przekracza [`DOMINANCE_MARGIN`]. Inaczej `None`.
+fn clear_lead(heights: [f32; 2]) -> Option<(usize, f32)> {
     let [left, right] = heights;
-    if left.max(right) < DOMINANT_MIN_HEIGHT || left == right {
-        None
-    } else if left > right {
-        Some(0)
-    } else {
-        Some(1)
+    let lead = (left - right).abs();
+    if left.max(right) < DOMINANT_MIN_HEIGHT || lead <= DOMINANCE_MARGIN {
+        return None;
     }
+    Some((if left > right { 0 } else { 1 }, lead))
+}
+
+/// Wysokość łuku „wszystko” po lewej i prawej, tak jak go rysuje bieżący tryb. W 3+3 to pierścień
+/// ciągłego tła stereo, a w 2+2 (i w trybach bez łuków warstw) najmocniejsza ze wszystkich warstw.
+fn everything_heights(state: &RadarState, cfg: &RadarConfig, now: f64) -> [f32; 2] {
+    use crate::sound::devices::VisualizationMode;
+    if cfg.visualization_mode == VisualizationMode::LayerBars {
+        let (left, right) = state.stereo_now();
+        [left, right].map(|v| (v * cfg.layer_rest_gain).clamp(0.0, 1.0))
+    } else {
+        [0usize, 1].map(|side| strongest_layer(state, side, now, cfg, &Layer::ALL).1)
+    }
+}
+
+/// Jedna strona z przewagą dla całego radaru warstw (3+3 i 2+2). Najpierw liczą się strzały i kroki,
+/// bo to zdarzenia ważne w grze. Gdy one nie mają wyraźnej przewagi, decyduje łuk wszystko. Bez tej
+/// kolejności głośne tło z jednej strony zabierałoby czerwień krokom z drugiej.
+fn decide_side(state: &RadarState, now: f64, cfg: &RadarConfig) -> Option<(usize, f32)> {
+    let inner = [0usize, 1].map(|side| strongest_layer(state, side, now, cfg, &INNER_LAYERS).1);
+    clear_lead(inner).or_else(|| clear_lead(everything_heights(state, cfg, now)))
+}
+
+/// Krycie poświaty dla strony `focus` w chwili `now`: z przewagi (od widoczności `floor` tuż nad
+/// progiem), przygaszone w czasie przytrzymania i pomnożone przez moc z ustawień.
+fn glow_strength(focus: SideFocus, now: f64, power: f32, floor: f32) -> f32 {
+    side_glow_strength(focus.lead, floor) * side_focus_fade(focus, now) * power
+}
+
+/// Strona z czerwienią i krycie poświaty radaru, które narysują się w chwili `now`. Do logu i opisów:
+/// nie zmienia stanu, ale liczy dokładnie to samo co [`RadarState::update_side_focus`].
+fn side_focus_now(state: &RadarState, cfg: &RadarConfig, now: f64) -> (Option<usize>, f32) {
+    let focus = next_side_focus(state.side_focus, decide_side(state, now, cfg), now);
+    let glow = focus
+        .map(|f| glow_strength(f, now, cfg.layer_side_glow, cfg.glow_min_visibility))
+        .unwrap_or(0.0);
+    (focus.map(|f| f.side), glow)
+}
+
+/// Następna strona z przewagą. Druga strona przejmuje ją dopiero, gdy minie [`SIDE_HOLD_SECS`]
+/// od ostatniego potwierdzenia obecnej. Bez przewagi obecna strona też trzyma się tyle samo.
+fn next_side_focus(prev: Option<SideFocus>, decided: Option<(usize, f32)>, now: f64) -> Option<SideFocus> {
+    let held = prev.filter(|p| now - p.at < SIDE_HOLD_SECS);
+    match (held, decided) {
+        (Some(p), Some((side, _))) if side != p.side => Some(p),
+        (_, Some((side, lead))) => Some(SideFocus { side, lead, at: now }),
+        (held, None) => held,
+    }
+}
+
+/// Ile poświaty zostaje w chwili `now`: pełna przy świeżym potwierdzeniu, gaśnie do zera przez
+/// czas przytrzymania.
+fn side_focus_fade(focus: SideFocus, now: f64) -> f32 {
+    (1.0 - ((now - focus.at) / SIDE_HOLD_SECS) as f32).clamp(0.0, 1.0)
+}
+
+/// Siła poświaty z przewagi, zanim pomnoży ją moc z ustawień: `floor` tuż nad progiem
+/// (widoczność przy małej przewadze z ustawień), 1,0 przy przewadze większej od progu o 0,3 i więcej.
+fn side_glow_strength(lead: f32, floor: f32) -> f32 {
+    let floor = floor.clamp(0.0, 1.0);
+    floor + (1.0 - floor) * ((lead - DOMINANCE_MARGIN) / 0.3).clamp(0.0, 1.0)
+}
+
+/// Poświata radaru warstw po stronie `focus`, za zewnętrznym łukiem (`rim_edge` to jego zewnętrzna
+/// krawędź), w stylu, mocy i widoczności z ustawień. `height` to wysokość łuku wszystko tej strony.
+#[allow(clippy::too_many_arguments)]
+fn draw_radar_glow<C: RadarCanvas>(
+    canvas: &C,
+    center: Pos2,
+    cfg: &RadarConfig,
+    focus: SideFocus,
+    rim_edge: f32,
+    rim_thickness: f32,
+    height: f32,
+    now: f64,
+) {
+    use crate::sound::devices::RadarGlowStyle;
+    let strength = glow_strength(focus, now, cfg.layer_side_glow, cfg.glow_min_visibility);
+    match cfg.radar_glow_style {
+        RadarGlowStyle::Crescent => {
+            draw_side_glow(canvas, center, focus.side, rim_edge, rim_thickness, height, strength, cfg.fg_alpha);
+        }
+        RadarGlowStyle::Line => {
+            let line = glow_line_px(rim_thickness, cfg);
+            draw_side_line(canvas, center, focus.side, rim_edge, line, strength, cfg.fg_alpha);
+        }
+    }
+}
+
+/// Domyślna grubość linii poświaty jako ułamek grubości zewnętrznego łuku (przy mnożniku 1.0).
+const GLOW_LINE_FRAC: f32 = 0.4;
+/// Krycie samej linii (0..255), zanim pomnoży je siła poświaty.
+const GLOW_LINE_ALPHA: f32 = 210.0;
+/// Odstęp linii od zewnętrznej krawędzi łuku, w pikselach.
+const GLOW_LINE_GAP: f32 = 2.0;
+/// Blada otoczka linii: (szerokość w grubościach linii, środek za krawędzią łuku w grubościach linii,
+/// krycie 0..255).
+const GLOW_LINE_HALO: (f32, f32, f32) = (4.0, 2.5, 35.0);
+
+/// Grubość linii poświaty w pikselach: ułamek grubości zewnętrznego łuku razy mnożnik z ustawień.
+fn glow_line_px(rim_thickness: f32, cfg: &RadarConfig) -> f32 {
+    (rim_thickness * GLOW_LINE_FRAC * cfg.glow_line_width.max(0.1)).max(1.0)
+}
+
+/// Linia poświaty: cienka czerwona linia na całej długości łuku tuż za nim i szersza, blada otoczka.
+/// Długość jest stała, przewagę pokazuje tylko krycie (`strength`, 0 nic nie rysuje).
+fn draw_side_line<C: RadarCanvas>(
+    canvas: &C,
+    center: Pos2,
+    side: usize,
+    rim_edge: f32,
+    line: f32,
+    strength: f32,
+    fg: f32,
+) {
+    const MAX_HALF_SPAN_DEG: f32 = 70.0;
+    if strength <= 0.0 {
+        return;
+    }
+    let mid_deg = if side == 0 { 270.0 } else { 90.0 };
+    let (r, g, b) = DOMINANT_OUTLINE_RGB;
+    let color = |alpha: f32| Color32::from_rgba_unmultiplied(r, g, b, (alpha * strength * fg).clamp(0.0, 255.0) as u8);
+    let (halo_width, halo_at, halo_alpha) = GLOW_LINE_HALO;
+    let halo = Stroke::new(line * halo_width, color(halo_alpha));
+    draw_arc(canvas, center, mid_deg, MAX_HALF_SPAN_DEG, rim_edge + line * halo_at, halo);
+    let stroke = Stroke::new(line, color(GLOW_LINE_ALPHA));
+    draw_arc(canvas, center, mid_deg, MAX_HALF_SPAN_DEG, rim_edge + GLOW_LINE_GAP + line * 0.5, stroke);
+}
+
+/// Jak daleko za zewnętrzną krawędź łuku sięga poświata radaru w bieżącym stylu, w pikselach.
+fn radar_glow_reach(cfg: &RadarConfig, rim_thickness: f32) -> f32 {
+    use crate::sound::devices::RadarGlowStyle;
+    match cfg.radar_glow_style {
+        RadarGlowStyle::Crescent => rim_thickness * SIDE_GLOW_BAND_FRAC * SIDE_GLOW_BANDS.len() as f32,
+        RadarGlowStyle::Line => {
+            let line = glow_line_px(rim_thickness, cfg);
+            let (halo_width, halo_at, _) = GLOW_LINE_HALO;
+            (GLOW_LINE_GAP + line).max(line * (halo_at + halo_width * 0.5))
+        }
+    }
+}
+
+/// Pasy poświaty od zewnętrznego łuku na zewnątrz: (krycie 0..255, ułamek rozpiętości). Każdy kolejny
+/// pas jest dalej, bledszy i krótszy, więc razem dają miękki półksiężyc bez gradientu, tak jak
+/// [`EDGE_GLOW_LAYERS`] przy krawędzi ekranu.
+const SIDE_GLOW_BANDS: [(f32, f32); 4] = [(150.0, 1.0), (95.0, 0.92), (55.0, 0.84), (25.0, 0.76)];
+
+/// Grubość jednego pasa poświaty jako ułamek grubości zewnętrznego łuku.
+const SIDE_GLOW_BAND_FRAC: f32 = 0.7;
+
+/// Czerwona poświata na zewnątrz radaru po stronie `side`, tuż za zewnętrznym łukiem (`rim_edge` to
+/// jego zewnętrzna krawędź). Długość idzie za wysokością zewnętrznego łuku tej strony, `strength`
+/// mnoży krycie (0 nic nie rysuje).
+#[allow(clippy::too_many_arguments)]
+fn draw_side_glow<C: RadarCanvas>(
+    canvas: &C,
+    center: Pos2,
+    side: usize,
+    rim_edge: f32,
+    rim_thickness: f32,
+    height: f32,
+    strength: f32,
+    fg: f32,
+) {
+    const MAX_HALF_SPAN_DEG: f32 = 70.0;
+    if strength <= 0.0 {
+        return;
+    }
+    let mid_deg = if side == 0 { 270.0 } else { 90.0 };
+    let band = rim_thickness * SIDE_GLOW_BAND_FRAC;
+    // Krótka poświata przy niskim łuku nadal ma być widoczna, a najdłuższa nie sięga legendy na dole.
+    let half_span = (MAX_HALF_SPAN_DEG * height).clamp(18.0, 62.0);
+    let (r, g, b) = DOMINANT_OUTLINE_RGB;
+    for (i, &(alpha, span_frac)) in SIDE_GLOW_BANDS.iter().enumerate() {
+        let a = (alpha * strength * fg).clamp(0.0, 255.0) as u8;
+        if a == 0 {
+            continue;
+        }
+        let radius = rim_edge + band * (i as f32 + 0.5);
+        let color = Color32::from_rgba_unmultiplied(r, g, b, a);
+        draw_arc(canvas, center, mid_deg, half_span * span_frac, radius, Stroke::new(band, color));
+    }
+}
+
+/// Margines okna overlay (cała szerokość ponad średnicę radaru), jakiego potrzebuje rysunek przy tych
+/// ustawieniach. Dziś tylko poświata radaru warstw (3+3 i 2+2) wychodzi poza zwykły margines aplikacji,
+/// więc w innych trybach i przy wyłączonej poświacie zwraca zero.
+pub fn overlay_padding_needed(cfg: &RadarConfig) -> f32 {
+    if !cfg.visualization_mode.shows_layers() || cfg.layer_side_glow <= 0.0 {
+        return 0.0;
+    }
+    let rim = stereo_arc_thickness(cfg.radius, cfg.line_thickness.max(0.0));
+    let glow_outer = 4.0 + rim + radar_glow_reach(cfg, rim);
+    2.0 * (glow_outer + 4.0)
 }
 
 /// Przód i tył jak w starym widoku: łuki i odbicia kroków. Rysowane tylko przy włączonym widoku
@@ -1180,8 +1419,16 @@ fn draw_spatial_extras<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, cfg: &R
 }
 
 /// Reszta: stare wskaźniki L/P wokół tarczy, zasilane ciągłym tłem stereo, więc działają też podczas
-/// jazdy, gdy nie ma wyraźnych zdarzeń.
-fn draw_rest_ring<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, cfg: &RadarConfig, state: &RadarState) {
+/// jazdy, gdy nie ma wyraźnych zdarzeń. Czerwony obrys dostaje tylko strona `focus` (wspólna dla
+/// całego 3+3), a nie strona przewagi samego tła.
+fn draw_rest_ring<C: RadarCanvas>(
+    canvas: &C,
+    center: Pos2,
+    r: f32,
+    cfg: &RadarConfig,
+    state: &RadarState,
+    focus: Option<usize>,
+) {
     let fg = cfg.fg_alpha;
     let lt = cfg.line_thickness.max(0.0);
     // Reszta: stare wskaźniki z własnym wzmocnieniem i kolorem.
@@ -1203,6 +1450,7 @@ fn draw_rest_ring<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, cfg: &RadarC
         fg,
         lt,
         state.rest_visible(),
+        [focus == Some(0), focus == Some(1)],
     );
 }
 
@@ -1247,6 +1495,223 @@ fn tint(rgb: (u8, u8, u8), alpha: f32, fg: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, (alpha * fg).clamp(0.0, 255.0) as u8)
 }
 
+/// Co wizualizacja pokazuje w danej chwili: kolumny zależne od trybu i widoku przestrzennego oraz jedna
+/// linia opisu słowami. Logger radaru (`sound::radar_log`) zapisuje stąd liczby, więc są te same, które
+/// rysuje `draw_radar`. Nazwy kolumn zależą tylko od trybu i widoku przestrzennego, nie od stanu.
+pub struct ViewSnapshot {
+    pub names: Vec<&'static str>,
+    pub values: Vec<String>,
+    pub text: String,
+}
+
+#[derive(Default)]
+struct Columns {
+    names: Vec<&'static str>,
+    values: Vec<String>,
+}
+
+impl Columns {
+    fn add(&mut self, name: &'static str, value: impl Into<String>) {
+        self.names.push(name);
+        self.values.push(value.into());
+    }
+}
+
+fn hex_rgb(c: (u8, u8, u8)) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2)
+}
+
+/// Wysokość strony, o ile wizualizacja ją rysuje (`None`, gdy ją chowa).
+fn shown_height(heights: [f32; 2], visible: [bool; 2], side: usize) -> Option<f32> {
+    visible[side].then_some(heights[side])
+}
+
+/// Wysokość 0..1 jako procent 0–100 z jednym miejscem po przecinku. Łuk schowany daje 0.
+fn percent_text(v: Option<f32>) -> String {
+    format!("{:.1}", v.unwrap_or(0.0) * 100.0)
+}
+
+/// Kod warstwy w logu: 1 strzały, 2 kroki, 3 reszta.
+pub fn layer_code(layer: Layer) -> u8 {
+    match layer {
+        Layer::Shots => 1,
+        Layer::Steps => 2,
+        Layer::Rest => 3,
+    }
+}
+
+/// Kod strony w logu: 0 brak, 1 lewa (L), 2 prawa (R).
+pub fn side_code(side: Option<usize>) -> u8 {
+    match side {
+        Some(0) => 1,
+        Some(1) => 2,
+        _ => 0,
+    }
+}
+
+/// Nazwa strony do tekstu: `L`, `R` albo „brak”.
+fn side_word(side: Option<usize>) -> &'static str {
+    match side {
+        Some(0) => "L",
+        Some(1) => "R",
+        _ => "brak",
+    }
+}
+
+fn word_text(v: Option<f32>) -> String {
+    v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "—".to_string())
+}
+
+/// Migawka tego, co widać w chwili `now`, zgodnie z trybem i ustawieniami z `cfg`. Patrz [`ViewSnapshot`].
+pub fn view_snapshot(state: &RadarState, cfg: &RadarConfig, now: f64) -> ViewSnapshot {
+    use crate::sound::devices::VisualizationMode;
+    let mode = cfg.visualization_mode;
+    let mut cols = Columns::default();
+    let mut parts: Vec<String> = Vec::new();
+
+    if mode.shows_radar() {
+        let alive: Vec<&DirectionMarker> = state
+            .direction_markers
+            .iter()
+            .filter(|m| (0.0..=DIRECTION_MARKER_LIFETIME_SECS).contains(&(now - m.spawned_at)))
+            .collect();
+        let newest = alive.last();
+        cols.add("radar_wskazniki", alive.len().to_string());
+        cols.add("radar_kierunek_deg", newest.map(|m| format!("{:.1}", m.angle_deg)).unwrap_or_default());
+        cols.add("radar_intensywnosc_proc", percent_text(newest.map(|m| m.intensity.clamp(0.0, 1.0))));
+        let color = newest.map(|m| m.color_rgb).unwrap_or((0, 0, 0));
+        cols.add("radar_kolor_R", color.0.to_string());
+        cols.add("radar_kolor_G", color.1.to_string());
+        cols.add("radar_kolor_B", color.2.to_string());
+        parts.push(if alive.is_empty() {
+            "radar: brak wskaźników".to_string()
+        } else {
+            let list: Vec<String> = alive
+                .iter()
+                .rev()
+                .take(3)
+                .map(|m| format!("{:.0}° {:.2} {}", m.angle_deg, m.intensity, hex_rgb(m.color_rgb)))
+                .collect();
+            format!("radar: {} wsk. ({})", alive.len(), list.join(", "))
+        });
+    }
+
+    if mode.shows_bars() {
+        let left = state.stereo_left_history.back().copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let right = state.stereo_right_history.back().copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        let outline = if left - right > DOMINANCE_MARGIN {
+            Some(0)
+        } else if right - left > DOMINANCE_MARGIN {
+            Some(1)
+        } else {
+            None
+        };
+        cols.add("bars_L_proc", percent_text(Some(left)));
+        cols.add("bars_R_proc", percent_text(Some(right)));
+        cols.add("bars_obrys", side_code(outline).to_string());
+        parts.push(format!("słupki L/R: L {left:.2} R {right:.2}, obrys {}", side_word(outline)));
+    }
+
+    match mode {
+        VisualizationMode::LayerBars => {
+            let heights = |layer: Layer| {
+                [0usize, 1]
+                    .map(|side| (state.layer_bars.height(side, layer, now, cfg.decay_secs) * layer_gain(cfg, layer)).clamp(0.0, 1.0))
+            };
+            let steps = heights(Layer::Steps);
+            let shots = heights(Layer::Shots);
+            let steps_vis = visible_sides(steps[0], steps[1], 0.05);
+            let shots_vis = visible_sides(shots[0], shots[1], 0.05);
+            // Zewnętrzny łuk to wszystko: strumień stereo, tak jak rysuje `draw_rest_ring`.
+            let rest = [0usize, 1].map(|side| {
+                let history = if side == 0 { &state.stereo_left_history } else { &state.stereo_right_history };
+                (history.back().copied().unwrap_or(0.0) * cfg.layer_rest_gain).clamp(0.0, 1.0)
+            });
+            let rest_vis = state.rest_visible();
+            let steps_shown = [shown_height(steps, steps_vis, 0), shown_height(steps, steps_vis, 1)];
+            let shots_shown = [shown_height(shots, shots_vis, 0), shown_height(shots, shots_vis, 1)];
+            let rest_shown = [shown_height(rest, rest_vis, 0), shown_height(rest, rest_vis, 1)];
+            cols.add("moc_kroki_L_proc", percent_text(steps_shown[0]));
+            cols.add("moc_kroki_R_proc", percent_text(steps_shown[1]));
+            cols.add("moc_strzaly_L_proc", percent_text(shots_shown[0]));
+            cols.add("moc_strzaly_R_proc", percent_text(shots_shown[1]));
+            cols.add("moc_wszystko_L_proc", percent_text(rest_shown[0]));
+            cols.add("moc_wszystko_R_proc", percent_text(rest_shown[1]));
+            let highlighted = state.layer_bars.highlighted_layer();
+            let (focus, _) = side_focus_now(state, cfg, now);
+            cols.add("podswietlona", layer_code(highlighted).to_string());
+            cols.add("obwodka", side_code(focus).to_string());
+            parts.push(format!(
+                "3+3: kroki L {} R {} | strzały L {} R {} | wszystko L {} R {} | podświetlona: {}, obwódka: {}",
+                word_text(steps_shown[0]),
+                word_text(steps_shown[1]),
+                word_text(shots_shown[0]),
+                word_text(shots_shown[1]),
+                word_text(rest_shown[0]),
+                word_text(rest_shown[1]),
+                highlighted.label(),
+                side_word(focus),
+            ));
+        }
+        VisualizationMode::LayerBars22 => {
+            let inner = [0usize, 1].map(|side| strongest_layer(state, side, now, cfg, &INNER_LAYERS));
+            let outer = [0usize, 1].map(|side| strongest_layer(state, side, now, cfg, &Layer::ALL));
+            // Ta sama strona z czerwienią i to samo krycie poświaty, co rysuje `draw_layer_bars_2x2`.
+            let (focus_side, glow) = side_focus_now(state, cfg, now);
+            // Obrys łuku pokazuje się tylko przy wysokości ponad progiem, tak jak w rysunku.
+            let outlined = |heights: [f32; 2]| focus_side.filter(|&side| heights[side] >= DOMINANT_MIN_HEIGHT);
+            let inner_outline = outlined(inner.map(|(_, h)| h));
+            let outer_outline = outlined(outer.map(|(_, h)| h));
+            cols.add("moc_wewnetrzny_L_proc", percent_text(Some(inner[0].1)));
+            cols.add("moc_wewnetrzny_R_proc", percent_text(Some(inner[1].1)));
+            cols.add("zrodlo_wewnetrzny_L", layer_code(inner[0].0).to_string());
+            cols.add("zrodlo_wewnetrzny_R", layer_code(inner[1].0).to_string());
+            cols.add("moc_zewnetrzny_L_proc", percent_text(Some(outer[0].1)));
+            cols.add("moc_zewnetrzny_R_proc", percent_text(Some(outer[1].1)));
+            cols.add("zrodlo_zewnetrzny_L", layer_code(outer[0].0).to_string());
+            cols.add("zrodlo_zewnetrzny_R", layer_code(outer[1].0).to_string());
+            cols.add("poswiata_strona", side_code(focus_side).to_string());
+            cols.add("poswiata_proc", percent_text(Some(glow)));
+            parts.push(format!(
+                "2+2: wewnątrz L {:.2} ({}) R {:.2} ({}) | na zewnątrz L {:.2} ({}) R {:.2} ({}) | obwódka: wewnątrz {}, na zewnątrz {} | poświata {:.2}",
+                inner[0].1,
+                inner[0].0.label(),
+                inner[1].1,
+                inner[1].0.label(),
+                outer[0].1,
+                outer[0].0.label(),
+                outer[1].1,
+                outer[1].0.label(),
+                side_word(inner_outline),
+                side_word(outer_outline),
+                glow,
+            ));
+        }
+        _ => {}
+    }
+
+    if cfg.spatial_audio_view && (mode.shows_bars() || mode.shows_layers()) {
+        let visible = state.spatial_energy >= 0.005;
+        let front_back = state.displayed_front_back(now);
+        let front = front_back.max(0.0).clamp(0.0, 1.0);
+        let back = (-front_back).max(0.0).clamp(0.0, 1.0);
+        cols.add("przod_proc", percent_text(visible.then_some(front)));
+        cols.add("tyl_proc", percent_text(visible.then_some(back)));
+        parts.push(if visible {
+            format!("przód {front:.2} tył {back:.2}")
+        } else {
+            "przód/tył schowane".to_string()
+        });
+    }
+
+    let text = if parts.is_empty() { "widok wyłączony".to_string() } else { parts.join(" | ") };
+    ViewSnapshot {
+        names: cols.names,
+        values: cols.values,
+        text,
+    }
+}
+
 /// Tekstowy zrzut tego, co widać na radarze 3+3 w chwili `now`. Liczby są te same, z których
 /// rysuje `draw_layer_bars`: wysokości łuków po wzmocnieniu, widoczność stron, podświetlenie,
 /// czerwona obwódka i kolory.
@@ -1263,7 +1728,7 @@ pub fn layer_text(state: &RadarState, cfg: &RadarConfig, now: f64) -> String {
         Layer::Rest => cfg.layer_rest_gain,
     };
     let highlighted = state.layer_bars.highlighted_layer();
-    let focus = state.layer_bars.focus_side(now, cfg.decay_secs);
+    let (focus, _) = side_focus_now(state, cfg, now);
     let side_name = |side: usize| if side == 0 { "L" } else { "P" };
 
     let mut out = String::new();
@@ -1549,8 +2014,16 @@ fn draw_arc<C: RadarCanvas>(
     }
 }
 
+/// Która strona słupków L/R dostaje czerwony obrys: ta, która przewyższa drugą o więcej niż
+/// [`DOMINANCE_MARGIN`].
+fn stereo_dominance((left, right): (f32, f32)) -> [bool; 2] {
+    [left - right > DOMINANCE_MARGIN, right - left > DOMINANCE_MARGIN]
+}
+
 /// Łuki L/R na obwodzie tarczy: lewy rozchodzi się od godziny 9, prawy od 3,
 /// długość i jasność rosną z energią kanału; cienka kreska to szczyt z historii.
+/// `outlined` mówi, która strona ma czerwony obrys.
+#[allow(clippy::too_many_arguments)]
 fn draw_stereo_indicators<C: RadarCanvas>(
     canvas: &C,
     center: Pos2,
@@ -1562,6 +2035,7 @@ fn draw_stereo_indicators<C: RadarCanvas>(
     fg: f32,
     lt: f32,
     visible: [bool; 2],
+    outlined: [bool; 2],
 ) {
     const MAX_HALF_SPAN_DEG: f32 = 70.0;
 
@@ -1570,12 +2044,9 @@ fn draw_stereo_indicators<C: RadarCanvas>(
 
     let point_at = |deg: f32, radius: f32| center + screen_direction(deg) * radius;
 
-    let left_energy = left_history.back().copied().unwrap_or(0.0);
-    let right_energy = right_history.back().copied().unwrap_or(0.0);
-
     let channels = [
-        (270.0_f32, left_history, left_rgb, "L", left_energy - right_energy > DOMINANCE_MARGIN),
-        (90.0_f32, right_history, right_rgb, "R", right_energy - left_energy > DOMINANCE_MARGIN),
+        (270.0_f32, left_history, left_rgb, "L", outlined[0]),
+        (90.0_f32, right_history, right_rgb, "R", outlined[1]),
     ];
 
     for (mid_deg, history, rgb, label, dominant) in channels {
@@ -1669,7 +2140,9 @@ fn edge_intersection(screen_rect: Rect, dir: Vec2) -> (Pos2, bool) {
 /// Rysuje jedną, wielowarstwową poświatę przy krawędzi ekranu najbliższej
 /// `point` — miękkie gasnięcie w głąb ekranu, symulowane kilkoma nałożonymi,
 /// coraz mniejszymi i coraz bardziej nieprzezroczystymi pasami (canvas nie ma
-/// prawdziwego gradientu), zamiast jednego twardego prostokąta.
+/// prawdziwego gradientu), zamiast jednego twardego prostokąta. `max_span` to długość
+/// najszerszego pasa wzdłuż krawędzi.
+#[allow(clippy::too_many_arguments)]
 fn draw_edge_glow_at<C: RadarCanvas>(
     canvas: &C,
     screen_rect: Rect,
@@ -1678,10 +2151,11 @@ fn draw_edge_glow_at<C: RadarCanvas>(
     rgb: (u8, u8, u8),
     strength: f32,
     fg: f32,
+    max_span: f32,
 ) {
     for &(size_frac, alpha_frac) in &EDGE_GLOW_LAYERS {
         let depth = EDGE_GLOW_MAX_DEPTH * size_frac;
-        let span = EDGE_GLOW_MAX_SPAN * size_frac;
+        let span = max_span * size_frac;
         let alpha = (255.0 * alpha_frac * strength * fg).clamp(0.0, 255.0) as u8;
         if alpha == 0 {
             continue;
@@ -1707,24 +2181,71 @@ fn draw_edge_glow_at<C: RadarCanvas>(
     }
 }
 
+/// W stereo poświata krawędzi zajmuje ten ułamek wysokości ekranu (najszerszy pas).
+const STEREO_EDGE_GLOW_SPAN_FRAC: f32 = 0.6;
+
+/// Pasy winiety od najszerszego do najwęższego: (ułamek zasięgu winiety, ułamek krycia). Nałożone
+/// dają gradient: blado w głębi ekranu, najmocniej przy samej krawędzi.
+const EDGE_VIGNETTE_LAYERS: [(f32, f32); 4] = [(1.0, 0.05), (0.6, 0.08), (0.3, 0.12), (0.08, 0.35)];
+
+/// Winieta na całej wysokości lewego (`side` 0) albo prawego boku `screen_rect`. `reach` to zasięg
+/// najszerszego pasa w pikselach, `strength` mnoży krycie (0 nic nie rysuje).
+fn draw_edge_vignette<C: RadarCanvas>(canvas: &C, screen_rect: Rect, side: usize, reach: f32, strength: f32, fg: f32) {
+    let (r, g, b) = DOMINANT_OUTLINE_RGB;
+    for &(reach_frac, alpha_frac) in &EDGE_VIGNETTE_LAYERS {
+        let alpha = (255.0 * alpha_frac * strength * fg).clamp(0.0, 255.0) as u8;
+        if alpha == 0 {
+            continue;
+        }
+        let width = reach * reach_frac;
+        let x0 = if side == 0 { screen_rect.left() } else { screen_rect.right() - width };
+        let rect = Rect::from_min_size(Pos2::new(x0, screen_rect.top()), Vec2::new(width, screen_rect.height()));
+        canvas.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(r, g, b, alpha));
+    }
+}
+
 /// Rysuje peryferyjne poświaty kierunku na krawędziach `screen_rect` (patrz
-/// doc-komentarz sekcji powyżej) — jedna na każdy aktywny wskaźnik kierunku w
-/// `state` ([`DirectionMarker`], ten sam stan co markery na tarczy radaru w
-/// [`draw_radar`]), więc oba tryby wizualizacji zawsze pokazują dokładnie te
-/// same zdarzenia, tylko w innej formie. Bez efektu, gdy
-/// [`RadarConfig::edge_glow_enabled`] jest wyłączone.
+/// doc-komentarz sekcji powyżej). Przy 5.1/7.1 jedna na każdy aktywny wskaźnik
+/// kierunku w `state` ([`DirectionMarker`], ten sam stan co markery na tarczy
+/// radaru w [`draw_radar`]). W stereo kąty mieszczą się w ±45°, więc wskaźniki
+/// trafiałyby zawsze w górną krawędź. Dlatego w stereo jest jedna czerwona
+/// poświata na lewej albo prawej krawędzi, po stronie, gdzie przewagę ma łuk
+/// wszystko (patrz [`everything_heights`]), z przytrzymaniem jak na radarze.
+/// Bez efektu, gdy [`RadarConfig::edge_glow_enabled`] jest wyłączone.
 pub fn draw_edge_glow_indicators<C: RadarCanvas>(
     canvas: &C,
     screen_rect: Rect,
-    state: &RadarState,
+    state: &mut RadarState,
     now: f64,
     cfg: &RadarConfig,
 ) {
+    use crate::sound::devices::{EdgeGlowStyle, SpeakerSetup};
     if !cfg.edge_glow_enabled {
         return;
     }
     let hc = cfg.high_contrast;
     let fg = cfg.fg_alpha;
+
+    if cfg.speaker_setup == SpeakerSetup::Stereo {
+        let decided = clear_lead(everything_heights(state, cfg, now));
+        state.edge_focus = next_side_focus(state.edge_focus, decided, now);
+        if let Some(focus) = state.edge_focus {
+            let strength = glow_strength(focus, now, cfg.edge_glow_strength, cfg.glow_min_visibility);
+            match cfg.edge_glow_style {
+                EdgeGlowStyle::Blob => {
+                    let x = if focus.side == 0 { screen_rect.left() } else { screen_rect.right() };
+                    let point = Pos2::new(x, screen_rect.center().y);
+                    let span = screen_rect.height() * STEREO_EDGE_GLOW_SPAN_FRAC;
+                    draw_edge_glow_at(canvas, screen_rect, point, true, DOMINANT_OUTLINE_RGB, strength, fg, span);
+                }
+                EdgeGlowStyle::Vignette => {
+                    let reach = screen_rect.width() * cfg.edge_vignette_width.clamp(0.0, 1.0);
+                    draw_edge_vignette(canvas, screen_rect, focus.side, reach, strength, fg);
+                }
+            }
+        }
+        return;
+    }
 
     for marker in &state.direction_markers {
         let age = (now - marker.spawned_at) as f32;
@@ -1739,7 +2260,7 @@ pub fn draw_edge_glow_indicators<C: RadarCanvas>(
         let rgb = if hc { (255, 255, 255) } else { marker.color_rgb };
         let dir = screen_direction(marker.angle_deg);
         let (point, vertical_edge) = edge_intersection(screen_rect, dir);
-        draw_edge_glow_at(canvas, screen_rect, point, vertical_edge, rgb, strength, fg);
+        draw_edge_glow_at(canvas, screen_rect, point, vertical_edge, rgb, strength, fg, EDGE_GLOW_MAX_SPAN);
     }
 }
 
@@ -1814,6 +2335,8 @@ mod tests {
             class: None,
             pan: -1.0,
             peak_dbfs,
+            peak_left_dbfs: peak_dbfs,
+            peak_right_dbfs: peak_dbfs,
             brightness_db: None,
             gap_s: None,
             onset_s: 0.0,
@@ -1841,6 +2364,8 @@ mod tests {
             class: None,
             pan,
             peak_dbfs,
+            peak_left_dbfs: peak_dbfs,
+            peak_right_dbfs: peak_dbfs,
             brightness_db: None,
             gap_s: None,
             onset_s: 0.0,
@@ -1871,11 +2396,267 @@ mod tests {
     }
 
     #[test]
-    fn dominant_side_needs_a_clear_lead_above_silence() {
-        assert_eq!(dominant_side([0.5, 0.2]), Some(0));
-        assert_eq!(dominant_side([0.2, 0.5]), Some(1));
-        assert_eq!(dominant_side([0.5, 0.5]), None, "remis: bez obrysu");
-        assert_eq!(dominant_side([0.01, 0.02]), None, "cisza: bez obrysu");
+    fn clear_lead_needs_a_margin_above_silence() {
+        assert_eq!(clear_lead([0.5, 0.2]).map(|(s, _)| s), Some(0));
+        assert_eq!(clear_lead([0.2, 0.5]).map(|(s, _)| s), Some(1));
+        assert_eq!(clear_lead([0.5, 0.5]), None, "remis: bez czerwieni");
+        assert_eq!(clear_lead([0.52, 0.50]), None, "różnica w marginesie: bez czerwieni");
+        assert_eq!(clear_lead([0.01, 0.04]), None, "cisza: bez czerwieni");
+    }
+
+    fn layer_2x2_cfg() -> RadarConfig {
+        RadarConfig {
+            visualization_mode: crate::sound::devices::VisualizationMode::LayerBars22,
+            layer_steps_gain: 1.0,
+            layer_shots_gain: 1.0,
+            layer_rest_gain: 1.0,
+            ..RadarConfig::default()
+        }
+    }
+
+    #[test]
+    fn layer_2x2_step_wins_the_side_over_louder_background() {
+        // Krok z lewej, a tło (wszystko) mocniej z prawej: zewnętrzny łuk sam dałby prawą stronę.
+        let cfg = layer_2x2_cfg();
+        let mut state = RadarState::new();
+        state.layer_bars.record(0.0, hit_at(Layer::Steps, -10.0, -0.8));
+        state.layer_bars.record(0.0, hit_at(Layer::Rest, -3.0, 0.9));
+        let outer = [0usize, 1].map(|side| strongest_layer(&state, side, 0.0, &cfg, &Layer::ALL).1);
+        assert!(outer[1] > outer[0] + DOMINANCE_MARGIN, "tło przeważa na zewnątrz po prawej: {outer:?}");
+        assert_eq!(decide_side(&state, 0.0, &cfg).map(|(s, _)| s), Some(0), "kroki decydują: lewa");
+    }
+
+    #[test]
+    fn layer_2x2_background_decides_when_no_events() {
+        let cfg = layer_2x2_cfg();
+        let mut state = RadarState::new();
+        state.layer_bars.record(0.0, hit_at(Layer::Rest, -6.0, 0.7));
+        assert_eq!(decide_side(&state, 0.0, &cfg).map(|(s, _)| s), Some(1), "samo tło z prawej");
+    }
+
+    #[test]
+    fn side_focus_holds_before_switching_and_after_losing_the_lead() {
+        let left = next_side_focus(None, Some((0, 0.4)), 1.0);
+        assert_eq!(left.map(|f| f.side), Some(0));
+        let still_left = next_side_focus(left, Some((1, 0.4)), 1.05);
+        assert_eq!(still_left.map(|f| f.side), Some(0), "prawa nie przejmuje przed końcem przytrzymania");
+        let right = next_side_focus(still_left, Some((1, 0.4)), 1.0 + SIDE_HOLD_SECS + 0.01);
+        assert_eq!(right.map(|f| f.side), Some(1), "po przytrzymaniu przejmuje prawa");
+
+        let held = next_side_focus(left, None, 1.1).expect("bez przewagi strona jeszcze się trzyma");
+        assert!(side_focus_fade(held, 1.1) < 1.0, "a poświata już gaśnie");
+        assert_eq!(next_side_focus(left, None, 1.0 + SIDE_HOLD_SECS + 0.01), None, "po przytrzymaniu nic");
+    }
+
+    #[test]
+    fn layer_2x2_puts_all_red_on_one_side_and_glow_follows_the_setting() {
+        // Krok z lewej, tło mocniej z prawej: dawniej czerwień była wewnątrz po lewej i na zewnątrz po prawej.
+        // Kanały są wstępnie pomnożone przez alfę, więc liczy się przewaga czerwieni, a nie wartość 255.
+        let is_red = |c: &Color32| {
+            let (r, g, b) = (u16::from(c.r()), u16::from(c.g()), u16::from(c.b()));
+            r > 10 && r > 3 * g && r > 3 * b
+        };
+        let draw = |glow: f32| {
+            let mut cfg = layer_2x2_cfg();
+            cfg.layer_side_glow = glow;
+            let mut state = RadarState::new();
+            state.layer_bars.record(0.0, hit_at(Layer::Steps, -10.0, -0.8));
+            state.layer_bars.record(0.0, hit_at(Layer::Rest, -3.0, 0.9));
+            let canvas = SegmentCanvas::default();
+            draw_radar(&canvas, Pos2::ZERO, &cfg, &mut state, 2, 0.0);
+            let red: Vec<(Pos2, f32)> = canvas
+                .segments
+                .into_inner()
+                .into_iter()
+                .filter(|(_, stroke)| is_red(&stroke.color))
+                .map(|(points, stroke)| (points[0], stroke.width))
+                .collect();
+            (red, state.side_focus.map(|f| f.side))
+        };
+
+        let (red, side) = draw(1.0);
+        assert_eq!(side, Some(0));
+        assert!(!red.is_empty(), "jest czerwień");
+        assert!(red.iter().all(|(p, _)| p.x < 0.0), "cała czerwień po lewej");
+
+        let (no_glow, _) = draw(0.0);
+        assert!(no_glow.len() < red.len(), "bez poświaty mniej czerwonych pasów");
+        assert!(!no_glow.is_empty(), "obrysy zostają, gdy poświata jest wyłączona");
+    }
+
+    #[derive(Default)]
+    struct SegmentCanvas {
+        segments: std::cell::RefCell<Vec<([Pos2; 2], Stroke)>>,
+    }
+
+    impl RadarCanvas for SegmentCanvas {
+        fn circle_filled(&self, _: Pos2, _: f32, _: Color32) {}
+        fn circle_stroke(&self, _: Pos2, _: f32, _: Stroke) {}
+        fn line_segment(&self, points: [Pos2; 2], stroke: Stroke) {
+            self.segments.borrow_mut().push((points, stroke));
+        }
+        fn rect_filled(&self, _: Rect, _: f32, _: Color32) {}
+        fn triangle_filled(&self, _: [Pos2; 3], _: Color32) {}
+        fn text(&self, _: Pos2, _: Align2, _: &str, _: FontId, _: Color32) {}
+    }
+
+    #[test]
+    fn overlay_grows_only_for_the_layer_glow() {
+        use crate::sound::devices::VisualizationMode;
+        let mut cfg = layer_2x2_cfg();
+        assert!(overlay_padding_needed(&cfg) > 0.0);
+        cfg.visualization_mode = VisualizationMode::LayerBars;
+        assert!(overlay_padding_needed(&cfg) > 0.0, "3+3 też ma poświatę");
+        cfg.layer_side_glow = 0.0;
+        assert_eq!(overlay_padding_needed(&cfg), 0.0, "bez poświaty bez dodatkowego miejsca");
+        cfg.layer_side_glow = 1.0;
+        cfg.visualization_mode = VisualizationMode::OnlyRadar;
+        assert_eq!(overlay_padding_needed(&cfg), 0.0, "sam radar nie ma poświaty");
+    }
+
+    #[test]
+    fn glow_visibility_floor_sets_the_strength_just_above_the_margin() {
+        let small = DOMINANCE_MARGIN + 0.001;
+        assert!(side_glow_strength(small, 0.0) < 0.01, "od zera");
+        assert!((side_glow_strength(small, 0.35) - 0.35).abs() < 0.01, "domyślnie 0,35");
+        assert_eq!(side_glow_strength(small, 1.0), 1.0, "zawsze pełna");
+        assert_eq!(side_glow_strength(0.9, 0.35), 1.0, "duża przewaga: pełna");
+    }
+
+    #[test]
+    fn line_glow_runs_the_whole_arc_on_the_focus_side_only() {
+        use crate::sound::devices::RadarGlowStyle;
+        let is_red = |c: &Color32| {
+            let (r, g, b) = (u16::from(c.r()), u16::from(c.g()), u16::from(c.b()));
+            r > 10 && r > 3 * g && r > 3 * b
+        };
+        let mut cfg = layer_2x2_cfg();
+        cfg.radar_glow_style = RadarGlowStyle::Line;
+        let mut state = RadarState::new();
+        // Krótki łuk: linia i tak idzie przez cały zakres, a półksiężyc byłby krótki.
+        state.layer_bars.record(0.0, hit_at(Layer::Steps, -20.0, -1.0));
+        let canvas = SegmentCanvas::default();
+        draw_radar(&canvas, Pos2::ZERO, &cfg, &mut state, 2, 0.0);
+        let rim = stereo_arc_thickness(cfg.radius, cfg.line_thickness);
+        let rim_edge = cfg.radius + 4.0 + rim;
+        let line: Vec<Pos2> = canvas
+            .segments
+            .into_inner()
+            .into_iter()
+            .filter(|(points, stroke)| is_red(&stroke.color) && points[0].to_vec2().length() > rim_edge)
+            .map(|(points, _)| points[0])
+            .collect();
+        assert!(!line.is_empty(), "linia za łukiem");
+        assert!(line.iter().all(|p| p.x < 0.0), "tylko po lewej");
+        let top = line.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+        assert!(top < -rim_edge * 0.9, "linia sięga prawie do końca zakresu 70°: {top}");
+    }
+
+    #[derive(Default)]
+    struct RectCanvas {
+        rects: std::cell::RefCell<Vec<(Rect, Color32)>>,
+    }
+
+    impl RadarCanvas for RectCanvas {
+        fn circle_filled(&self, _: Pos2, _: f32, _: Color32) {}
+        fn circle_stroke(&self, _: Pos2, _: f32, _: Stroke) {}
+        fn line_segment(&self, _: [Pos2; 2], _: Stroke) {}
+        fn rect_filled(&self, rect: Rect, _: f32, color: Color32) {
+            self.rects.borrow_mut().push((rect, color));
+        }
+        fn triangle_filled(&self, _: [Pos2; 3], _: Color32) {}
+        fn text(&self, _: Pos2, _: Align2, _: &str, _: FontId, _: Color32) {}
+    }
+
+    #[test]
+    fn stereo_vignette_covers_the_whole_left_side_when_everything_leans_left() {
+        use crate::sound::devices::EdgeGlowStyle;
+        let mut cfg = layer_2x2_cfg();
+        cfg.edge_glow_enabled = true;
+        cfg.edge_glow_style = EdgeGlowStyle::Vignette;
+        cfg.edge_vignette_width = 0.2;
+        let mut state = RadarState::new();
+        state.layer_bars.record(0.0, hit_at(Layer::Rest, -6.0, -0.7));
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0));
+        let canvas = RectCanvas::default();
+        draw_edge_glow_indicators(&canvas, screen, &mut state, 0.0, &cfg);
+        let rects = canvas.rects.into_inner();
+        assert!(!rects.is_empty(), "winieta jest");
+        assert!(rects.iter().all(|(r, _)| r.left() == 0.0 && r.height() == 1080.0), "cały lewy bok: {rects:?}");
+        let widest = rects.iter().map(|(r, _)| r.width()).fold(0.0, f32::max);
+        assert!((widest - 1920.0 * 0.2).abs() < 0.5, "zasięg z ustawień: {widest}");
+
+        cfg.edge_glow_strength = 0.0;
+        let canvas = RectCanvas::default();
+        draw_edge_glow_indicators(&canvas, screen, &mut state, 0.0, &cfg);
+        assert!(canvas.rects.into_inner().is_empty(), "moc 0: nic");
+    }
+
+    #[test]
+    fn layer_3x3_puts_red_and_glow_on_the_step_side() {
+        // Krok z lewej, ciągłe tło mocniej z prawej: pierścień wszystko sam dałby obrys po prawej.
+        let is_red = |c: &Color32| {
+            let (r, g, b) = (u16::from(c.r()), u16::from(c.g()), u16::from(c.b()));
+            r > 10 && r > 3 * g && r > 3 * b
+        };
+        let mut cfg = layer_2x2_cfg();
+        cfg.visualization_mode = crate::sound::devices::VisualizationMode::LayerBars;
+        let mut state = RadarState::new();
+        for i in 0..5 {
+            state.update(i as f64 * 0.05, 2, &[0.2, 0.6], &[], &[], cfg.decay_secs, 1.0, &[]);
+        }
+        state.layer_bars.record(0.2, hit_at(Layer::Steps, -10.0, -0.8));
+        let (left, right) = state.stereo_now();
+        assert!(right > left + DOMINANCE_MARGIN, "tło mocniej z prawej: {left} / {right}");
+
+        let canvas = SegmentCanvas::default();
+        draw_radar(&canvas, Pos2::ZERO, &cfg, &mut state, 2, 0.2);
+        assert_eq!(state.side_focus.map(|f| f.side), Some(0), "kroki decydują: lewa");
+        let red: Vec<Pos2> = canvas
+            .segments
+            .into_inner()
+            .into_iter()
+            .filter(|(_, stroke)| is_red(&stroke.color))
+            .map(|(points, _)| points[0])
+            .collect();
+        assert!(!red.is_empty(), "jest czerwień");
+        assert!(red.iter().all(|p| p.x < 0.0), "cała czerwień po lewej, także na pierścieniu wszystko");
+    }
+
+    #[test]
+    fn log_view_reports_the_layer_heights_the_radar_draws() {
+        use crate::sound::devices::VisualizationMode;
+        use crate::sound::layers::{level_from_dbfs, LayerHit};
+        let mut state = RadarState::new();
+        let cfg = RadarConfig {
+            visualization_mode: VisualizationMode::LayerBars,
+            layer_steps_gain: 1.0,
+            ..RadarConfig::default()
+        };
+        state.layer_bars.record(
+            0.0,
+            LayerHit {
+                layer: Layer::Steps,
+                class: None,
+                pan: -1.0,
+                peak_dbfs: -10.0,
+                peak_left_dbfs: -10.0,
+                peak_right_dbfs: -10.0,
+                brightness_db: None,
+                gap_s: None,
+                onset_s: 0.0,
+            },
+        );
+        let view = view_snapshot(&state, &cfg, 0.0);
+        let value = |name: &str| {
+            let index = view.names.iter().position(|n| *n == name).expect("kolumna");
+            view.values[index].clone()
+        };
+        let left: f32 = value("moc_kroki_L_proc").parse().expect("lewy łuk kroków jest widoczny");
+        assert!((left - 100.0 * level_from_dbfs(-10.0)).abs() < 0.1, "lewy kroków w procentach: {left}");
+        assert_eq!(value("moc_kroki_R_proc"), "0.0", "prawy łuk kroków jest schowany, bo lewy przeważa");
+        assert_eq!(value("moc_strzaly_L_proc"), "0.0", "brak strzałów: zero procent");
+        assert!(view.text.contains("kroki L 0.89"), "{}", view.text);
     }
 
     #[test]

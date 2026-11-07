@@ -73,8 +73,9 @@ impl VisualizationMode {
             }
             Self::LayerBars22 => {
                 "Cztery łuki, po dwa na stronę. Wewnątrz strzały, wybuchy i kroki (silniejsza z tych \
-                 dwóch warstw), na zewnątrz wszystko naraz. Czerwony obrys pokazuje stronę, z której \
-                 idzie najmocniejszy dźwięk."
+                 dwóch warstw), na zewnątrz wszystko naraz. Cała czerwień (obrysy i poświata na \
+                 zewnątrz radaru) jest po jednej stronie: tej, z której idą strzały albo kroki, a bez \
+                 nich tej, z której jest głośniej."
             }
             Self::None => "Overlay wyłączony. Radar nie jest rysowany, a ustawienia wyglądu są ukryte.",
         }
@@ -134,6 +135,48 @@ impl SpeakerSetup {
         match self {
             Self::Stereo => true,
             Self::Surround => matches!(mode, VisualizationMode::OnlyRadar | VisualizationMode::None),
+        }
+    }
+}
+
+/// Wygląd poświaty strony z przewagą na radarze warstw (3+3, 2+2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum RadarGlowStyle {
+    /// Kilka pasów za zewnętrznym łukiem, coraz bledszych i krótszych. Długość idzie za wysokością łuku.
+    Crescent,
+    /// Cienka linia na całej długości łuku z bladą otoczką. Przewagę pokazuje krycie.
+    #[default]
+    Line,
+}
+
+impl RadarGlowStyle {
+    pub const ALL: &'static [Self] = &[Self::Line, Self::Crescent];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Crescent => "Półksiężyc",
+            Self::Line => "Linia",
+        }
+    }
+}
+
+/// Wygląd poświaty na krawędzi ekranu w stereo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum EdgeGlowStyle {
+    /// Plama na środku wysokości krawędzi.
+    Blob,
+    /// Winieta na całej wysokości boku ekranu, gasnąca w głąb ekranu.
+    #[default]
+    Vignette,
+}
+
+impl EdgeGlowStyle {
+    pub const ALL: &'static [Self] = &[Self::Vignette, Self::Blob];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blob => "Plama",
+            Self::Vignette => "Winieta",
         }
     }
 }
@@ -214,6 +257,27 @@ pub struct RadarConfig {
     /// tarczy (patrz `HearRadarApp::ui_overlay_contents`).
     #[serde(default)]
     pub edge_glow_enabled: bool,
+    /// Moc poświaty na krawędzi ekranu w stereo (0.0 wyłącza, 1.0 domyślna, 2.0 najmocniejsza). W stereo
+    /// poświata stoi na lewej albo prawej krawędzi, po stronie przewagi łuku wszystko. Wspólna dla
+    /// wszystkich trybów, jak samo `edge_glow_enabled`.
+    #[serde(default = "default_edge_glow_strength")]
+    pub edge_glow_strength: f32,
+    /// Wygląd poświaty na krawędzi ekranu w stereo, patrz [`EdgeGlowStyle`]. Wspólny dla trybów.
+    #[serde(default)]
+    pub edge_glow_style: EdgeGlowStyle,
+    /// Zasięg winiety w głąb ekranu jako ułamek szerokości ekranu (najszerszy pas), 0.03 .. 0.5.
+    #[serde(default = "default_edge_vignette_width")]
+    pub edge_vignette_width: f32,
+    /// Wygląd poświaty radaru warstw, patrz [`RadarGlowStyle`]. Wspólny dla 3+3 i 2+2.
+    #[serde(default)]
+    pub radar_glow_style: RadarGlowStyle,
+    /// Grubość linii poświaty radaru (styl `Line`) jako mnożnik: 1.0 to 0,4 grubości zewnętrznego łuku.
+    #[serde(default = "default_glow_line_width")]
+    pub glow_line_width: f32,
+    /// Widoczność poświat (radar i krawędź) przy najmniejszej przewadze, 0..1: ułamek pełnego krycia
+    /// tuż nad progiem przewagi. 0 = poświata rośnie od zera, 1 = od razu pełna. Moc mnoży to dalej.
+    #[serde(default = "default_glow_min_visibility")]
+    pub glow_min_visibility: f32,
     /// Rozróżnienie układu: 2.0 dostaje łuki L/R, 5.1/7.1 pierścień kropek
     /// w pozycjach głośników i etykietę układu. Wyłączone = dawny wygląd.
     #[serde(default)]
@@ -290,6 +354,10 @@ pub struct RadarConfig {
     pub layer_steps_color: [u8; 3],
     #[serde(default = "default_layer_rest_color")]
     pub layer_rest_color: [u8; 3],
+    /// Moc czerwonej poświaty na zewnątrz radaru 2+2, po stronie z przewagą (0.0 wyłącza, 1.0 domyślna,
+    /// 2.0 najmocniejsza). Mnoży krycie poświaty, a nie zmienia decyzji o stronie.
+    #[serde(default = "default_layer_side_glow")]
+    pub layer_side_glow: f32,
     /// Wygląd zapisany osobno dla każdego trybu wyświetlania (patrz [`ModeAppearance`]). Pola
     /// powyżej to wygląd wybranego trybu. Tu są kopie dla wszystkich trybów, w tym bieżącego po
     /// zapisie. `#[serde(default)]`: stary plik bez tej mapy startuje pusty.
@@ -323,6 +391,7 @@ pub struct ModeAppearance {
     pub layer_shots_color: [u8; 3],
     pub layer_steps_color: [u8; 3],
     pub layer_rest_color: [u8; 3],
+    pub layer_side_glow: f32,
 }
 
 impl Default for ModeAppearance {
@@ -355,6 +424,7 @@ impl RadarConfig {
             layer_shots_color: self.layer_shots_color,
             layer_steps_color: self.layer_steps_color,
             layer_rest_color: self.layer_rest_color,
+            layer_side_glow: self.layer_side_glow,
         }
     }
 
@@ -380,6 +450,7 @@ impl RadarConfig {
         self.layer_shots_color = a.layer_shots_color;
         self.layer_steps_color = a.layer_steps_color;
         self.layer_rest_color = a.layer_rest_color;
+        self.layer_side_glow = a.layer_side_glow;
     }
 
     /// Zapamiętuje wygląd wybranego trybu w mapie. Wołane przed każdym zapisem na dysk.
@@ -450,6 +521,26 @@ fn default_layer_rest_color() -> [u8; 3] {
     [80, 170, 255]
 }
 
+fn default_layer_side_glow() -> f32 {
+    1.0
+}
+
+fn default_edge_glow_strength() -> f32 {
+    1.0
+}
+
+fn default_edge_vignette_width() -> f32 {
+    0.16
+}
+
+fn default_glow_line_width() -> f32 {
+    1.0
+}
+
+fn default_glow_min_visibility() -> f32 {
+    0.35
+}
+
 fn default_stereo_left_color() -> [u8; 3] {
     [0, 150, 255]
 }
@@ -487,6 +578,12 @@ impl Default for RadarConfig {
             mono_scout_amount: default_mono_scout_amount(),
             radar_sensitivity: default_radar_sensitivity(),
             edge_glow_enabled: false,
+            edge_glow_strength: default_edge_glow_strength(),
+            edge_glow_style: EdgeGlowStyle::default(),
+            edge_vignette_width: default_edge_vignette_width(),
+            radar_glow_style: RadarGlowStyle::default(),
+            glow_line_width: default_glow_line_width(),
+            glow_min_visibility: default_glow_min_visibility(),
             speaker_layout_view: false,
             stereo_left_color: default_stereo_left_color(),
             stereo_right_color: default_stereo_right_color(),
@@ -504,6 +601,7 @@ impl Default for RadarConfig {
             layer_shots_color: default_layer_shots_color(),
             layer_steps_color: default_layer_steps_color(),
             layer_rest_color: default_layer_rest_color(),
+            layer_side_glow: default_layer_side_glow(),
             mode_appearance: BTreeMap::new(),
         }
     }
@@ -1112,6 +1210,12 @@ impl SharedAudioAnalysis {
     /// nawet po tym, jak zapis pliku faktycznie się nie powiódł.
     pub fn sample_logging_enabled(&self) -> bool {
         self.sample_logger.is_enabled()
+    }
+
+    /// Czas strumienia analizy (s), patrz [`layers::LayerTracker::stream_seconds`]. Logger radaru
+    /// zapisuje go na starcie odtwarzania, żeby czas wierszy liczyć od tej chwili.
+    pub fn layer_stream_seconds(&self) -> f64 {
+        self.layers.lock().map(|t| t.stream_seconds()).unwrap_or(0.0)
     }
 
     /// Włącza/wyłącza logger próbek. Włączenie ZAWSZE zaczyna nowy plik —
@@ -1781,6 +1885,8 @@ mod tests {
             class: Some(layers::Class::A),
             pan: 0.0,
             peak_dbfs: -10.0,
+            peak_left_dbfs: -10.0,
+            peak_right_dbfs: -10.0,
             brightness_db: None,
             gap_s: None,
             onset_s,

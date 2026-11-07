@@ -54,6 +54,9 @@ const DOMINANT_MIN_HEIGHT: f32 = 0.05;
 /// Dźwięk bliżej środka niż to i z warstwy strzał/krok to kandydat na własny dźwięk gracza.
 pub const OWN_MAX_PAN: f32 = 0.2;
 
+/// Poziom, jaki zapisujemy dla ciszy w kanale (dBFS). Bardzo nisko, żeby nie udawać sygnału.
+const SILENCE_DBFS: f32 = -180.0;
+
 /// Ile trafień trzymamy na jednym słupku.
 const MAX_HITS_PER_BAR: usize = 16;
 /// Wykładnik zaniku słupka. Taki sam jak zanik kropek w `radar_egui`.
@@ -109,6 +112,10 @@ pub struct LayerHit {
     pub pan: f32,
     /// Poziom szczytu (dBFS), jak `peak_dbfs` w `events.csv`.
     pub peak_dbfs: f32,
+    /// Poziom lewego kanału w ramce szczytu (dBFS), z tej samej ramki co `peak_dbfs`.
+    pub peak_left_dbfs: f32,
+    /// Poziom prawego kanału w ramce szczytu (dBFS), z tej samej ramki co `peak_dbfs`.
+    pub peak_right_dbfs: f32,
     pub brightness_db: Option<f32>,
     /// Odstęp od poprzedniego zdarzenia (s), `None` dla pierwszego.
     pub gap_s: Option<f32>,
@@ -389,6 +396,12 @@ impl LayerTracker {
         }
     }
 
+    /// Czas strumienia (s) od początku tego trackera, czyli ile próbek już przeszło przez analizę.
+    /// Ta sama oś co `LayerHit::onset_s`, więc różnica dwóch wartości to czas między zdarzeniami.
+    pub fn stream_seconds(&self) -> f64 {
+        self.total_frames as f64 / self.rate as f64
+    }
+
     /// Zwraca decyzje dla zdarzeń, którym minęło już okno szczytu i jasności.
     pub fn take_ready(&mut self) -> Vec<LayerHit> {
         let delay = ((PEAK_SEARCH_S + BRIGHTNESS_LENGTH_S + FRAME_S) * self.rate) as u64;
@@ -426,11 +439,14 @@ impl LayerTracker {
         let brightness = brightness_db(&mono, self.rate);
         let class = class_auto(peak_dbfs, brightness);
         let pan = self.pan_at(peak_start);
+        let (peak_left_dbfs, peak_right_dbfs) = self.channel_dbfs_at(peak_start);
         Some(LayerHit {
             layer: layer_for(class, onset.gap_s, previous),
             class,
             pan,
             peak_dbfs,
+            peak_left_dbfs,
+            peak_right_dbfs,
             brightness_db: brightness,
             gap_s: onset.gap_s,
             onset_s: onset.at_frame as f64 / self.rate as f64,
@@ -455,6 +471,22 @@ impl LayerTracker {
             (left + frame.left * frame.left, right + frame.right * frame.right)
         });
         pan_from_rms(left.sqrt(), right.sqrt())
+    }
+
+    /// Poziom (dBFS) lewego i prawego kanału w ramce 10 ms od `start`. Cisza daje bardzo niską wartość.
+    fn channel_dbfs_at(&self, start: u64) -> (f32, f32) {
+        let len = frame_samples(self.rate) as usize;
+        let Some(frames) = self.slice(start, len) else {
+            return (SILENCE_DBFS, SILENCE_DBFS);
+        };
+        let (left, right, count) = frames.fold((0.0f32, 0.0f32, 0usize), |(left, right, count), frame| {
+            (left + frame.left * frame.left, right + frame.right * frame.right, count + 1)
+        });
+        if count == 0 {
+            return (SILENCE_DBFS, SILENCE_DBFS);
+        }
+        let db = |sum: f32| 10.0 * (sum / count as f32).max(1e-18).log10();
+        (db(left), db(right))
     }
 
     fn frame_level_dbfs(&self, start: u64, len: usize) -> Option<f32> {
@@ -531,20 +563,6 @@ impl LayerBars {
         Layer::ALL[self.highlight]
     }
 
-    /// Strona wyższego słupka wybranej pary: `0` lewa, `1` prawa. `None`, gdy słupki są równe
-    /// albo oba są pod progiem (cisza).
-    pub fn focus_side(&self, now: f64, decay_secs: f32) -> Option<usize> {
-        let layer = self.highlighted_layer();
-        let left = self.height(0, layer, now, decay_secs);
-        let right = self.height(1, layer, now, decay_secs);
-        if left.max(right) < DOMINANT_MIN_HEIGHT || left == right {
-            None
-        } else if left > right {
-            Some(0)
-        } else {
-            Some(1)
-        }
-    }
 
     /// Wybiera parę z największą aktywnością, ale tylko gdy któraś jest wyraźnie aktywna.
     /// Dzięki temu w ciszy zostaje ostatnio wybrana para.
@@ -636,6 +654,8 @@ mod tests {
             class: None,
             pan,
             peak_dbfs,
+            peak_left_dbfs: peak_dbfs,
+            peak_right_dbfs: peak_dbfs,
             brightness_db: None,
             gap_s: None,
             onset_s: 0.0,
@@ -830,7 +850,6 @@ mod tests {
         let right = bars.height(1, Layer::Steps, 0.0, 1.5);
         assert!(right > left && left > 0.0, "mocniej z prawej → prawy bardziej wypełniony: {left} / {right}");
         assert_eq!(bars.highlighted_layer(), Layer::Steps, "wybrana para to ta, która świeci");
-        assert_eq!(bars.focus_side(0.0, 1.5), Some(1), "prawy słupek dostaje obwódkę");
     }
 
     #[test]
@@ -852,8 +871,6 @@ mod tests {
         let right = bars.height(1, Layer::Rest, 0.0, 1.5);
         assert!(left > 0.0);
         assert!((left - right).abs() < 1e-6);
-        bars.prune(0.0, 1.5);
-        assert_eq!(bars.focus_side(0.0, 1.5), None, "równe słupki: bez obwódki");
     }
 
     #[test]
