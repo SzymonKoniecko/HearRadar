@@ -850,7 +850,8 @@ impl HearRadarApp {
 
         let mut changed = false;
         ui.label("Tryb wyświetlania:");
-        for mode in devices::VisualizationMode::ALL {
+        let setup = self.radar_config.speaker_setup;
+        for mode in devices::VisualizationMode::ALL.iter().filter(|mode| setup.allows(**mode)) {
             if ui
                 .selectable_label(self.radar_config.visualization_mode == *mode, mode.label())
                 .clicked()
@@ -918,74 +919,6 @@ impl HearRadarApp {
                 )
                 .changed();
         }
-        if mode.shows_layers() {
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.radar_config.layer_arc_inner, 0.1..=0.7)
-                        .text("Łuki warstw: promień wewnętrznego łuku"),
-                )
-                .changed();
-            // Odstęp dotyczy tylko 3+3, bo w 2+2 nie ma osobnej warstwy kroków na zewnątrz.
-            if mode == devices::VisualizationMode::LayerBars {
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.radar_config.layer_arc_spacing, 0.0..=0.3)
-                            .text("Łuki 3+3: odstęp między kroki a strzałami"),
-                    )
-                    .changed();
-            }
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.radar_config.layer_steps_gain, 0.0..=4.0)
-                        .text("Kroki: wzmocnienie widoczności"),
-                )
-                .changed();
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.radar_config.layer_shots_gain, 0.0..=4.0)
-                        .text("Strzały: wzmocnienie widoczności"),
-                )
-                .changed();
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.radar_config.layer_rest_gain, 0.0..=4.0)
-                        .text("Zewnętrzny łuk (wszystko): wzmocnienie widoczności"),
-                )
-                .changed();
-            changed |= ui
-                .horizontal(|ui| {
-                    ui.label("Kolor strzałów");
-                    ui.color_edit_button_srgb(&mut self.radar_config.layer_shots_color).changed()
-                })
-                .inner;
-            changed |= ui
-                .horizontal(|ui| {
-                    ui.label("Kolor kroków");
-                    ui.color_edit_button_srgb(&mut self.radar_config.layer_steps_color).changed()
-                })
-                .inner;
-            changed |= ui
-                .horizontal(|ui| {
-                    ui.label("Kolor zewnętrznego łuku (wszystko)");
-                    ui.color_edit_button_srgb(&mut self.radar_config.layer_rest_color).changed()
-                })
-                .inner;
-        }
-        if mode.shows_radar() {
-            changed |= ui
-                .checkbox(
-                    &mut self.radar_config.direction_contrast_enabled,
-                    "🎯 Kontrast międzykanałowy (tłumi tło wspólne dla wszystkich kierunków, 5.1/7.1)",
-                )
-                .on_hover_text(
-                    "Odejmuje energię wspólną dla wszystkich kanałów kierunkowych przed \
-                     wykryciem markera, żeby wyraźnie jednostronne zdarzenie (krok, strzał) \
-                     łatwiej przebijało się na tle otoczenia/muzyki słyszalnej wszędzie naraz. \
-                     Bez wpływu przy zwykłym stereo (2.0) — tam L≈R to normalny zapis \
-                     wyśrodkowanego dźwięku, nie oznaka otoczenia.",
-                )
-                .changed();
-        }
         if mode.shows_overlay() {
             changed |= ui
                 .add(
@@ -1000,6 +933,11 @@ impl HearRadarApp {
                 )
                 .changed();
         }
+        // Sekcje zależą od wybranego na górze układu: stereo albo 5.1/7.1.
+        changed |= match setup {
+            devices::SpeakerSetup::Stereo => self.ui_stereo_settings(ui),
+            devices::SpeakerSetup::Surround => self.ui_surround_settings(ui),
+        };
         let edge_glow_changed = ui
             .checkbox(
                 &mut self.radar_config.edge_glow_enabled,
@@ -1012,28 +950,6 @@ impl HearRadarApp {
             self.overlay_reposition_pending = true;
         }
         changed |= edge_glow_changed;
-        if mode.shows_radar() {
-            changed |= ui
-                .checkbox(
-                    &mut self.radar_config.speaker_layout_view,
-                    "🔈 Rozróżnij układ 2.0 / 5.1 / 7.1 (kropki głośników zamiast łuków)",
-                )
-                .changed();
-        }
-        if mode.shows_bars() {
-            ui.horizontal(|ui| {
-                changed |= stereo_color_combo(ui, "Kolor łuku L", &mut self.radar_config.stereo_left_color);
-                changed |= stereo_color_combo(ui, "Kolor łuku R", &mut self.radar_config.stereo_right_color);
-            });
-        }
-        if mode.shows_bars() || mode.shows_layers() {
-            changed |= ui
-                .checkbox(
-                    &mut self.radar_config.spatial_audio_view,
-                    "🎧 Punkt źródła 3D w 2.0 (lewo–prawo, przód–tył, wysokość w jasności)",
-                )
-                .changed();
-        }
 
         ui.separator();
         changed |= ui
@@ -1053,6 +969,154 @@ impl HearRadarApp {
         if changed {
             self.write_radar_config();
         }
+    }
+
+    /// Radio na samej górze: stereo albo 5.1/7.1. Od wyboru zależą sekcje ustawień poniżej.
+    fn ui_speaker_setup(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.strong("Układ głośników:");
+            for setup in devices::SpeakerSetup::ALL {
+                changed |= ui
+                    .radio_value(&mut self.radar_config.speaker_setup, *setup, setup.label())
+                    .changed();
+            }
+        });
+        if self.radar_config.speaker_setup == devices::SpeakerSetup::Surround {
+            ui.weak("Przy 5.1 / 7.1 dostępny jest tylko radar.");
+        }
+        // Tryb, którego nie ma przy wybranym układzie, zamienia się na „Tylko radar”.
+        let setup = self.radar_config.speaker_setup;
+        if !setup.allows(self.radar_config.visualization_mode) {
+            self.radar_config.switch_mode(devices::VisualizationMode::OnlyRadar);
+            self.overlay_reposition_pending = true;
+            changed = true;
+        }
+        if changed {
+            self.write_radar_config();
+        }
+    }
+
+    /// Sekcje dla stereo (2.0): słupki L/R i warstwy, każda w osobnej, zwijanej części.
+    fn ui_stereo_settings(&mut self, ui: &mut egui::Ui) -> bool {
+        let mode = self.radar_config.visualization_mode;
+        let mut changed = false;
+        ui.separator();
+        ui.strong("Stereo (2.0)");
+        if mode.shows_bars() || mode.shows_layers() {
+            changed |= ui
+                .checkbox(
+                    &mut self.radar_config.spatial_audio_view,
+                    "🎧 Punkt źródła 3D w 2.0 (lewo–prawo, przód–tył, wysokość w jasności)",
+                )
+                .changed();
+        }
+        egui::CollapsingHeader::new("Słupki L/R")
+            .id_salt("stereo_bars_section")
+            .default_open(mode.shows_bars())
+            .show(ui, |ui| {
+                if mode.shows_bars() {
+                    ui.horizontal(|ui| {
+                        changed |= stereo_color_combo(ui, "Kolor łuku L", &mut self.radar_config.stereo_left_color);
+                        changed |= stereo_color_combo(ui, "Kolor łuku R", &mut self.radar_config.stereo_right_color);
+                    });
+                } else {
+                    ui.weak("Ten tryb nie rysuje słupków L/R.");
+                }
+            });
+        egui::CollapsingHeader::new("Warstwy 3+3 / 2+2")
+            .id_salt("stereo_layers_section")
+            .default_open(mode.shows_layers())
+            .show(ui, |ui| {
+                if !mode.shows_layers() {
+                    ui.weak("Ten tryb nie rysuje warstw.");
+                    return;
+                }
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.radar_config.layer_arc_inner, 0.1..=0.7)
+                            .text("Łuki warstw: promień wewnętrznego łuku"),
+                    )
+                    .changed();
+                // Odstęp dotyczy tylko 3+3, bo w 2+2 nie ma osobnej warstwy kroków na zewnątrz.
+                if mode == devices::VisualizationMode::LayerBars {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.radar_config.layer_arc_spacing, 0.0..=0.3)
+                                .text("Łuki 3+3: odstęp między kroki a strzałami"),
+                        )
+                        .changed();
+                }
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.radar_config.layer_steps_gain, 0.0..=4.0)
+                            .text("Kroki: wzmocnienie widoczności"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.radar_config.layer_shots_gain, 0.0..=4.0)
+                            .text("Strzały: wzmocnienie widoczności"),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.radar_config.layer_rest_gain, 0.0..=4.0)
+                            .text("Zewnętrzny łuk (wszystko): wzmocnienie widoczności"),
+                    )
+                    .changed();
+                changed |= ui
+                    .horizontal(|ui| {
+                        ui.label("Kolor strzałów");
+                        ui.color_edit_button_srgb(&mut self.radar_config.layer_shots_color).changed()
+                    })
+                    .inner;
+                changed |= ui
+                    .horizontal(|ui| {
+                        ui.label("Kolor kroków");
+                        ui.color_edit_button_srgb(&mut self.radar_config.layer_steps_color).changed()
+                    })
+                    .inner;
+                changed |= ui
+                    .horizontal(|ui| {
+                        ui.label("Kolor zewnętrznego łuku (wszystko)");
+                        ui.color_edit_button_srgb(&mut self.radar_config.layer_rest_color).changed()
+                    })
+                    .inner;
+            });
+        changed
+    }
+
+    /// Sekcja dla 5.1/7.1: tylko radar, czyli kropki głośników i kontrast kanałów kierunkowych.
+    fn ui_surround_settings(&mut self, ui: &mut egui::Ui) -> bool {
+        let mode = self.radar_config.visualization_mode;
+        let mut changed = false;
+        ui.separator();
+        ui.strong("Tylko radar (5.1 / 7.1)");
+        if mode.shows_radar() {
+            changed |= ui
+                .checkbox(
+                    &mut self.radar_config.speaker_layout_view,
+                    "🔈 Rozróżnij układ 2.0 / 5.1 / 7.1 (kropki głośników zamiast łuków)",
+                )
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut self.radar_config.direction_contrast_enabled,
+                    "🎯 Kontrast międzykanałowy (tłumi tło wspólne dla wszystkich kierunków, 5.1/7.1)",
+                )
+                .on_hover_text(
+                    "Odejmuje energię wspólną dla wszystkich kanałów kierunkowych przed \
+                     wykryciem markera, żeby wyraźnie jednostronne zdarzenie (krok, strzał) \
+                     łatwiej przebijało się na tle otoczenia/muzyki słyszalnej wszędzie naraz. \
+                     Bez wpływu przy zwykłym stereo (2.0) — tam L≈R to normalny zapis \
+                     wyśrodkowanego dźwięku, nie oznaka otoczenia.",
+                )
+                .changed();
+        } else {
+            ui.weak("Ten tryb nie rysuje tarczy. Wybierz tryb z radarem.");
+        }
+        changed
     }
 
     // ── Panel: dowolna liczba reguł "częstotliwość → kolor" ──────────────
@@ -1178,6 +1242,11 @@ impl HearRadarApp {
             self.write_radar_config();
         }
 
+    }
+
+    /// Zapis i wczytanie konfiguracji oraz logowanie próbek do pliku. Ta sekcja jest zawsze widoczna,
+    /// niezależnie od wybranego układu głośników.
+    fn ui_save_and_logging(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.separator();
         self.ui_sample_logging_toggle(ui);
@@ -1474,13 +1543,19 @@ impl eframe::App for HearRadarApp {
         egui::CentralPanel::default().show(root_ui, |ui| {
             ui.heading("Hear Radar !!!");
             ui.add_space(8.0);
+            self.ui_speaker_setup(ui);
+            ui.add_space(4.0);
 
+            let surround = self.radar_config.speaker_setup == devices::SpeakerSetup::Surround;
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.columns(2, |cols| {
                     self.ui_device_selector(&mut cols[0]);
                     cols[0].separator();
-                    self.ui_test_panel(&mut cols[0]);
-                    cols[0].separator();
+                    // Test radaru i kolory częstotliwości są tylko dla 5.1 / 7.1.
+                    if surround {
+                        self.ui_test_panel(&mut cols[0]);
+                        cols[0].separator();
+                    }
                     self.direction_tester.ui(
                         &mut cols[0],
                         &self.analysis,
@@ -1490,8 +1565,11 @@ impl eframe::App for HearRadarApp {
                     );
                     cols[0].separator();
                     self.ui_config_panel(&mut cols[0]);
-                    cols[0].separator();
-                    self.ui_color_rules_panel(&mut cols[0]);
+                    if surround {
+                        cols[0].separator();
+                        self.ui_color_rules_panel(&mut cols[0]);
+                    }
+                    self.ui_save_and_logging(&mut cols[0]);
 
                     self.ui_radar_preview(&mut cols[1]);
                 });

@@ -107,6 +107,37 @@ impl Default for VisualizationMode {
     }
 }
 
+/// Układ głośników wybrany na górze ustawień. Od niego zależy, które sekcje ustawień są widoczne:
+/// stereo pokazuje słupki L/R i warstwy, 5.1/7.1 pokazuje tylko radar z kropkami głośników.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SpeakerSetup {
+    /// Stereo (2.0).
+    #[default]
+    Stereo,
+    /// 5.1 albo 7.1, czyli tylko radar.
+    Surround,
+}
+
+impl SpeakerSetup {
+    pub const ALL: &'static [Self] = &[Self::Stereo, Self::Surround];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo (2.0)",
+            Self::Surround => "5.1 / 7.1",
+        }
+    }
+
+    /// Czy tryb wyświetlania jest dostępny przy tym układzie. Przy 5.1/7.1 tylko radar i wyłączenie:
+    /// słupki L/R i warstwy są stereo, więc ich tu nie ma.
+    pub fn allows(self, mode: VisualizationMode) -> bool {
+        match self {
+            Self::Stereo => true,
+            Self::Surround => matches!(mode, VisualizationMode::OnlyRadar | VisualizationMode::None),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RadarConfig {
     /// Pozycja X środka radaru jako ułamek szerokości okna (0.0 = lewo, 1.0 = prawo).
@@ -233,6 +264,9 @@ pub struct RadarConfig {
     /// Tryb wyświetlania: radar, słupki L/R, oba razem, albo nic.
     #[serde(default)]
     pub visualization_mode: VisualizationMode,
+    /// Układ głośników (stereo albo 5.1/7.1) wybrany na górze ustawień, patrz [`SpeakerSetup`].
+    #[serde(default)]
+    pub speaker_setup: SpeakerSetup,
     /// Promień wewnętrznego łuku zestawu 3+3 (warstwa strzałów), jako ułamek promienia radaru.
     /// `#[serde(default = ...)]`, żeby stary plik konfiguracji dał wartość domyślną.
     #[serde(default = "default_layer_arc_inner")]
@@ -461,6 +495,7 @@ impl Default for RadarConfig {
             mono_cue_style: MonoCueStyle::default(),
             direction_contrast_enabled: false,
             visualization_mode: VisualizationMode::default(),
+            speaker_setup: SpeakerSetup::default(),
             layer_arc_inner: default_layer_arc_inner(),
             layer_arc_spacing: default_layer_arc_spacing(),
             layer_steps_gain: default_layer_steps_gain(),
@@ -1622,6 +1657,27 @@ mod tests {
         value.as_object_mut().unwrap().remove("mode_appearance");
         let cfg: RadarConfig = serde_json::from_value(value).unwrap();
         assert!(cfg.mode_appearance.is_empty());
+    }
+
+    #[test]
+    fn surround_offers_only_radar_modes() {
+        use VisualizationMode as M;
+        assert!(SpeakerSetup::Surround.allows(M::OnlyRadar));
+        assert!(SpeakerSetup::Surround.allows(M::None));
+        for mode in [M::OnlyBars, M::Both, M::LayerBars, M::LayerBars22] {
+            assert!(!SpeakerSetup::Surround.allows(mode), "5.1/7.1 nie pokazuje: {}", mode.label());
+        }
+        for mode in M::ALL {
+            assert!(SpeakerSetup::Stereo.allows(*mode), "stereo pokazuje wszystko");
+        }
+    }
+
+    #[test]
+    fn config_without_speaker_setup_defaults_to_stereo() {
+        let mut value = serde_json::to_value(RadarConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("speaker_setup");
+        let cfg: RadarConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.speaker_setup, SpeakerSetup::Stereo);
     }
 
     #[test]
