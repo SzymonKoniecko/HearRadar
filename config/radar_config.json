@@ -1,11 +1,11 @@
 {
   "anchor_x": 0.5,
   "anchor_y": 0.91,
-  "radius": 165.0,
+  "radius": 115.0,
   "bg_alpha": 0.45,
   "fg_alpha": 0.78,
   "high_contrast": false,
-  "decay_secs": 2.6,
+  "decay_secs": 1.05,
   "color_rules": [
     {
       "freq_min": 0.0,
@@ -64,7 +64,7 @@
     }
   ],
   "overlay_click_through": true,
-  "mono_boost_db": 23.0,
+  "mono_boost_db": 22.0,
   "mono_tone_db": 11.5,
   "mono_class_gain": false,
   "mono_class_gain_db": 7.5,
@@ -84,15 +84,15 @@
     50
   ],
   "spatial_audio_view": false,
-  "line_thickness": 0.9,
+  "line_thickness": 1.7,
   "mono_cue_style": "Tremolo",
   "direction_contrast_enabled": false,
   "visualization_mode": "LayerBars",
-  "layer_arc_inner": 0.54,
-  "layer_arc_spacing": 0.3,
+  "layer_arc_inner": 0.55,
+  "layer_arc_spacing": 0.175,
   "layer_steps_gain": 4.0,
-  "layer_shots_gain": 2.7,
-  "layer_rest_gain": 2.45,
+  "layer_shots_gain": 3.1,
+  "layer_rest_gain": 3.1,
   "layer_shots_color": [
     255,
     140,
@@ -107,5 +107,49 @@
     80,
     170,
     255
-  ]
+  ],
+  "mode_appearance": {
+    "LayerBars": {
+      "radius": 115.0,
+      "bg_alpha": 0.45,
+      "fg_alpha": 0.78,
+      "high_contrast": false,
+      "decay_secs": 1.05,
+      "radar_sensitivity": 20.0,
+      "line_thickness": 1.7,
+      "speaker_layout_view": true,
+      "spatial_audio_view": false,
+      "direction_contrast_enabled": false,
+      "stereo_left_color": [
+        0,
+        150,
+        255
+      ],
+      "stereo_right_color": [
+        100,
+        200,
+        50
+      ],
+      "layer_arc_inner": 0.55,
+      "layer_arc_spacing": 0.175,
+      "layer_steps_gain": 4.0,
+      "layer_shots_gain": 3.1,
+      "layer_rest_gain": 3.1,
+      "layer_shots_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_steps_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_rest_color": [
+        80,
+        170,
+        255
+      ]
+    }
+  }
 }

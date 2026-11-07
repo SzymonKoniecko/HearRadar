@@ -75,11 +75,11 @@ pub enum Class {
 /// Warstwa na słupkach. Indeks to pozycja od środka: 0 najbliżej, 2 najdalej.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layer {
-    /// Strzały i wybuchy (najważniejsze, najbliżej środka).
+    /// Strzały i wybuchy (najważniejsze, środkowy łuk w 3+3).
     Shots = 0,
-    /// Kroki.
+    /// Kroki (najbliżej środka w 3+3).
     Steps = 1,
-    /// Reszta (najbardziej zewnętrzny słupek).
+    /// Reszta (w 3+3 zewnętrzny łuk, czyli wszystko).
     Rest = 2,
 }
 

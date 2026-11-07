@@ -12,9 +12,10 @@ use crate::sound::layers::{self, LayerHit};
 use crate::sound::recorder;
 use crate::sound::sample_logger;
 use crate::sound::spectrum::{self, ColorRule};
+use std::collections::BTreeMap;
 
 /// Tryb wyświetlania wizualizacji audio na overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum VisualizationMode {
     /// Tylko radar ze strzałkami kierunków.
     OnlyRadar,
@@ -24,6 +25,8 @@ pub enum VisualizationMode {
     Both,
     /// Sześć słupków 3+3: po trzy na stronę (strzały, kroki, reszta), patrz `sound::layers`.
     LayerBars,
+    /// Cztery słupki 2+2: po dwa na stronę. Wewnątrz strzały i kroki, na zewnątrz reszta.
+    LayerBars22,
     /// Nic nie wyświetlaj (overlay wyłączony).
     None,
 }
@@ -34,6 +37,7 @@ impl VisualizationMode {
         Self::OnlyBars,
         Self::Both,
         Self::LayerBars,
+        Self::LayerBars22,
         Self::None,
     ];
 
@@ -43,8 +47,57 @@ impl VisualizationMode {
             Self::OnlyBars => "≡ Tylko słupki L/R",
             Self::Both => "◉≡ Radar + słupki",
             Self::LayerBars => "▮▮▮ Warstwy 3+3",
+            Self::LayerBars22 => "▮▮ Warstwy 2+2",
             Self::None => "⊘ Nic",
         }
+    }
+
+    /// Opis trybu, pokazywany w rozwijanej sekcji przy wyborze trybu.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::OnlyRadar => {
+                "Tarcza z kropkami zdarzeń i strzałkami kierunku. Odległość kropki od środka to \
+                 głośność, a kolor zależy od reguł częstotliwości. Słupki L/R i warstwy są ukryte."
+            }
+            Self::OnlyBars => {
+                "Łuki lewej i prawej strony na obwodzie. Długość i jasność rosną z energii kanału. \
+                 Bez tarczy i kropek."
+            }
+            Self::Both => {
+                "Tarcza z kropkami i strzałkami oraz łuki L/R na obwodzie naraz. Pokazuje najwięcej, \
+                 więc jest najbardziej zajęty."
+            }
+            Self::LayerBars => {
+                "Sześć łuków, po trzy na stronę. Kroki najbliżej środka, potem strzały i wybuchy, \
+                 a na zewnątrz wszystko, czyli ciągłe tło stereo rysowane jak słupki L/R."
+            }
+            Self::LayerBars22 => {
+                "Cztery łuki, po dwa na stronę. Wewnątrz strzały, wybuchy i kroki (silniejsza z tych \
+                 dwóch warstw), na zewnątrz wszystko naraz. Czerwony obrys pokazuje stronę, z której \
+                 idzie najmocniejszy dźwięk."
+            }
+            Self::None => "Overlay wyłączony. Radar nie jest rysowany, a ustawienia wyglądu są ukryte.",
+        }
+    }
+
+    /// Czy tryb rysuje tarczę z kropkami i strzałkami kierunku.
+    pub fn shows_radar(self) -> bool {
+        matches!(self, Self::OnlyRadar | Self::Both)
+    }
+
+    /// Czy tryb rysuje łuki L/R na obwodzie.
+    pub fn shows_bars(self) -> bool {
+        matches!(self, Self::OnlyBars | Self::Both)
+    }
+
+    /// Czy tryb rysuje warstwy (3+3 albo 2+2).
+    pub fn shows_layers(self) -> bool {
+        matches!(self, Self::LayerBars | Self::LayerBars22)
+    }
+
+    /// Czy overlay w ogóle coś rysuje.
+    pub fn shows_overlay(self) -> bool {
+        self != Self::None
     }
 }
 
@@ -203,6 +256,116 @@ pub struct RadarConfig {
     pub layer_steps_color: [u8; 3],
     #[serde(default = "default_layer_rest_color")]
     pub layer_rest_color: [u8; 3],
+    /// Wygląd zapisany osobno dla każdego trybu wyświetlania (patrz [`ModeAppearance`]). Pola
+    /// powyżej to wygląd wybranego trybu. Tu są kopie dla wszystkich trybów, w tym bieżącego po
+    /// zapisie. `#[serde(default)]`: stary plik bez tej mapy startuje pusty.
+    #[serde(default)]
+    pub mode_appearance: BTreeMap<VisualizationMode, ModeAppearance>,
+}
+
+/// Wygląd, który każdy tryb wyświetlania ma osobno: rozmiar, przezroczystości, czułość, grubość
+/// linii, kolory, wzmocnienia i opcje widoków. Pozycja na ekranie, poświata krawędzi, klikanie przez
+/// overlay i ustawienia mono zostają wspólne dla wszystkich trybów.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ModeAppearance {
+    pub radius: f32,
+    pub bg_alpha: f32,
+    pub fg_alpha: f32,
+    pub high_contrast: bool,
+    pub decay_secs: f32,
+    pub radar_sensitivity: f32,
+    pub line_thickness: f32,
+    pub speaker_layout_view: bool,
+    pub spatial_audio_view: bool,
+    pub direction_contrast_enabled: bool,
+    pub stereo_left_color: [u8; 3],
+    pub stereo_right_color: [u8; 3],
+    pub layer_arc_inner: f32,
+    pub layer_arc_spacing: f32,
+    pub layer_steps_gain: f32,
+    pub layer_shots_gain: f32,
+    pub layer_rest_gain: f32,
+    pub layer_shots_color: [u8; 3],
+    pub layer_steps_color: [u8; 3],
+    pub layer_rest_color: [u8; 3],
+}
+
+impl Default for ModeAppearance {
+    fn default() -> Self {
+        RadarConfig::default().appearance()
+    }
+}
+
+impl RadarConfig {
+    /// Wygląd z bieżących pól, czyli taki, jaki widzi aktualnie wybrany tryb.
+    pub fn appearance(&self) -> ModeAppearance {
+        ModeAppearance {
+            radius: self.radius,
+            bg_alpha: self.bg_alpha,
+            fg_alpha: self.fg_alpha,
+            high_contrast: self.high_contrast,
+            decay_secs: self.decay_secs,
+            radar_sensitivity: self.radar_sensitivity,
+            line_thickness: self.line_thickness,
+            speaker_layout_view: self.speaker_layout_view,
+            spatial_audio_view: self.spatial_audio_view,
+            direction_contrast_enabled: self.direction_contrast_enabled,
+            stereo_left_color: self.stereo_left_color,
+            stereo_right_color: self.stereo_right_color,
+            layer_arc_inner: self.layer_arc_inner,
+            layer_arc_spacing: self.layer_arc_spacing,
+            layer_steps_gain: self.layer_steps_gain,
+            layer_shots_gain: self.layer_shots_gain,
+            layer_rest_gain: self.layer_rest_gain,
+            layer_shots_color: self.layer_shots_color,
+            layer_steps_color: self.layer_steps_color,
+            layer_rest_color: self.layer_rest_color,
+        }
+    }
+
+    /// Wgrywa zapisany wygląd do bieżących pól.
+    pub fn apply_appearance(&mut self, a: &ModeAppearance) {
+        self.radius = a.radius;
+        self.bg_alpha = a.bg_alpha;
+        self.fg_alpha = a.fg_alpha;
+        self.high_contrast = a.high_contrast;
+        self.decay_secs = a.decay_secs;
+        self.radar_sensitivity = a.radar_sensitivity;
+        self.line_thickness = a.line_thickness;
+        self.speaker_layout_view = a.speaker_layout_view;
+        self.spatial_audio_view = a.spatial_audio_view;
+        self.direction_contrast_enabled = a.direction_contrast_enabled;
+        self.stereo_left_color = a.stereo_left_color;
+        self.stereo_right_color = a.stereo_right_color;
+        self.layer_arc_inner = a.layer_arc_inner;
+        self.layer_arc_spacing = a.layer_arc_spacing;
+        self.layer_steps_gain = a.layer_steps_gain;
+        self.layer_shots_gain = a.layer_shots_gain;
+        self.layer_rest_gain = a.layer_rest_gain;
+        self.layer_shots_color = a.layer_shots_color;
+        self.layer_steps_color = a.layer_steps_color;
+        self.layer_rest_color = a.layer_rest_color;
+    }
+
+    /// Zapamiętuje wygląd wybranego trybu w mapie. Wołane przed każdym zapisem na dysk.
+    pub fn remember_appearance(&mut self) {
+        let appearance = self.appearance();
+        self.mode_appearance.insert(self.visualization_mode, appearance);
+    }
+
+    /// Przełącza tryb wyświetlania. Wygląd dotychczasowego trybu zostaje zapamiętany, a nowy wczytuje
+    /// swój zapisany wygląd. Tryb, którego jeszcze nie było, zachowuje wygląd bieżący.
+    pub fn switch_mode(&mut self, mode: VisualizationMode) {
+        if mode == self.visualization_mode {
+            return;
+        }
+        self.remember_appearance();
+        self.visualization_mode = mode;
+        if let Some(saved) = self.mode_appearance.get(&mode).copied() {
+            self.apply_appearance(&saved);
+        }
+    }
 }
 
 fn default_overlay_click_through() -> bool {
@@ -306,6 +469,7 @@ impl Default for RadarConfig {
             layer_shots_color: default_layer_shots_color(),
             layer_steps_color: default_layer_steps_color(),
             layer_rest_color: default_layer_rest_color(),
+            mode_appearance: BTreeMap::new(),
         }
     }
 }
@@ -1414,6 +1578,81 @@ fn channel_pan_weights(role: direction::ChannelRole) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_mode_keeps_its_own_appearance() {
+        let mut cfg = RadarConfig::default();
+        cfg.visualization_mode = VisualizationMode::Both;
+        cfg.radius = 150.0;
+        // Pierwsza wizyta w trybie 3+3 bierze wygląd bieżący.
+        cfg.switch_mode(VisualizationMode::LayerBars);
+        assert_eq!(cfg.radius, 150.0, "nowy tryb startuje z bieżącym wyglądem");
+        cfg.radius = 220.0;
+        cfg.layer_shots_gain = 3.5;
+
+        cfg.switch_mode(VisualizationMode::Both);
+        assert_eq!(cfg.radius, 150.0, "powrót przywraca wygląd tego trybu");
+        assert_eq!(cfg.layer_shots_gain, RadarConfig::default().layer_shots_gain, "gain 3+3 nie dotyczy radaru");
+
+        cfg.switch_mode(VisualizationMode::LayerBars);
+        assert_eq!(cfg.radius, 220.0);
+        assert_eq!(cfg.layer_shots_gain, 3.5);
+    }
+
+    #[test]
+    fn remembered_appearance_survives_json_round_trip() {
+        let mut cfg = RadarConfig::default();
+        cfg.visualization_mode = VisualizationMode::OnlyRadar;
+        cfg.radius = 180.0;
+        cfg.switch_mode(VisualizationMode::LayerBars22);
+        cfg.radius = 90.0;
+        cfg.remember_appearance();
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: RadarConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mode_appearance[&VisualizationMode::OnlyRadar].radius, 180.0);
+        assert_eq!(back.mode_appearance[&VisualizationMode::LayerBars22].radius, 90.0);
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn config_without_mode_appearance_starts_empty() {
+        // Plik sprzed tej mapy: cała reszta konfiguracji jest, brakuje tylko `mode_appearance`.
+        let mut value = serde_json::to_value(RadarConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("mode_appearance");
+        let cfg: RadarConfig = serde_json::from_value(value).unwrap();
+        assert!(cfg.mode_appearance.is_empty());
+    }
+
+    #[test]
+    fn position_stays_shared_between_modes() {
+        let mut cfg = RadarConfig::default();
+        cfg.anchor_x = 0.25;
+        cfg.switch_mode(VisualizationMode::LayerBars);
+        assert_eq!(cfg.anchor_x, 0.25);
+    }
+
+    #[test]
+    fn appearance_round_trips_through_apply() {
+        let mut cfg = RadarConfig::default();
+        let mut appearance = cfg.appearance();
+        appearance.stereo_left_color = [1, 2, 3];
+        appearance.layer_arc_inner = 0.6;
+        cfg.apply_appearance(&appearance);
+        assert_eq!(cfg.appearance(), appearance);
+    }
+
+    #[test]
+    fn appearance_of_a_mode_is_not_affected_by_other_modes() {
+        let mut cfg = RadarConfig::default();
+        cfg.visualization_mode = VisualizationMode::OnlyBars;
+        cfg.stereo_left_color = [9, 9, 9];
+        cfg.switch_mode(VisualizationMode::None);
+        cfg.stereo_left_color = [5, 5, 5];
+        cfg.remember_appearance();
+        assert_eq!(cfg.mode_appearance[&VisualizationMode::OnlyBars].stereo_left_color, [9, 9, 9]);
+        assert_eq!(cfg.mode_appearance[&VisualizationMode::None].stereo_left_color, [5, 5, 5]);
+    }
 
     #[test]
     fn test_device_helpers() {

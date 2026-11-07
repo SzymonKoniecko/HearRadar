@@ -206,7 +206,7 @@ Ograniczenia:
 
 W oknie głównym, w panelu „Źródło audio”, jest lista nagrań z `recordings/` (`audio.wav` i klipy). „▶ Odtwórz” puszcza wybrany plik przez ten sam potok analizy co żywe audio, w czasie rzeczywistym, więc radar pokazuje to, co pokazałby podczas grania. Odtwarzanie wyłącza żywe przechwytywanie. „Przechwytuj” je przywraca.
 
-Tryb „▮▮▮ Warstwy 3+3” (w ustawieniach wyświetlania) rysuje sześć słupków, po trzy na stronę. Od środka: strzały i wybuchy, kroki, reszta. Klasa A–D wynika z poziomu i jasności zdarzenia. Mapowanie klasa → warstwa jest tymczasowe i zapisane w `src/sound/layers.rs` (`layer_for`). Trafienie pojawia się ok. 0,35 s po zdarzeniu, bo tyle trwa okno szczytu.
+Tryb „▮▮▮ Warstwy 3+3” (w ustawieniach wyświetlania) rysuje sześć słupków, po trzy na stronę. Od środka: kroki, strzały i wybuchy, a na zewnątrz wszystko (ciągłe tło stereo, jak słupki L/R). Klasa A–D wynika z poziomu i jasności zdarzenia. Mapowanie klasa → warstwa jest tymczasowe i zapisane w `src/sound/layers.rs` (`layer_for`). Trafienie pojawia się ok. 0,35 s po zdarzeniu, bo tyle trwa okno szczytu.
 
 ## Pliki tworzone przez program
 

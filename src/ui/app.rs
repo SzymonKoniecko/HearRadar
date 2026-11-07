@@ -337,6 +337,7 @@ impl HearRadarApp {
     /// jawny „zapisz teraz i pokaż mi ścieżkę”, ale nie jest już jedynym
     /// sposobem na trwały zapis).
     fn write_radar_config(&mut self) {
+        self.radar_config.remember_appearance();
         if let Ok(mut lock) = self.analysis.lock() {
             lock.radar_config = self.radar_config.clone();
         }
@@ -849,131 +850,156 @@ impl HearRadarApp {
 
         let mut changed = false;
         ui.label("Tryb wyświetlania:");
-        egui::Grid::new("visualization_mode_grid").num_columns(2).show(ui, |ui| {
-            for mode in devices::VisualizationMode::ALL {
-                if ui
-                    .selectable_label(self.radar_config.visualization_mode == *mode, mode.label())
-                    .clicked()
-                {
-                    self.radar_config.visualization_mode = *mode;
-                    changed = true;
-                }
-                ui.end_row();
+        for mode in devices::VisualizationMode::ALL {
+            if ui
+                .selectable_label(self.radar_config.visualization_mode == *mode, mode.label())
+                .clicked()
+            {
+                self.radar_config.switch_mode(*mode);
+                self.overlay_reposition_pending = true;
+                changed = true;
             }
-        });
+            egui::CollapsingHeader::new("Opis")
+                .id_salt(("visualization_description", mode.label()))
+                .show(ui, |ui| {
+                    ui.label(mode.description());
+                });
+        }
+        ui.weak("Rozmiar, przezroczystości, czułość, kolory i wzmocnienia zapisują się osobno dla każdego trybu. Pozycja na ekranie jest wspólna.");
 
         if changed {
             self.write_radar_config();
         }
 
+        // Każdy tryb pokazuje tylko te ustawienia, których faktycznie używa.
+        let mode = self.radar_config.visualization_mode;
         let mut changed = false;
         let mut position_changed = false;
-        position_changed |= ui
-            .add(egui::Slider::new(&mut self.radar_config.anchor_x, 0.0..=1.0).text("Pozycja X"))
-            .changed();
-        position_changed |= ui
-            .add(egui::Slider::new(&mut self.radar_config.anchor_y, 0.0..=1.0).text("Pozycja Y"))
-            .changed();
-        position_changed |= ui
-            .add(
-                egui::Slider::new(&mut self.radar_config.radius, 40.0..=300.0).text("Rozmiar (px)"),
-            )
-            .changed();
+        if mode.shows_overlay() {
+            position_changed |= ui
+                .add(egui::Slider::new(&mut self.radar_config.anchor_x, 0.0..=1.0).text("Pozycja X"))
+                .changed();
+            position_changed |= ui
+                .add(egui::Slider::new(&mut self.radar_config.anchor_y, 0.0..=1.0).text("Pozycja Y"))
+                .changed();
+            position_changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.radius, 40.0..=300.0).text("Rozmiar (px)"),
+                )
+                .changed();
+        }
         if position_changed {
             self.overlay_reposition_pending = true;
         }
         changed |= position_changed;
-        changed |= ui
-            .add(egui::Slider::new(&mut self.radar_config.bg_alpha, 0.0..=1.0).text("Tło"))
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut self.radar_config.fg_alpha, 0.0..=1.0).text("Jasność"))
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.radar_config.decay_secs, 1.0..=3.0)
-                    .text("Czas zaniku kropki / echo (s)"),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.radar_config.radar_sensitivity, 1.0..=20.0)
-                    .text("Czułość radaru (siła/zasięg dźwięku)"),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.radar_config.layer_arc_inner, 0.1..=0.7)
-                    .text("Łuki 3+3: promień wewnętrznego łuku"),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.radar_config.layer_arc_spacing, 0.0..=0.3)
-                    .text("Łuki 3+3: odstęp między warstwami"),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.radar_config.layer_steps_gain, 0.0..=4.0)
-                    .text("Kroki 3+3: wzmocnienie widoczności"),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.radar_config.layer_shots_gain, 0.0..=4.0)
-                    .text("Strzały 3+3: wzmocnienie widoczności"),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.radar_config.layer_rest_gain, 0.0..=4.0)
-                    .text("Reszta 3+3: wzmocnienie widoczności"),
-            )
-            .changed();
-        changed |= ui
-            .horizontal(|ui| {
-                ui.label("Kolor strzałów 3+3");
-                ui.color_edit_button_srgb(&mut self.radar_config.layer_shots_color).changed()
-            })
-            .inner;
-        changed |= ui
-            .horizontal(|ui| {
-                ui.label("Kolor kroków 3+3");
-                ui.color_edit_button_srgb(&mut self.radar_config.layer_steps_color).changed()
-            })
-            .inner;
-        changed |= ui
-            .horizontal(|ui| {
-                ui.label("Kolor reszty 3+3");
-                ui.color_edit_button_srgb(&mut self.radar_config.layer_rest_color).changed()
-            })
-            .inner;
-        changed |= ui
-            .checkbox(
-                &mut self.radar_config.direction_contrast_enabled,
-                "🎯 Kontrast międzykanałowy (tłumi tło wspólne dla wszystkich kierunków, 5.1/7.1)",
-            )
-            .on_hover_text(
-                "Odejmuje energię wspólną dla wszystkich kanałów kierunkowych przed \
-                 wykryciem markera, żeby wyraźnie jednostronne zdarzenie (krok, strzał) \
-                 łatwiej przebijało się na tle otoczenia/muzyki słyszalnej wszędzie naraz. \
-                 Bez wpływu przy zwykłym stereo (2.0) — tam L≈R to normalny zapis \
-                 wyśrodkowanego dźwięku, nie oznaka otoczenia.",
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut self.radar_config.line_thickness, 0.3..=3.0)
-                    .text("Grubość linii"),
-            )
-            .changed();
-        changed |= ui
-            .checkbox(
-                &mut self.radar_config.high_contrast,
-                "Wysoki kontrast (monochromatyczny)",
-            )
-            .changed();
+        if mode.shows_radar() {
+            changed |= ui
+                .add(egui::Slider::new(&mut self.radar_config.bg_alpha, 0.0..=1.0).text("Tło"))
+                .changed();
+        }
+        if mode.shows_overlay() {
+            changed |= ui
+                .add(egui::Slider::new(&mut self.radar_config.fg_alpha, 0.0..=1.0).text("Jasność"))
+                .changed();
+        }
+        if mode.shows_radar() || mode.shows_layers() {
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.decay_secs, 1.0..=3.0)
+                        .text("Czas zaniku kropki / echo (s)"),
+                )
+                .changed();
+        }
+        if mode.shows_overlay() {
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.radar_sensitivity, 1.0..=20.0)
+                        .text("Czułość radaru (siła/zasięg dźwięku)"),
+                )
+                .changed();
+        }
+        if mode.shows_layers() {
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.layer_arc_inner, 0.1..=0.7)
+                        .text("Łuki warstw: promień wewnętrznego łuku"),
+                )
+                .changed();
+            // Odstęp dotyczy tylko 3+3, bo w 2+2 nie ma osobnej warstwy kroków na zewnątrz.
+            if mode == devices::VisualizationMode::LayerBars {
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.radar_config.layer_arc_spacing, 0.0..=0.3)
+                            .text("Łuki 3+3: odstęp między kroki a strzałami"),
+                    )
+                    .changed();
+            }
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.layer_steps_gain, 0.0..=4.0)
+                        .text("Kroki: wzmocnienie widoczności"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.layer_shots_gain, 0.0..=4.0)
+                        .text("Strzały: wzmocnienie widoczności"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.layer_rest_gain, 0.0..=4.0)
+                        .text("Zewnętrzny łuk (wszystko): wzmocnienie widoczności"),
+                )
+                .changed();
+            changed |= ui
+                .horizontal(|ui| {
+                    ui.label("Kolor strzałów");
+                    ui.color_edit_button_srgb(&mut self.radar_config.layer_shots_color).changed()
+                })
+                .inner;
+            changed |= ui
+                .horizontal(|ui| {
+                    ui.label("Kolor kroków");
+                    ui.color_edit_button_srgb(&mut self.radar_config.layer_steps_color).changed()
+                })
+                .inner;
+            changed |= ui
+                .horizontal(|ui| {
+                    ui.label("Kolor zewnętrznego łuku (wszystko)");
+                    ui.color_edit_button_srgb(&mut self.radar_config.layer_rest_color).changed()
+                })
+                .inner;
+        }
+        if mode.shows_radar() {
+            changed |= ui
+                .checkbox(
+                    &mut self.radar_config.direction_contrast_enabled,
+                    "🎯 Kontrast międzykanałowy (tłumi tło wspólne dla wszystkich kierunków, 5.1/7.1)",
+                )
+                .on_hover_text(
+                    "Odejmuje energię wspólną dla wszystkich kanałów kierunkowych przed \
+                     wykryciem markera, żeby wyraźnie jednostronne zdarzenie (krok, strzał) \
+                     łatwiej przebijało się na tle otoczenia/muzyki słyszalnej wszędzie naraz. \
+                     Bez wpływu przy zwykłym stereo (2.0) — tam L≈R to normalny zapis \
+                     wyśrodkowanego dźwięku, nie oznaka otoczenia.",
+                )
+                .changed();
+        }
+        if mode.shows_overlay() {
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.line_thickness, 0.3..=3.0)
+                        .text("Grubość linii"),
+                )
+                .changed();
+            changed |= ui
+                .checkbox(
+                    &mut self.radar_config.high_contrast,
+                    "Wysoki kontrast (monochromatyczny)",
+                )
+                .changed();
+        }
         let edge_glow_changed = ui
             .checkbox(
                 &mut self.radar_config.edge_glow_enabled,
@@ -986,22 +1012,28 @@ impl HearRadarApp {
             self.overlay_reposition_pending = true;
         }
         changed |= edge_glow_changed;
-        changed |= ui
-            .checkbox(
-                &mut self.radar_config.speaker_layout_view,
-                "🔈 Rozróżnij układ 2.0 / 5.1 / 7.1 (kropki głośników zamiast łuków)",
-            )
-            .changed();
-        ui.horizontal(|ui| {
-            changed |= stereo_color_combo(ui, "Kolor łuku L", &mut self.radar_config.stereo_left_color);
-            changed |= stereo_color_combo(ui, "Kolor łuku R", &mut self.radar_config.stereo_right_color);
-        });
-        changed |= ui
-            .checkbox(
-                &mut self.radar_config.spatial_audio_view,
-                "🎧 Punkt źródła 3D w 2.0 (lewo–prawo, przód–tył, wysokość w jasności)",
-            )
-            .changed();
+        if mode.shows_radar() {
+            changed |= ui
+                .checkbox(
+                    &mut self.radar_config.speaker_layout_view,
+                    "🔈 Rozróżnij układ 2.0 / 5.1 / 7.1 (kropki głośników zamiast łuków)",
+                )
+                .changed();
+        }
+        if mode.shows_bars() {
+            ui.horizontal(|ui| {
+                changed |= stereo_color_combo(ui, "Kolor łuku L", &mut self.radar_config.stereo_left_color);
+                changed |= stereo_color_combo(ui, "Kolor łuku R", &mut self.radar_config.stereo_right_color);
+            });
+        }
+        if mode.shows_bars() || mode.shows_layers() {
+            changed |= ui
+                .checkbox(
+                    &mut self.radar_config.spatial_audio_view,
+                    "🎧 Punkt źródła 3D w 2.0 (lewo–prawo, przód–tył, wysokość w jasności)",
+                )
+                .changed();
+        }
 
         ui.separator();
         changed |= ui
