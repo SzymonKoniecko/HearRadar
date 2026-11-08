@@ -215,8 +215,15 @@ pub struct RadarConfig {
     /// mnożnik kompensujący z natury niskie RMS na potrzeby WYŚWIETLANIA na
     /// radarze, tu analogiczny, ale regulowany przez użytkownika mnożnik na
     /// samym WYJŚCIU dźwięku (patrz `mono_router::db_to_linear`).
+    /// Bufor mono jest w skali stereo (patrz [`MONO_PAN_SCALE`]), więc 0 dB daje w słuchawce mniej
+    /// więcej poziom gry, tak samo przy strumieniu 2- i 8-kanałowym.
     #[serde(default)]
     pub mono_boost_db: f32,
+    /// Wersja skali poziomu w torze mono, potrzebna do przeliczenia `mono_boost_db` ze starego pliku
+    /// (patrz [`RadarConfig::migrate_mono_level`]). Plik bez tego pola to wersja 0: bufor mono był
+    /// wtedy dzielony przez liczbę kanałów strumienia, więc przy VB-Cable 7.1 był o 12 dB cichszy.
+    #[serde(default)]
+    pub mono_level_version: u32,
     /// Korekcja barwy sygnału mono na wyjściu, w decybelach: dodatnie = jaśniej
     /// (wysokie w górę, bas w dół), ujemne = ciemniej/cieplej (bas w górę,
     /// wysokie w dół), 0.0 = bez zmian. To pochylenie widma wokół
@@ -461,6 +468,21 @@ impl RadarConfig {
         self.mode_appearance.insert(self.visualization_mode, appearance);
     }
 
+    /// Przelicza ustawienia mono z pliku zapisanego przed zmianą skali bufora mono (wersja 0, patrz
+    /// [`MONO_LEVEL_VERSION`]). Bufor jest teraz przy VB-Cable 7.1 o [`LEGACY_MONO_BOOST_OFFSET_DB`]
+    /// głośniejszy, więc o tyle samo obniżamy `mono_boost_db` i głośność w słuchawce zostaje taka sama.
+    /// Plik już przeliczony albo nowy zostaje bez zmian, więc kolejne wczytania niczego nie odejmują.
+    /// Wołane przy wczytaniu pliku (`config_store::load_from`). Na dysk trafia przy następnym zapisie,
+    /// a do tego czasu każde wczytanie liczy od tej samej, starej wartości.
+    pub fn migrate_mono_level(&mut self) {
+        if self.mono_level_version >= MONO_LEVEL_VERSION {
+            return;
+        }
+        self.mono_boost_db =
+            (self.mono_boost_db - LEGACY_MONO_BOOST_OFFSET_DB).clamp(MONO_BOOST_DB_MIN, MONO_BOOST_DB_MAX);
+        self.mono_level_version = MONO_LEVEL_VERSION;
+    }
+
     /// Przełącza tryb wyświetlania. Wygląd dotychczasowego trybu zostaje zapamiętany, a nowy wczytuje
     /// swój zapisany wygląd. Tryb, którego jeszcze nie było, zachowuje wygląd bieżący.
     pub fn switch_mode(&mut self, mode: VisualizationMode) {
@@ -474,6 +496,23 @@ impl RadarConfig {
         }
     }
 }
+
+/// Bieżąca wersja skali poziomu w torze mono: bufor w skali stereo (patrz [`MONO_PAN_SCALE`]).
+/// Wersja 0 dzieliła bufor przez liczbę kanałów strumienia.
+pub(crate) const MONO_LEVEL_VERSION: u32 = 1;
+
+/// O ile obniżyć `mono_boost_db` z pliku w wersji 0, żeby głośność w słuchawce się nie zmieniła.
+/// Wersja 0 przy VB-Cable 7.1 (8 kanałów, wymóg z README; gra w stereo gra tylko na FL/FR) dawała
+/// w buforze FL/8, a skala stereo daje FL/2, czyli 20·log10(4) ≈ 12,04 dB więcej. Liczymy względem
+/// 8 kanałów, bo tak przechwytuje obecny użytkownik. Kto przechwytywał strumień 2-kanałowy, po migracji
+/// usłyszy o tyle ciszej, ale to dokładnie ta różnica między 2 a 8 kanałami, którą poprawka usuwa.
+const LEGACY_MONO_BOOST_OFFSET_DB: f32 = 12.041_2;
+
+/// Zakres suwaka wzmocnienia mono (dB). Dół −24 dB, żeby zmieściło się najniższe dawne ustawienie
+/// po migracji (−12 dB − 12,04 dB). Suwak egui przycina wartości spoza zakresu, więc bez tego
+/// przeliczona wartość zmieniłaby się sama po otwarciu ustawień.
+pub const MONO_BOOST_DB_MIN: f32 = -24.0;
+pub const MONO_BOOST_DB_MAX: f32 = 24.0;
 
 fn default_overlay_click_through() -> bool {
     true
@@ -573,6 +612,7 @@ impl Default for RadarConfig {
             color_rules: spectrum::default_color_rules(),
             overlay_click_through: true,
             mono_boost_db: 0.0,
+            mono_level_version: MONO_LEVEL_VERSION,
             mono_tone_db: 0.0,
             mono_class_gain: false,
             mono_class_gain_db: default_mono_class_gain_db(),
@@ -857,8 +897,14 @@ const CLASS_GAIN_RELEASE_FRAMES: f32 = 14_400.0;
 /// Najwięcej zdarzeń czekających na obwiednię; starsze odrzucamy.
 const MAX_CLASS_GAIN_EVENTS: usize = 64;
 
-/// Dynamika "Scout" w mono: ciche dźwięki (poniżej −45 dBFS, ale nie szum poniżej −60 dBFS) są
-/// podbijane, a głośne (powyżej −15 dBFS) ściszane. Nachylenie 0,5 dB na dB; najwięcej zależy od siły.
+/// Dynamika "Scout" w mono: ciche dźwięki (poniżej −45 dB, ale nie szum poniżej −60 dB) są
+/// podbijane, a głośne (powyżej −15 dB) ściszane. Nachylenie 0,5 dB na dB; najwięcej zależy od siły.
+///
+/// Progi są w dB pary z bufora mono, czyli w skali stereo (patrz [`MONO_PAN_SCALE`]): dźwięk z gry
+/// o szczycie X dBFS w kanale L albo P daje tu X − 6 dB, tak samo w strumieniu 2.0, 5.1 i 7.1. Ciche
+/// dźwięki z gry to więc ok. −54 … −39 dBFS, a ściszanie zaczyna się od ok. −9 dBFS. Dawniej bufor
+/// był dzielony przez liczbę kanałów strumienia i przy VB-Cable 7.1 te same progi wypadały 12 dB
+/// wyżej (−42 … −27 dBFS), a ściszanie głośnych w ogóle się nie włączało (szczyty do −18 dB).
 const SCOUT_QUIET_DB: f32 = -45.0;
 const SCOUT_FLOOR_DB: f32 = -60.0;
 const SCOUT_LOUD_DB: f32 = -15.0;
@@ -1676,13 +1722,17 @@ pub(crate) fn update_analysis(
 /// `mono_router`, który (w trybie jednousznym) może nią oznaczyć dźwięk z
 /// przeciwnej strony efektem (ring modulation), zamiast go bezpowrotnie
 /// zlewać z resztą.
+///
+/// Ważoną sumę każdej strony mnożymy przez stałe [`MONO_PAN_SCALE`], a nie
+/// dzielimy przez liczbę kanałów strumienia — patrz uzasadnienie tam.
 fn downmix_to_stereo_pan(interleaved: &[f32], channels: usize) -> Vec<(f32, f32)> {
     if channels == 0 {
         return Vec::new();
     }
     if channels == 1 {
-        // Mono źródło: brak informacji o stronie, więc dzielimy po równo.
-        return interleaved.iter().map(|&s| (s * 0.5, s * 0.5)).collect();
+        // Mono źródło: brak informacji o stronie, więc dzielimy po równo. Mono `s` to to samo co
+        // stereo L = P = s, więc para wychodzi taka jak ze strumienia 2.0.
+        return interleaved.iter().map(|&s| (s * MONO_PAN_SCALE, s * MONO_PAN_SCALE)).collect();
     }
     let layout = direction::channel_layout(channels);
     let weights: Vec<(f32, f32)> = (0..channels)
@@ -1698,10 +1748,33 @@ fn downmix_to_stereo_pan(interleaved: &[f32], channels: usize) -> Vec<(f32, f32)
                 left += s * wl;
                 right += s * wr;
             }
-            (left / channels as f32, right / channels as f32)
+            (left * MONO_PAN_SCALE, right * MONO_PAN_SCALE)
         })
         .collect()
 }
+
+/// Skala pary "ważonego mono" z [`downmix_to_stereo_pan`]: ważoną sumę kanałów każdej strony
+/// mnożymy przez stałe 0,5, czyli tak, jak uśrednia się strumień stereo. Dla 2.0 para to
+/// `(L/2, P/2)`, a `left + right` to średnia mono, jak dotąd.
+///
+/// Dawniej sumy były dzielone przez liczbę kanałów strumienia, więc puste kanały ściszały sygnał.
+/// VB-Cable jest ustawiony na 7.1 (8 kanałów, wymóg z README), a gra daje stereo tylko na FL/FR,
+/// więc na żywo bufor dostawał FL/8, a z nagrania 2-kanałowego (`sound::playback`) FL/2, czyli
+/// o 12 dB więcej. Progi Scout ([`SCOUT_QUIET_DB`] i dalsze) są bezwzględne na tej parze, więc
+/// działały inaczej na żywo i z nagrania, a ściszanie głośnych na żywo nie włączało się wcale.
+///
+/// Normalizacja sumą wag strony z układu kanałów ([`channel_pan_weights`]) tego nie naprawia:
+/// w 7.1 lewa strona ma wagę 4 (FL, RL, SL i po pół C i LFE), a w 2.0 wagę 1, więc ten sam FL
+/// wychodzi jako FL/4 wobec FL/1 — dalej 12 dB różnicy. To nadal średnia po kanałach strony,
+/// a dźwięk z gry stereo i tak jest tylko w jednym z nich. Stała skala nie zależy od tego, ile
+/// kanałów jest pustych: ten sam dźwięk z gry daje tę samą parę w strumieniu 2.0, 5.1 i 7.1.
+///
+/// Cena: pełny miks 5.1/7.1 z sygnałem we wszystkich kanałach może dać parę powyżej 1,0. W buforze
+/// to tylko `f32`, a wyjście i tak przechodzi przez ściszanie głośnych Scout i miękki limiter
+/// (`mono_router::soft_limit`). Przy 7.1 bufor jest teraz 4 razy (12,04 dB) głośniejszy niż dawniej,
+/// więc `mono_boost_db` ze starego configu jest obniżane o tyle samo (patrz
+/// [`RadarConfig::migrate_mono_level`]) i głośność w słuchawce się nie zmienia.
+pub(crate) const MONO_PAN_SCALE: f32 = 0.5;
 
 /// Waga `(lewa, prawa)` pojedynczego kanału przy miksowaniu do "ważonego
 /// mono": pełne `1.0` po swojej stronie dla kanałów jednoznacznie bocznych,
@@ -1838,17 +1911,156 @@ mod tests {
     }
 
     #[test]
-    fn downmix_to_stereo_pan_sums_back_to_the_old_flat_mono_average() {
-        // (left + right) musi się zgadzać z dawnym płaskim `sum(channels)/channels`
-        // dla KAŻDEGO układu kanałów, bo `mono_router::MonoEar::Both` na tym polega.
-        let interleaved = [1.0, 0.5, 0.2, -0.4, -0.1, 0.3];
-        for &channels in &[1usize, 2, 6] {
-            let pan = downmix_to_stereo_pan(&interleaved[..channels.min(interleaved.len())], channels);
-            if let Some(&(l, r)) = pan.first() {
-                let expected: f32 = interleaved[..channels].iter().sum::<f32>() / channels as f32;
-                assert!((l + r - expected).abs() < 1e-6, "channels={channels}");
-            }
+    fn downmix_to_stereo_pan_sums_to_the_stereo_scaled_mix_of_all_channels() {
+        // `left + right` to suma WSZYSTKICH kanałów w skali stereo (C i LFE idą po połowie w obie
+        // strony), bo `mono_router::MonoEar::Both` gra właśnie tę sumę. Dla 2.0 to dawna średnia.
+        let interleaved = [1.0, 0.5, 0.2, -0.4, -0.1, 0.3, 0.6, -0.2];
+        for &channels in &[2usize, 6, 8] {
+            let (l, r) = downmix_to_stereo_pan(&interleaved[..channels], channels)[0];
+            let expected = interleaved[..channels].iter().sum::<f32>() * MONO_PAN_SCALE;
+            assert!((l + r - expected).abs() < 1e-6, "channels={channels}");
         }
+        let (l, r) = downmix_to_stereo_pan(&interleaved[..2], 2)[0];
+        assert!((l + r - (1.0 + 0.5) / 2.0).abs() < 1e-6, "2.0: średnia (L + P) / 2 jak dotąd");
+        // Mono `s` to to samo co stereo L = P = s.
+        assert_eq!(downmix_to_stereo_pan(&[0.8], 1), downmix_to_stereo_pan(&[0.8, 0.8], 2));
+    }
+
+    /// Dźwięk z gry w stereo `(L, P)` rozłożony na strumień o `channels` kanałach: sygnał w FL/FR,
+    /// reszta cisza, tak jak gra stereo na VB-Cable ustawionym na 7.1.
+    fn game_stream(game: &[(f32, f32)], channels: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(game.len() * channels);
+        for &(l, r) in game {
+            out.push(l);
+            out.push(r);
+            out.resize(out.len() + channels - 2, 0.0);
+        }
+        out
+    }
+
+    /// 0,3 s dźwięku z gry przy 48 kHz: cichy ton 1 kHz (L ok. −50 dBFS), strzał 50 ms (L ok. −3 dBFS)
+    /// od 0,1 s i znów cichy ton. Prawa strona trochę ciszej.
+    fn quiet_shot_quiet() -> Vec<(f32, f32)> {
+        (0..14_400)
+            .map(|i| {
+                let amp = if (4_800..7_200).contains(&i) { 0.7 } else { 0.003 };
+                let s = amp * (std::f32::consts::TAU * 1_000.0 * i as f32 / 48_000.0).sin();
+                (s, s * 0.8)
+            })
+            .collect()
+    }
+
+    /// Wynik przepuszczenia strumienia przez tor mono: wyjście bufora, docelowa zmiana Scout (dB)
+    /// każdej ramki i obwiednia, z której Scout liczy poziom, po każdym kawałku 10 ms.
+    struct MonoRun {
+        out: Vec<(f32, f32)>,
+        scout_db: Vec<f32>,
+        scout_env: Vec<f32>,
+    }
+
+    /// Strumień idzie przez `update_analysis` kawałkami po 10 ms, tak jak żywe przechwytywanie
+    /// (`fetch_audio_from_device`) i odtwarzanie nagrania (`playback`). Po każdym kawałku bufor
+    /// mono jest czytany do końca, jak robi to `mono_router`.
+    fn run_mono(stream: &[f32], channels: usize, scout: bool) -> MonoRun {
+        let analysis = SharedAudioAnalysis::new();
+        analysis.set_mono_scout(scout, 1.0);
+        let mut run = MonoRun { out: Vec::new(), scout_db: Vec::new(), scout_env: Vec::new() };
+        for chunk in stream.chunks(480 * channels) {
+            update_analysis(chunk, channels, 48_000.0, &analysis, None);
+            {
+                let ring = analysis.mono_ring.lock().unwrap();
+                run.scout_db.extend(ring.scout_targets.iter().copied());
+                run.scout_env.push(ring.scout_env);
+            }
+            run.out.extend(analysis.read_stereo_pan(chunk.len() / channels));
+        }
+        run
+    }
+
+    #[test]
+    fn silent_extra_channels_do_not_change_the_pan_pair() {
+        // Gra w stereo przez VB-Cable 7.1: sygnał tylko w FL/FR. Para ma być taka sama jak ze
+        // strumienia 2.0. Dawniej dzielenie przez liczbę kanałów dawało tu 4 razy mniej (−12 dB).
+        let game = [(0.7, -0.3), (0.1, 0.25), (-0.5, 0.0)];
+        let stereo = downmix_to_stereo_pan(&game_stream(&game, 2), 2);
+        assert_eq!(downmix_to_stereo_pan(&game_stream(&game, 8), 8), stereo, "7.1");
+        assert_eq!(downmix_to_stereo_pan(&game_stream(&game, 6), 6), stereo, "5.1");
+        assert_eq!(stereo[0], (0.35, -0.15), "skala stereo: połowa kanału z gry");
+    }
+
+    #[test]
+    fn scout_sees_the_same_level_for_game_audio_in_2_and_8_channel_streams() {
+        let game = quiet_shot_quiet();
+        let two = run_mono(&game_stream(&game, 2), 2, true);
+        let eight = run_mono(&game_stream(&game, 8), 8, true);
+        assert_eq!(eight.scout_env, two.scout_env, "ten sam poziom Scout przy 2 i 8 kanałach");
+        assert_eq!(eight.scout_db, two.scout_db, "te same decyzje Scout przy 2 i 8 kanałach");
+        assert_eq!(eight.out, two.out, "to samo wyjście bufora mono przy 2 i 8 kanałach");
+
+        // Strzał ok. −3 dBFS z gry to w skali pary ok. −9 dB, czyli powyżej progu ściszania. Dawniej
+        // przy 8 kanałach wychodziło ok. −21 dB i „ścisz głośne” się nie włączało.
+        let shot_db = 20.0 * eight.scout_env.iter().copied().fold(0.0f32, f32::max).log10();
+        assert!(shot_db > SCOUT_LOUD_DB, "poziom strzału w skali pary: {shot_db} dB");
+        let deepest = eight.scout_db.iter().copied().fold(0.0f32, f32::min);
+        assert!(deepest < -2.0, "przy 8 kanałach Scout ścisza strzał: {deepest} dB");
+        // Cichy ton (ok. −50 dBFS z gry, −56 dB w skali pary) jest podbijany, tak samo przy 8 kanałach.
+        assert!(eight.scout_db[100..4_800].iter().all(|&db| db > 0.0), "cichy ton przed strzałem podbity");
+    }
+
+    #[test]
+    fn played_back_recording_has_the_same_mono_level_as_live_capture() {
+        // Nagranie (`recorder`) zapisuje dwa pierwsze kanały żywego strumienia, a odtwarzanie
+        // (`playback`) woła `update_analysis` z 2 kanałami. Żywe przechwytywanie z VB-Cable 7.1 to
+        // 8 kanałów. Ten sam dźwięk z gry ma dać w buforze mono dokładnie to samo.
+        let game = quiet_shot_quiet();
+        let live = game_stream(&game, 8);
+        let recording: Vec<f32> = live.chunks_exact(8).flat_map(|f| [f[0], f[1]]).collect();
+        let from_live = run_mono(&live, 8, false);
+        let from_recording = run_mono(&recording, 2, false);
+        assert_eq!(from_live.out.len(), game.len());
+        assert_eq!(from_recording.out, from_live.out, "nagranie i żywe audio na tym samym poziomie");
+        // Skala stereo: strona pary to połowa kanału z gry, także w środku strzału.
+        let (l, r) = from_live.out[5_000];
+        assert!((l - game[5_000].0 * MONO_PAN_SCALE).abs() < 1e-6 && (r - game[5_000].1 * MONO_PAN_SCALE).abs() < 1e-6);
+    }
+
+    #[test]
+    fn migrated_boost_keeps_the_headphone_level_of_live_7_1_capture() {
+        // Użytkownik z VB-Cable 7.1 i +22 dB: dawniej bufor dostawał FL/8, teraz FL/2. Po migracji
+        // wzmocnienie ma dać w słuchawce ten sam poziom, a nie 12 dB głośniej.
+        let db_to_linear = |db: f32| 10f32.powf(db / 20.0);
+        let mut cfg = RadarConfig { mono_boost_db: 22.0, mono_level_version: 0, ..RadarConfig::default() };
+        cfg.migrate_mono_level();
+        assert_eq!(cfg.mono_level_version, MONO_LEVEL_VERSION);
+
+        let fl = 0.3;
+        let before = fl / 8.0 * db_to_linear(22.0);
+        let pan = downmix_to_stereo_pan(&game_stream(&[(fl, 0.0)], 8), 8);
+        let after = pan[0].0 * db_to_linear(cfg.mono_boost_db);
+        let jump_db = 20.0 * (after / before).log10();
+        assert!(jump_db.abs() < 0.01, "skok głośności po migracji: {jump_db} dB");
+
+        // Drugie przeliczenie (kolejne wczytanie) niczego już nie odejmuje.
+        let boost = cfg.mono_boost_db;
+        cfg.migrate_mono_level();
+        assert_eq!(cfg.mono_boost_db, boost);
+    }
+
+    #[test]
+    fn new_config_is_not_migrated_and_old_boosts_fit_the_slider() {
+        let mut fresh = RadarConfig::default();
+        fresh.migrate_mono_level();
+        assert_eq!(fresh.mono_boost_db, 0.0, "nowy config zostaje bez zmian");
+
+        // Najniższe dawne ustawienie suwaka (−12 dB) po migracji mieści się w nowym zakresie.
+        let mut lowest = RadarConfig { mono_boost_db: -12.0, mono_level_version: 0, ..RadarConfig::default() };
+        lowest.migrate_mono_level();
+        assert!(lowest.mono_boost_db >= MONO_BOOST_DB_MIN && lowest.mono_boost_db < -23.9, "{}", lowest.mono_boost_db);
+
+        assert!(
+            (LEGACY_MONO_BOOST_OFFSET_DB - 20.0 * (8.0 * MONO_PAN_SCALE).log10()).abs() < 1e-3,
+            "przesunięcie migracji to stosunek dawnego FL/8 do FL·MONO_PAN_SCALE"
+        );
     }
 
     #[test]

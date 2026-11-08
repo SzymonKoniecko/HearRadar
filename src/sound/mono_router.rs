@@ -444,6 +444,12 @@ const SOFT_LIMIT_KNEE: f32 = 0.8;
 /// zniekształceń mieszają się z oscylatorem `Buzz`/`Squeaky` z [`apply_cue`]
 /// i wzmacniają jego nieprzyjemną, piskliwą barwę. Miękkie dogięcie
 /// eliminuje tę nieciągłość, więc oba objawy znikają razem.
+///
+/// Próg i kształt zostały przy zmianie skali bufora mono na stałą skalę
+/// stereo (`devices::MONO_PAN_SCALE`): przy VB-Cable 7.1 bufor jest 12 dB
+/// głośniejszy, ale `mono_boost_db` ze starego configu jest obniżane o tyle
+/// samo (`RadarConfig::migrate_mono_level`), więc do limitera trafia ten sam
+/// poziom co wcześniej.
 #[inline]
 fn soft_limit(x: f32) -> f32 {
     let mag = x.abs();

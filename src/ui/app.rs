@@ -758,7 +758,10 @@ impl HearRadarApp {
         // faktyczną GŁOŚNOŚĆ w słuchawkach (patrz `mono_router::db_to_linear`).
         if ui
             .add(
-                egui::Slider::new(&mut self.radar_config.mono_boost_db, -12.0..=24.0)
+                egui::Slider::new(
+                    &mut self.radar_config.mono_boost_db,
+                    devices::MONO_BOOST_DB_MIN..=devices::MONO_BOOST_DB_MAX,
+                )
                     .text("Wzmocnienie (dB)")
                     .suffix(" dB"),
             )

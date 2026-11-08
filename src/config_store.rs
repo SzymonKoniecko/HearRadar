@@ -59,10 +59,17 @@ pub fn load() -> Result<RadarConfig> {
 }
 
 /// Wczytuje konfigurację z podanej ścieżki. Błędy jak w [`load`].
+///
+/// Plik zapisany starszą wersją aplikacji jest od razu przeliczany do bieżącej skali poziomu mono
+/// (patrz [`RadarConfig::migrate_mono_level`]), żeby głośność w słuchawce nie skoczyła. Na dysk
+/// trafia to przy następnym zapisie konfiguracji.
 pub fn load_from(path: &Path) -> Result<RadarConfig> {
     let data = std::fs::read_to_string(path)
         .with_context(|| format!("nie udało się odczytać pliku {}", path.display()))?;
-    serde_json::from_str(&data).with_context(|| format!("nieprawidłowy JSON w {}", path.display()))
+    let mut cfg: RadarConfig =
+        serde_json::from_str(&data).with_context(|| format!("nieprawidłowy JSON w {}", path.display()))?;
+    cfg.migrate_mono_level();
+    Ok(cfg)
 }
 
 #[cfg(test)]
@@ -147,6 +154,27 @@ mod tests {
         save_to(&path, &cfg).expect("save should succeed");
         let loaded = load_from(&path).expect("load should succeed right after save");
         assert_eq!(cfg.color_rules, loaded.color_rules);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn loading_an_old_config_lowers_mono_boost_once() {
+        // Plik sprzed skali stereo w buforze mono (bez `mono_level_version`), jak
+        // `config/radar_config.json` użytkownika z +22 dB.
+        let path = temp_config_path("mono_level");
+        let mut value =
+            serde_json::to_value(RadarConfig { mono_boost_db: 22.0, ..RadarConfig::default() }).unwrap();
+        value.as_object_mut().unwrap().remove("mono_level_version");
+        std::fs::write(&path, value.to_string()).unwrap();
+
+        let loaded = load_from(&path).expect("stary plik powinien się wczytać");
+        assert!((loaded.mono_boost_db - (22.0 - 12.04)).abs() < 0.01, "boost po migracji: {}", loaded.mono_boost_db);
+
+        // Po zapisie plik ma już bieżącą wersję, więc kolejne wczytanie niczego nie odejmuje.
+        save_to(&path, &loaded).expect("save should succeed");
+        let again = load_from(&path).expect("load should succeed right after save");
+        assert_eq!(again.mono_boost_db, loaded.mono_boost_db);
 
         let _ = std::fs::remove_file(&path);
     }
