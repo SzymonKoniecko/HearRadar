@@ -211,26 +211,22 @@ impl RadarCanvas for SkiaCanvas<'_> {
     }
 }
 
-/// Natywne okno warstwowe (`WS_EX_LAYERED`) z radarem, sterowane bezpośrednio
-/// przez WinAPI zamiast przez viewport `eframe`. Tworzone leniwie, gdy
-/// użytkownik otwiera overlay, i niszczone (`Drop`) gdy go zamyka.
-pub struct WinOverlay {
+/// Jedno natywne okno warstwowe (`WS_EX_LAYERED`) z własnym buforem DIB. Overlay składa się
+/// z kilku takich okien: małego wokół tarczy radaru i wąskich pasków przy krawędziach ekranu na
+/// poświatę krawędzi (patrz [`WinOverlay`]).
+struct LayeredWindow {
     hwnd: HWND,
     mem_dc: HDC,
     bitmap: HBITMAP,
     pixels: *mut u8,
-    /// Bufor DIB był dawniej zawsze kwadratowy (tarcza + margines), ale
-    /// `edge_glow_enabled` (patrz `RadarConfig::edge_glow_enabled`) potrzebuje
-    /// okna pokrywającego CAŁY monitor — rzadko kwadratowy — więc szerokość i
-    /// wysokość są teraz niezależne (patrz `resize`).
     width: i32,
     height: i32,
     visible: bool,
     click_through: bool,
 }
 
-impl WinOverlay {
-    pub fn new() -> windows::core::Result<Self> {
+impl LayeredWindow {
+    fn new() -> windows::core::Result<Self> {
         let hinstance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
         ensure_class_registered(hinstance);
 
@@ -259,7 +255,7 @@ impl WinOverlay {
             ReleaseDC(None, screen_dc);
         }
 
-        let mut overlay = Self {
+        let mut window = Self {
             hwnd,
             mem_dc,
             bitmap: HBITMAP::default(),
@@ -267,10 +263,12 @@ impl WinOverlay {
             width: 0,
             height: 0,
             visible: false,
-            click_through: true,
+            // Okno powstaje bez `WS_EX_TRANSPARENT`, więc stan startowy to „nie przepuszcza
+            // kliknięć”. Dzięki temu pierwsze `set_click_through(true)` naprawdę ustawia styl.
+            click_through: false,
         };
-        overlay.resize(1, 1)?;
-        Ok(overlay)
+        window.resize(1, 1)?;
+        Ok(window)
     }
 
     fn resize(&mut self, width: i32, height: i32) -> windows::core::Result<()> {
@@ -311,20 +309,7 @@ impl WinOverlay {
         Ok(())
     }
 
-    /// Rozmiar głównego monitora w pikselach — potrzebny, żeby okno mogło
-    /// pokryć CAŁY ekran w trybie `edge_glow_enabled` (patrz
-    /// `render_and_present`), analogicznie do `monitor_size` z
-    /// `egui::ViewportInfo` na ścieżce nie-Windowsowej.
-    fn screen_size() -> (i32, i32) {
-        unsafe {
-            (
-                GetSystemMetrics(SM_CXSCREEN),
-                GetSystemMetrics(SM_CYSCREEN),
-            )
-        }
-    }
-
-    pub fn set_click_through(&mut self, click_through: bool) {
+    fn set_click_through(&mut self, click_through: bool) {
         if self.click_through == click_through {
             return;
         }
@@ -341,75 +326,12 @@ impl WinOverlay {
         }
     }
 
-    /// Oblicza lewy-górny róg okna z `anchor_x`/`anchor_y` (0.0..1.0 =
-    /// ułamek szerokości/wysokości głównego monitora) tak samo jak
-    /// `HearRadarApp::overlay_anchored_position` dla ścieżki `eframe`.
-    fn position_from_anchor(overlay_size: f32, anchor_x: f32, anchor_y: f32, margin: f32) -> (i32, i32) {
-        let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) } as f32;
-        let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) } as f32;
-        let usable_w = (screen_w - overlay_size - 2.0 * margin).max(0.0);
-        let usable_h = (screen_h - overlay_size - 2.0 * margin).max(0.0);
-        let x = margin + anchor_x * usable_w;
-        let y = margin + anchor_y * usable_h;
-        (x.round() as i32, y.round() as i32)
-    }
-
-    /// Środek tarczy WEWNĄTRZ okna o rozmiarze `width`x`height`, wg
-    /// `anchor_x`/`anchor_y` — dokładny odpowiednik `HearRadarApp::dial_center_in`
-    /// ze ścieżki nie-Windowsowej, potrzebny gdy okno pokrywa cały ekran
-    /// (`edge_glow_enabled`) i tarcza musi "pływać" w jego wnętrzu, zamiast
-    /// całe okno było przesuwane przez system w róg.
-    fn dial_center_in(width: i32, height: i32, dial_size: f32, anchor_x: f32, anchor_y: f32, margin: f32) -> Pos2 {
-        let usable_w = (width as f32 - dial_size - 2.0 * margin).max(0.0);
-        let usable_h = (height as f32 - dial_size - 2.0 * margin).max(0.0);
-        let x = margin + anchor_x * usable_w + dial_size / 2.0;
-        let y = margin + anchor_y * usable_h + dial_size / 2.0;
-        Pos2::new(x, y)
-    }
-
-    /// Rysuje jedną klatkę radaru (i, przy `edge_glow_enabled`, poświaty na
-    /// krawędzi ekranu — patrz `radar_egui::draw_edge_glow_indicators`) i
-    /// wysyła ją na pulpit. Wołane co klatkę `eframe` (patrz
-    /// `HearRadarApp::tick_native_overlay`), analogicznie do
-    /// `ui_overlay_contents` w ścieżce nie-Windowsowej. `dial_size` to
-    /// średnica samej tarczy + margines (`radius * 2 + OVERLAY_PADDING`) —
-    /// przy wyłączonym `edge_glow_enabled` to też rozmiar CAŁEGO okna (jak
-    /// dawniej); przy włączonym okno rozciąga się na cały monitor, a
-    /// `dial_size` służy tylko do wyliczenia, gdzie w jego wnętrzu wypada
-    /// środek tarczy.
-    pub fn render_and_present(
-        &mut self,
-        dial_size: f32,
-        screen_margin: f32,
-        cfg: &RadarConfig,
-        state: &mut RadarState,
-        channels: usize,
-        now: f64,
-        click_through: bool,
-    ) {
-        let (width, height, x, y, center) = if cfg.edge_glow_enabled {
-            let (screen_w, screen_h) = Self::screen_size();
-            let center = Self::dial_center_in(
-                screen_w,
-                screen_h,
-                dial_size,
-                cfg.anchor_x,
-                cfg.anchor_y,
-                screen_margin,
-            );
-            (screen_w, screen_h, 0, 0, center)
-        } else {
-            let size = dial_size.round() as i32;
-            let (x, y) = Self::position_from_anchor(dial_size, cfg.anchor_x, cfg.anchor_y, screen_margin);
-            (size, size, x, y, Pos2::new(size as f32 / 2.0, size as f32 / 2.0))
-        };
-
+    /// Rysuje klatkę `width`x`height` przez `draw` (na czystym, przezroczystym buforze) i wysyła ją
+    /// na pulpit z lewym-górnym rogiem w `(x, y)`.
+    fn draw_and_present(&mut self, x: i32, y: i32, width: i32, height: i32, draw: impl FnOnce(&SkiaCanvas<'_>)) {
         if self.resize(width, height).is_err() {
             return;
         }
-
-        self.set_click_through(click_through);
-
         let len = (self.width as usize) * (self.height as usize) * 4;
         // Bezpieczne: `self.pixels` wskazuje na bufor DIB o dokładnie takiej
         // długości, żywy tak długo jak `self.bitmap` (odtwarzany w `resize`
@@ -420,21 +342,11 @@ impl WinOverlay {
             return;
         };
         pixmap.fill(tiny_skia::Color::TRANSPARENT);
+        draw(&SkiaCanvas { pixmap: RefCell::new(pixmap) });
+        self.present(x, y);
+    }
 
-        let canvas = SkiaCanvas { pixmap: RefCell::new(pixmap) };
-        draw_radar(
-            &canvas,
-            center,
-            cfg,
-            state,
-            channels,
-            now,
-        );
-        if cfg.edge_glow_enabled {
-            let screen_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(self.width as f32, self.height as f32));
-            draw_edge_glow_indicators(&canvas, screen_rect, state, now, cfg);
-        }
-
+    fn present(&mut self, x: i32, y: i32) {
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -477,9 +389,18 @@ impl WinOverlay {
             );
         }
     }
+
+    fn hide(&mut self) {
+        if self.visible {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+            self.visible = false;
+        }
+    }
 }
 
-impl Drop for WinOverlay {
+impl Drop for LayeredWindow {
     fn drop(&mut self) {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -488,6 +409,202 @@ impl Drop for WinOverlay {
             }
             let _ = DeleteDC(self.mem_dc);
             let _ = DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Jeden wypełniony prostokąt poświaty krawędzi w układzie całego ekranu: (prostokąt, zaokrąglenie,
+/// kolor). Poświata krawędzi rysuje wyłącznie prostokąty (patrz `radar_egui::draw_edge_glow_indicators`).
+type GlowRect = (Rect, f32, Color32);
+
+/// Płótno, które tylko zapamiętuje prostokąty poświaty krawędzi, zamiast rysować je na pełnym ekranie.
+/// Inne kształty pomija, bo poświata krawędzi ich nie używa.
+#[derive(Default)]
+struct GlowRecorder {
+    rects: RefCell<Vec<GlowRect>>,
+}
+
+impl RadarCanvas for GlowRecorder {
+    fn circle_filled(&self, _: Pos2, _: f32, _: Color32) {}
+    fn circle_stroke(&self, _: Pos2, _: f32, _: Stroke) {}
+    fn line_segment(&self, _: [Pos2; 2], _: Stroke) {}
+    fn rect_filled(&self, rect: Rect, corner_radius: f32, color: Color32) {
+        if color.a() > 0 && rect.width() > 0.0 && rect.height() > 0.0 {
+            self.rects.borrow_mut().push((rect, corner_radius, color));
+        }
+    }
+    fn triangle_filled(&self, _: [Pos2; 3], _: Color32) {}
+    fn text(&self, _: Pos2, _: Align2, _: &str, _: FontId, _: Color32) {}
+}
+
+/// Krawędź ekranu, przy której leży prostokąt poświaty: 0 lewa, 1 prawa, 2 góra, 3 dół. Pionowe pasy
+/// (winieta, plama w stereo) dotykają lewej albo prawej krawędzi, więc te sprawdzamy najpierw.
+fn glow_edge(rect: Rect, screen: Rect) -> usize {
+    const TOUCH: f32 = 1.0;
+    if rect.min.x <= screen.min.x + TOUCH {
+        0
+    } else if rect.max.x >= screen.max.x - TOUCH {
+        1
+    } else if rect.min.y <= screen.min.y + TOUCH {
+        2
+    } else {
+        3
+    }
+}
+
+/// O tyle może się zmienić krycie prostokąta (0..255), zanim pasek krawędzi zostanie narysowany
+/// ponownie. Poświata gaśnie płynnie co klatkę, a tak mała różnica jest niewidoczna, za to oszczędza
+/// większość odświeżeń w czasie zanikania.
+const GLOW_ALPHA_TOLERANCE: u8 = 3;
+
+/// Czy dwie klatki paska krawędzi wyglądają tak samo: te same prostokąty i kolory, krycie najwyżej
+/// o [`GLOW_ALPHA_TOLERANCE`] inne.
+fn glow_frames_match(a: &[GlowRect], b: &[GlowRect]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|((ra, za, ca), (rb, zb, cb))| {
+            ra == rb && za == zb && ca.a().abs_diff(cb.a()) <= GLOW_ALPHA_TOLERANCE && {
+                // Kolory są wstępnie pomnożone przez alfę, więc porównujemy barwę po przeskalowaniu.
+                let hue = |c: &Color32| c.to_srgba_unmultiplied();
+                let (ha, hb) = (hue(ca), hue(cb));
+                ha[0].abs_diff(hb[0]) <= 8 && ha[1].abs_diff(hb[1]) <= 8 && ha[2].abs_diff(hb[2]) <= 8
+            }
+        })
+}
+
+/// Pasek przy jednej krawędzi ekranu z poświatą. Okno ma rozmiar dokładnie obejmujący prostokąty
+/// poświaty tej krawędzi i odświeża się tylko, gdy obraz naprawdę się zmienił.
+struct EdgeStrip {
+    window: LayeredWindow,
+    /// Prostokąty ostatnio wysłanej klatki, w układzie ekranu.
+    shown: Vec<GlowRect>,
+}
+
+impl EdgeStrip {
+    fn show(&mut self, screen: Rect, rects: Vec<GlowRect>) {
+        if self.window.visible && glow_frames_match(&self.shown, &rects) {
+            return;
+        }
+        let bounds = rects
+            .iter()
+            .fold(Rect::NOTHING, |acc, (r, _, _)| acc.union(*r))
+            .intersect(screen);
+        let x = bounds.min.x.floor() as i32;
+        let y = bounds.min.y.floor() as i32;
+        let width = (bounds.max.x.ceil() as i32 - x).max(1);
+        let height = (bounds.max.y.ceil() as i32 - y).max(1);
+        let offset = Vec2::new(x as f32, y as f32);
+        self.window.draw_and_present(x, y, width, height, |canvas| {
+            for (rect, corner_radius, color) in &rects {
+                canvas.rect_filled(rect.translate(-offset), *corner_radius, *color);
+            }
+        });
+        self.shown = rects;
+    }
+
+    fn hide(&mut self) {
+        self.window.hide();
+        self.shown.clear();
+    }
+}
+
+/// Natywny overlay sterowany bezpośrednio przez WinAPI zamiast przez viewport `eframe`: małe okno
+/// wokół tarczy radaru i, przy `edge_glow_enabled`, wąskie paski przy krawędziach ekranu na poświatę.
+/// Dawniej poświata krawędzi rozciągała całe okno na monitor i co klatkę wysyłała pełnoekranowy bufor,
+/// co zabierało grze dużo klatek i zasłaniało jej kursor. Tworzony leniwie, gdy użytkownik otwiera
+/// overlay, i niszczony (`Drop`) gdy go zamyka.
+pub struct WinOverlay {
+    radar: LayeredWindow,
+    /// Paski poświaty przy krawędziach (lewa, prawa, góra, dół), tworzone przy pierwszym użyciu.
+    edges: [Option<EdgeStrip>; 4],
+}
+
+impl WinOverlay {
+    pub fn new() -> windows::core::Result<Self> {
+        Ok(Self { radar: LayeredWindow::new()?, edges: [None, None, None, None] })
+    }
+
+    /// Rozmiar głównego monitora w pikselach — poświata krawędzi liczy pozycje w układzie
+    /// całego ekranu, analogicznie do `monitor_size` z `egui::ViewportInfo` na ścieżce
+    /// nie-Windowsowej.
+    fn screen_size() -> (i32, i32) {
+        unsafe {
+            (
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+            )
+        }
+    }
+
+    /// Oblicza lewy-górny róg okna z `anchor_x`/`anchor_y` (0.0..1.0 =
+    /// ułamek szerokości/wysokości głównego monitora) tak samo jak
+    /// `HearRadarApp::overlay_anchored_position` dla ścieżki `eframe`.
+    fn position_from_anchor(overlay_size: f32, anchor_x: f32, anchor_y: f32, margin: f32) -> (i32, i32) {
+        let (screen_w, screen_h) = Self::screen_size();
+        let usable_w = (screen_w as f32 - overlay_size - 2.0 * margin).max(0.0);
+        let usable_h = (screen_h as f32 - overlay_size - 2.0 * margin).max(0.0);
+        let x = margin + anchor_x * usable_w;
+        let y = margin + anchor_y * usable_h;
+        (x.round() as i32, y.round() as i32)
+    }
+
+    /// Rysuje jedną klatkę radaru w małym oknie wokół tarczy i, przy `edge_glow_enabled`, poświatę
+    /// na krawędzi ekranu w osobnych paskach (patrz `radar_egui::draw_edge_glow_indicators`).
+    /// Wołane co klatkę `eframe` (patrz `HearRadarApp::tick_native_overlay`), analogicznie do
+    /// `ui_overlay_contents` w ścieżce nie-Windowsowej. `dial_size` to bok okna radaru: średnica
+    /// tarczy + margines.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_and_present(
+        &mut self,
+        dial_size: f32,
+        screen_margin: f32,
+        cfg: &RadarConfig,
+        state: &mut RadarState,
+        channels: usize,
+        now: f64,
+        click_through: bool,
+    ) {
+        let size = dial_size.round() as i32;
+        let (x, y) = Self::position_from_anchor(dial_size, cfg.anchor_x, cfg.anchor_y, screen_margin);
+        let center = Pos2::new(size as f32 / 2.0, size as f32 / 2.0);
+        self.radar.set_click_through(click_through);
+        self.radar.draw_and_present(x, y, size, size, |canvas| {
+            draw_radar(canvas, center, cfg, state, channels, now);
+        });
+
+        if !cfg.edge_glow_enabled {
+            self.hide_edges();
+            return;
+        }
+        let (screen_w, screen_h) = Self::screen_size();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(screen_w as f32, screen_h as f32));
+        let recorder = GlowRecorder::default();
+        draw_edge_glow_indicators(&recorder, screen, state, now, cfg);
+        let mut groups: [Vec<GlowRect>; 4] = Default::default();
+        for glow in recorder.rects.into_inner() {
+            groups[glow_edge(glow.0, screen)].push(glow);
+        }
+        for (slot, rects) in self.edges.iter_mut().zip(groups) {
+            if rects.is_empty() {
+                if let Some(strip) = slot {
+                    strip.hide();
+                }
+                continue;
+            }
+            if slot.is_none() {
+                // Pasek zawsze przepuszcza kliknięcia: nie ma czego przeciągać, a ma nie zasłaniać gry.
+                let Ok(mut window) = LayeredWindow::new() else { continue };
+                window.set_click_through(true);
+                *slot = Some(EdgeStrip { window, shown: Vec::new() });
+            }
+            if let Some(strip) = slot {
+                strip.show(screen, rects);
+            }
+        }
+    }
+
+    fn hide_edges(&mut self) {
+        for strip in self.edges.iter_mut().flatten() {
+            strip.hide();
         }
     }
 }
@@ -504,3 +621,35 @@ unsafe impl Send for WinOverlay {}
 const _: () = {
     fn _assert_flags_type(_: SET_WINDOW_POS_FLAGS) {}
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen() -> Rect {
+        Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0))
+    }
+
+    #[test]
+    fn glow_rects_go_to_the_edge_they_touch() {
+        let full_height_left = Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 1080.0));
+        assert_eq!(glow_edge(full_height_left, screen()), 0, "winieta po lewej, choć dotyka też góry i dołu");
+        let right = Rect::from_min_max(Pos2::new(1760.0, 216.0), Pos2::new(1920.0, 864.0));
+        assert_eq!(glow_edge(right, screen()), 1);
+        let top = Rect::from_min_max(Pos2::new(800.0, 0.0), Pos2::new(1120.0, 160.0));
+        assert_eq!(glow_edge(top, screen()), 2);
+        let bottom = Rect::from_min_max(Pos2::new(800.0, 920.0), Pos2::new(1120.0, 1080.0));
+        assert_eq!(glow_edge(bottom, screen()), 3);
+    }
+
+    #[test]
+    fn tiny_alpha_changes_do_not_redraw_the_strip() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 1080.0));
+        let frame = |alpha: u8| vec![(rect, 0.0, Color32::from_rgba_unmultiplied(255, 40, 40, alpha))];
+        assert!(glow_frames_match(&frame(70), &frame(68)), "różnica 2 w kryciu: bez odświeżenia");
+        assert!(!glow_frames_match(&frame(70), &frame(60)), "wyraźnie bledsza: odświeżenie");
+        assert!(!glow_frames_match(&frame(70), &[]), "zniknęła: odświeżenie");
+        let wider = vec![(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 1080.0)), 0.0, frame(70)[0].2)];
+        assert!(!glow_frames_match(&frame(70), &wider), "inny zasięg: odświeżenie");
+    }
+}

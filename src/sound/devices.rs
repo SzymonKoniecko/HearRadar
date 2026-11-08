@@ -254,7 +254,9 @@ pub struct RadarConfig {
     /// ekranu. Domyślnie wyłączone (`#[serde(default)]`), żeby nie zmieniać
     /// wyglądu dla obecnych użytkowników bez ich zgody — wymaga też, żeby
     /// overlay rozciągnął się na cały ekran zamiast małego kwadratu wokół
-    /// tarczy (patrz `HearRadarApp::ui_overlay_contents`).
+    /// tarczy (patrz `HearRadarApp::ui_overlay_contents`). Na Windows
+    /// (`ui::overlay_win`) zamiast tego poświata dostaje osobne, wąskie okna
+    /// przy krawędziach, bo pełnoekranowe okno zabierało grze klatki.
     #[serde(default)]
     pub edge_glow_enabled: bool,
     /// Moc poświaty na krawędzi ekranu w stereo (0.0 wyłącza, 1.0 domyślna, 2.0 najmocniejsza). W stereo
