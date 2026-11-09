@@ -734,23 +734,118 @@ impl HearRadarApp {
         // `mono_router::apply_cue`) — bez tego w trybie jednousznym
         // (Lewe/Prawe) cała informacja "z której strony był dźwięk" ginie,
         // bo obie strony grają identycznie w jednej słuchawce.
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Wskazówka dla strony przeciwnej (tryb jednouszny):");
-            for style in MonoCueStyle::ALL {
-                let style = *style;
-                if ui
-                    .selectable_label(self.radar_config.mono_cue_style == style, style.label())
-                    .clicked()
-                {
-                    self.radar_config.mono_cue_style = style;
+        ui.label("Wskazówka dla strony przeciwnej (tryb jednouszny):");
+        for (group, styles) in [("Na kanale:", MonoCueStyle::CHANNEL), ("Kierunkowo:", MonoCueStyle::DIRECTIONAL)] {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(group);
+                for &style in styles {
+                    if ui
+                        .selectable_label(self.radar_config.mono_cue_style == style, style.label())
+                        .clicked()
+                    {
+                        self.radar_config.mono_cue_style = style;
+                        self.write_radar_config();
+                    }
+                }
+            });
+        }
+        ui.weak(
+            "Dotyczy tylko ucha Lewe/Prawe. Na kanale: efekt dostaje cały kanał przeciwny, więc \
+             trochę też dźwięki ze środka i z Twojej strony. Kierunkowo: efekt dostaje tylko dźwięk, \
+             który przychodzi z przeciwnej strony (osobno w każdym paśmie), w całości i bez zmiany \
+             głośności; środek (np. własna broń) i Twoja strona zostają czyste. Dodaje ok. 11 ms opóźnienia.",
+        );
+
+        // „Wg warstw”: osobny styl dla strzałów, kroków i reszty (patrz `MonoLayerStyles`).
+        let style = self.radar_config.mono_cue_style;
+        let per_layer = style == MonoCueStyle::PerLayer;
+        if per_layer {
+            ui.weak(
+                "Wg warstw: styl zależy od tego, co radar rozpoznał po przeciwnej stronie. Rozpoznanie \
+                 trwa ok. 0,15 s, więc wyjście dostaje 0,25 s opóźnienia (jak przy „Strzały ciszej, \
+                 kroki głośniej”). Gdy nic nie rozpoznano, obowiązuje styl reszty.",
+            );
+            for layer in crate::sound::layers::Layer::ALL {
+                let label = match layer {
+                    crate::sound::layers::Layer::Shots => "Strzały i wybuchy:",
+                    crate::sound::layers::Layer::Steps => "Kroki:",
+                    crate::sound::layers::Layer::Rest => "Reszta:",
+                };
+                let current = self.radar_config.mono_layer_styles.get(layer).as_layer_choice();
+                let mut chosen = current;
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    egui::ComboBox::from_id_salt(("mono_layer_style", layer.index()))
+                        .selected_text(current.label())
+                        .show_ui(ui, |ui| {
+                            for &choice in MonoCueStyle::LAYER_CHOICES {
+                                ui.selectable_value(&mut chosen, choice, choice.label());
+                            }
+                        });
+                });
+                if chosen != current {
+                    *self.radar_config.mono_layer_styles.get_mut(layer) = chosen;
                     self.write_radar_config();
                 }
             }
-        });
-        ui.weak(
-            "Dotyczy tylko ucha Lewe/Prawe: strona przeciwna dostaje wybrany efekt zamiast grać \
-             identycznie jak swoja, żeby po brzmieniu poznać, że dźwięk był z drugiej strony.",
-        );
+        }
+
+        // Style kierunkowe z oddechem: głębokość i barwa (patrz `sound::directional`).
+        let layer_styles = self.radar_config.mono_layer_styles;
+        if style.uses_breath() || (per_layer && layer_styles.any_uses_breath()) {
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.mono_breath_depth, 0.2..=0.9)
+                        .text("Głębokość oddechu")
+                        .custom_formatter(|v, _| {
+                            let swing_db = -20.0 * (1.0 - v).log10();
+                            format!("{:.0} % (wahanie {swing_db:.0} dB)", v * 100.0)
+                        }),
+                )
+                .on_hover_text(
+                    "Jak mocno oddycha dźwięk w pełni z przeciwnej strony. Średnia głośność zostaje ta sama.",
+                )
+                .changed()
+            {
+                self.write_radar_config();
+            }
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.mono_breath_timbre, 0.0..=1.0)
+                        .text("Barwa strony przeciwnej")
+                        .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+                )
+                .on_hover_text(
+                    "Cieńsze brzmienie dźwięku z przeciwnej strony (mniej dołu i góry, jak w zwykłym \
+                     Oddechu), bez ściszania. Pomaga przy krótkich dźwiękach, np. krokach. 0 % = sam oddech.",
+                )
+                .changed()
+            {
+                self.write_radar_config();
+            }
+        }
+        if (style == MonoCueStyle::BreathBuzz || (per_layer && layer_styles.any_uses_breath_buzz()))
+            && ui
+                .add(
+                    egui::Slider::new(&mut self.radar_config.mono_buzz_depth, 0.1..=1.0)
+                        .text("Siła brzęczenia")
+                        .custom_formatter(|v, _| {
+                            if v >= 0.999 {
+                                "100 % (do ciszy)".to_string()
+                            } else {
+                                let swing_db = -20.0 * (1.0 - v).log10();
+                                format!("{:.0} % (wahanie {swing_db:.0} dB)", v * 100.0)
+                            }
+                        }),
+                )
+                .on_hover_text(
+                    "Lekkie brzęczenie 45 Hz na dźwięku z przeciwnej strony: mieści kilka cykli w krótkim \
+                     dźwięku (krok), więc oznacza też krótkie dźwięki. Oddech oznacza długie.",
+                )
+                .changed()
+        {
+            self.write_radar_config();
+        }
 
         // Wzmocnienie sygnału mono na wyjściu — odpowiednik `INTENSITY_SCALE`
         // z `sound::direction` (tam sztywny mnożnik dla WYŚWIETLANIA na

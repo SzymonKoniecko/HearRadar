@@ -5,6 +5,7 @@ pub mod color_profiles;
 pub mod devices;
 pub mod direction;
 pub mod direction_test;
+pub mod directional;
 pub mod footsteps;
 pub mod layers;
 pub mod mono_router;

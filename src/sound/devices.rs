@@ -318,6 +318,21 @@ pub struct RadarConfig {
     /// pliku configu (sprzed tego pola) włącza nową funkcję zamiast ją wyciszyć.
     #[serde(default)]
     pub mono_cue_style: MonoCueStyle,
+    /// Głębokość oddechu w stylach kierunkowych z oddechem (`MonoCueStyle::uses_breath`),
+    /// 0–0,95. 0,6 daje wahanie ok. 8 dB dla dźwięku w pełni z przeciwnej strony.
+    #[serde(default = "default_mono_breath_depth")]
+    pub mono_breath_depth: f32,
+    /// Siła cieńszej barwy w stylach kierunkowych z oddechem, 0–1: 0 = sam oddech, 1 = kształt
+    /// pasma jak w zwykłym Oddechu (z wyrównaną głośnością).
+    #[serde(default = "default_mono_breath_timbre")]
+    pub mono_breath_timbre: f32,
+    /// Siła lekkiego brzęczenia w stylu „Oddech + brzęczenie” (`MonoCueStyle::BreathBuzz`), 0–1.
+    /// 0,5 to wahanie 6 dB przy 45 Hz, 1,0 schodzi na dnie cyklu do ciszy.
+    #[serde(default = "default_mono_buzz_depth")]
+    pub mono_buzz_depth: f32,
+    /// Styl wskazówki dla strzałów, kroków i reszty w stylu „Wg warstw” (`MonoCueStyle::PerLayer`).
+    #[serde(default)]
+    pub mono_layer_styles: MonoLayerStyles,
     /// Włącza odejmowanie energii wspólnej dla wszystkich kanałów kierunkowych
     /// przed sprawdzeniem onsetu (patrz [`crate::sound::direction::CONTRAST_AMOUNT`]
     /// i doc-komentarz [`crate::sound::direction::detect_channel_activity`]) —
@@ -522,6 +537,18 @@ fn default_mono_scout_amount() -> f32 {
     0.5
 }
 
+fn default_mono_breath_depth() -> f32 {
+    crate::sound::directional::DEFAULT_DEPTH
+}
+
+fn default_mono_breath_timbre() -> f32 {
+    crate::sound::directional::DEFAULT_TIMBRE
+}
+
+fn default_mono_buzz_depth() -> f32 {
+    crate::sound::directional::DEFAULT_BUZZ_DEPTH
+}
+
 fn default_mono_class_gain_db() -> f32 {
     MONO_CLASS_GAIN_DB_DEFAULT
 }
@@ -632,6 +659,10 @@ impl Default for RadarConfig {
             spatial_audio_view: false,
             line_thickness: default_line_thickness(),
             mono_cue_style: MonoCueStyle::default(),
+            mono_breath_depth: default_mono_breath_depth(),
+            mono_breath_timbre: default_mono_breath_timbre(),
+            mono_buzz_depth: default_mono_buzz_depth(),
+            mono_layer_styles: MonoLayerStyles::default(),
             direction_contrast_enabled: false,
             visualization_mode: VisualizationMode::default(),
             speaker_setup: SpeakerSetup::default(),
@@ -682,7 +713,17 @@ impl MonoEar {
 /// kanale. Każdy wariant to inny, tani obliczeniowo efekt DSP w czasie
 /// rzeczywistym (patrz `mono_router::apply_cue`), do wyboru wg tego, co komu
 /// łatwiej rozróżnić na ucho.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+///
+/// Style są w dwóch grupach. Kanałowe ([`Self::CHANNEL`]) dają efekt całemu
+/// kanałowi przeciwnemu, więc dostaje go też kopia dźwięków ze środka i ze swojej
+/// strony. Kierunkowe ([`Self::DIRECTIONAL`]) dają efekt tylko dźwiękowi, który
+/// przychodzi z przeciwnej strony (patrz `sound::directional`), w całości
+/// i z wyrównaną głośnością; opóźniają wyjście o ok. 11 ms.
+///
+/// Usunięte style (Pulsowanie, Stłumiony, Ciemny, Odbicie, Wycięcie środka,
+/// Falowanie) wczytują się ze starego configu jako styl domyślny, patrz
+/// [`Self::from_config_name`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum MonoCueStyle {
     /// Strona przeciwna gra niezmieniona, tak samo jak swoja — brak wskazówki
     /// (zachowanie sprzed dodania tej funkcji).
@@ -690,49 +731,85 @@ pub enum MonoCueStyle {
     /// Ring modulation ~45 Hz — wyraźne, niskie "brzęczenie".
     #[default]
     Buzz,
-    /// Ring modulation ~220 Hz — ten sam mechanizm co `Buzz`, ale szybciej,
+    /// Ring modulation ~140 Hz — ten sam mechanizm co `Buzz`, ale szybciej,
     /// więc brzmi wyżej/"piskliwiej".
     Squeaky,
-    /// Rytmiczne wyciszanie/odciszanie (~8 Hz) zamiast płynnej fali —
-    /// dźwięk "mruga" zamiast brzęczeć.
-    Pulse,
-    /// Filtr dolnoprzepustowy — strona przeciwna brzmi stłumiona, "zza
-    /// ściany", bez zmiany rytmu głośności (w odróżnieniu od pozostałych
-    /// wariantów, które modulują amplitudę).
-    Muffled,
-    /// Podbicie wysokich tonów (dopełnienie filtra z `Muffled`) — strona
-    /// przeciwna brzmi jaśniej/cieńciej, bez zmiany rytmu głośności.
+    /// Podbicie wysokich tonów — strona przeciwna brzmi jaśniej/cieńciej, bez
+    /// zmiany rytmu głośności.
     Bright,
-    /// Mocniejszy filtr dolnoprzepustowy niż `Muffled` (niższe odcięcie) —
-    /// strona przeciwna brzmi wyraźnie ciemniej/głucho.
-    Dark,
     /// Grzebieniowy: krótkie opóźnienie 1,2 ms zmieszane z sygnałem daje wycięcia (pierwsze ok.
     /// 416 Hz) i "pustą", przestrzenną barwę. Bez modulacji.
     Comb,
-    /// Odbicie od ściany: opóźnienie 18 ms, tylko strona przeciwna, stłumiona powyżej 3,5 kHz.
-    Echo,
     /// Oddech: wolna modulacja głośności 4 Hz (głębokość 40 %) w paśmie 300 Hz – 4 kHz.
     Tremolo,
-    /// Wycięcie środka: ubytek pasma 1,5 – 5 kHz, zostaje dół i góra.
-    Notch,
-    /// Falowanie: opóźnienie 5 ms ± 1,5 ms przy 2 Hz, czyli delikatne pływanie wysokości.
-    PitchWobble,
+    /// Oddech kierunkowy: oddech 4 Hz bez zmiany średniej głośności i cieńsza barwa, tylko dla
+    /// dźwięku z przeciwnej strony. Głębokość i barwa z suwaków. Najlepszy dla dźwięków ciągłych.
+    DirectionalBreath,
+    /// Oddech + brzęczenie: jak `DirectionalBreath`, a do tego lekkie brzęczenie 45 Hz, które
+    /// mieści kilka cykli w krótkim dźwięku (krok), więc oznacza też krótkie dźwięki.
+    BreathBuzz,
+    /// `Buzz` tylko dla dźwięku z przeciwnej strony.
+    DirectionalBuzz,
+    /// `Squeaky` tylko dla dźwięku z przeciwnej strony.
+    DirectionalSqueaky,
+    /// `Bright` tylko dla dźwięku z przeciwnej strony.
+    DirectionalBright,
+    /// `Comb` tylko dla dźwięku z przeciwnej strony.
+    DirectionalComb,
+    /// Wg warstw: osobny styl kierunkowy dla strzałów, kroków i reszty (patrz
+    /// [`MonoLayerStyles`]), zależnie od tego, co radar rozpoznał po przeciwnej stronie. Czeka na
+    /// decyzję klasy, więc wyjście dostaje 0,25 s opóźnienia.
+    PerLayer,
 }
 
 impl MonoCueStyle {
+    /// Style do wyboru dla jednej warstwy w stylu „Wg warstw”: bez wskazówki albo jeden ze
+    /// stylów kierunkowych.
+    pub const LAYER_CHOICES: &'static [Self] = &[
+        Self::Off,
+        Self::DirectionalBreath,
+        Self::BreathBuzz,
+        Self::DirectionalBuzz,
+        Self::DirectionalSqueaky,
+        Self::DirectionalBright,
+        Self::DirectionalComb,
+    ];
+
+    /// Style kanałowe, w kolejności przycisków w UI.
+    pub const CHANNEL: &'static [Self] = &[
+        Self::Off,
+        Self::Buzz,
+        Self::Squeaky,
+        Self::Tremolo,
+        Self::Bright,
+        Self::Comb,
+    ];
+
+    /// Style kierunkowe, w kolejności przycisków w UI.
+    pub const DIRECTIONAL: &'static [Self] = &[
+        Self::DirectionalBreath,
+        Self::BreathBuzz,
+        Self::DirectionalBuzz,
+        Self::DirectionalSqueaky,
+        Self::DirectionalBright,
+        Self::DirectionalComb,
+        Self::PerLayer,
+    ];
+
     pub const ALL: &'static [Self] = &[
         Self::Off,
         Self::Buzz,
         Self::Squeaky,
-        Self::Pulse,
-        Self::Muffled,
-        Self::Bright,
-        Self::Dark,
-        Self::Comb,
-        Self::Echo,
         Self::Tremolo,
-        Self::Notch,
-        Self::PitchWobble,
+        Self::Bright,
+        Self::Comb,
+        Self::DirectionalBreath,
+        Self::BreathBuzz,
+        Self::DirectionalBuzz,
+        Self::DirectionalSqueaky,
+        Self::DirectionalBright,
+        Self::DirectionalComb,
+        Self::PerLayer,
     ];
 
     pub fn label(self) -> &'static str {
@@ -740,16 +817,145 @@ impl MonoCueStyle {
             Self::Off => "Wyłączone",
             Self::Buzz => "Brzęczenie",
             Self::Squeaky => "Bardziej piskliwy",
-            Self::Pulse => "Pulsowanie",
-            Self::Muffled => "Stłumiony",
             Self::Bright => "Jasny",
-            Self::Dark => "Ciemny",
             Self::Comb => "Grzebień",
-            Self::Echo => "Odbicie",
             Self::Tremolo => "Oddech",
-            Self::Notch => "Wycięcie środka",
-            Self::PitchWobble => "Falowanie",
+            Self::DirectionalBreath => "Oddech kierunkowy",
+            Self::BreathBuzz => "Oddech + brzęczenie",
+            Self::DirectionalBuzz => "Brzęczenie kierunkowe",
+            Self::DirectionalSqueaky => "Piskliwy kierunkowy",
+            Self::DirectionalBright => "Jasny kierunkowy",
+            Self::DirectionalComb => "Grzebień kierunkowy",
+            Self::PerLayer => "Wg warstw",
         }
+    }
+
+    /// Styl sprowadzony do wyboru dozwolonego dla jednej warstwy ([`Self::LAYER_CHOICES`]):
+    /// styl kanałowy daje swoją wersję kierunkową, a „Wg warstw” daje brak wskazówki.
+    pub fn as_layer_choice(self) -> Self {
+        match self {
+            Self::Buzz => Self::DirectionalBuzz,
+            Self::Squeaky => Self::DirectionalSqueaky,
+            Self::Tremolo => Self::DirectionalBreath,
+            Self::Bright => Self::DirectionalBright,
+            Self::Comb => Self::DirectionalComb,
+            Self::PerLayer => Self::Off,
+            other => other,
+        }
+    }
+
+    /// Czy styl daje efekt tylko dźwiękowi z przeciwnej strony (a nie całemu kanałowi).
+    pub fn is_directional(self) -> bool {
+        Self::DIRECTIONAL.contains(&self)
+    }
+
+    /// Czy styl kierunkowy ma oddech i cieńszą barwę (suwaki głębokości i barwy).
+    pub fn uses_breath(self) -> bool {
+        matches!(self, Self::DirectionalBreath | Self::BreathBuzz)
+    }
+
+    /// Styl kanałowy, którego efekt wersja kierunkowa nakłada na dźwięk z przeciwnej strony.
+    /// Dla pozostałych stylów zwraca je same.
+    pub fn base_cue(self) -> Self {
+        match self {
+            Self::DirectionalBuzz => Self::Buzz,
+            Self::DirectionalSqueaky => Self::Squeaky,
+            Self::DirectionalBright => Self::Bright,
+            Self::DirectionalComb => Self::Comb,
+            other => other,
+        }
+    }
+
+    /// Styl z nazwy zapisanej w configu. Nazwy usuniętych stylów (`Pulse`, `Muffled`, `Dark`,
+    /// `Echo`, `Notch`, `PitchWobble`) i nieznane nazwy dają styl domyślny, żeby stary plik
+    /// wczytał się w całości, zamiast odrzucić wszystkie ustawienia.
+    pub fn from_config_name(name: &str) -> Self {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|style| style.config_name() == name)
+            .unwrap_or_default()
+    }
+
+    /// Nazwa stylu w configu (ta sama, którą zapisuje `serde::Serialize`).
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Buzz => "Buzz",
+            Self::Squeaky => "Squeaky",
+            Self::Bright => "Bright",
+            Self::Comb => "Comb",
+            Self::Tremolo => "Tremolo",
+            Self::DirectionalBreath => "DirectionalBreath",
+            Self::BreathBuzz => "BreathBuzz",
+            Self::DirectionalBuzz => "DirectionalBuzz",
+            Self::DirectionalSqueaky => "DirectionalSqueaky",
+            Self::DirectionalBright => "DirectionalBright",
+            Self::DirectionalComb => "DirectionalComb",
+            Self::PerLayer => "PerLayer",
+        }
+    }
+}
+
+/// Styl wskazówki dla każdej warstwy w stylu „Wg warstw” (`MonoCueStyle::PerLayer`). Domyślnie
+/// trzy różne faktury: grzebień (pusta barwa) dla strzałów, brzęczenie dla kroków (mieści kilka
+/// cykli w krótkim kroku) i oddech dla reszty (najlepszy dla dźwięków ciągłych).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MonoLayerStyles {
+    pub shots: MonoCueStyle,
+    pub steps: MonoCueStyle,
+    pub rest: MonoCueStyle,
+}
+
+impl Default for MonoLayerStyles {
+    fn default() -> Self {
+        Self {
+            shots: MonoCueStyle::DirectionalComb,
+            steps: MonoCueStyle::DirectionalBuzz,
+            rest: MonoCueStyle::DirectionalBreath,
+        }
+    }
+}
+
+impl MonoLayerStyles {
+    pub fn get(&self, layer: layers::Layer) -> MonoCueStyle {
+        match layer {
+            layers::Layer::Shots => self.shots,
+            layers::Layer::Steps => self.steps,
+            layers::Layer::Rest => self.rest,
+        }
+    }
+
+    pub fn get_mut(&mut self, layer: layers::Layer) -> &mut MonoCueStyle {
+        match layer {
+            layers::Layer::Shots => &mut self.shots,
+            layers::Layer::Steps => &mut self.steps,
+            layers::Layer::Rest => &mut self.rest,
+        }
+    }
+
+    /// Style w kolejności `layers::Layer::ALL`, każdy sprowadzony do dozwolonego wyboru
+    /// (patrz [`MonoCueStyle::as_layer_choice`]).
+    pub fn in_layer_order(&self) -> [MonoCueStyle; 3] {
+        layers::Layer::ALL.map(|layer| self.get(layer).as_layer_choice())
+    }
+
+    /// Czy któraś warstwa używa stylu z oddechem (suwaki głębokości i barwy w UI).
+    pub fn any_uses_breath(&self) -> bool {
+        self.in_layer_order().iter().any(|s| s.uses_breath())
+    }
+
+    /// Czy któraś warstwa używa „Oddech + brzęczenie” (suwak siły brzęczenia w UI).
+    pub fn any_uses_breath_buzz(&self) -> bool {
+        self.in_layer_order().contains(&MonoCueStyle::BreathBuzz)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MonoCueStyle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(Self::from_config_name(&name))
     }
 }
 
@@ -869,8 +1075,9 @@ const MONO_RING_CAPACITY: usize = 65_536;
 /// Z włączoną zmianą głośności klas używamy [`CLASS_GAIN_LATENCY_SAMPLES`].
 const TARGET_RING_LATENCY_SAMPLES: usize = 2_400;
 
-/// Opóźnienie wyjścia z włączoną zmianą głośności klas (0,25 s przy 48 kHz). Tyle trwa
-/// klasyfikacja zdarzenia (ok. 0,15 s) plus zapas, żeby zmiana zdążyła przed początkiem dźwięku.
+/// Opóźnienie wyjścia z włączoną zmianą głośności klas albo stylem wskazówki „Wg warstw”
+/// (0,25 s przy 48 kHz). Tyle trwa klasyfikacja zdarzenia (ok. 0,15 s, patrz
+/// `layers::LayerTracker::take_ready`) plus zapas, żeby zmiana zdążyła przed początkiem dźwięku.
 const CLASS_GAIN_LATENCY_SAMPLES: usize = 12_000;
 
 /// Próg, po przekroczeniu którego bufor jest od razu przycinany z powrotem do
@@ -885,6 +1092,30 @@ const CLASS_GAIN_LATENCY_SAMPLES: usize = 12_000;
 /// dryfu. ~150 ms przy 48 kHz — trzykrotność celu, żeby nie przycinać przy
 /// zwykłym, chwilowym jitterze.
 const RING_TRIM_FACTOR: usize = 3;
+
+/// Zapas ponad docelowe opóźnienie, po którego przekroczeniu bufor jest przycinany (patrz
+/// [`RING_TRIM_FACTOR`]). Stały, a nie proporcjonalny do celu: przy zwykłym celu daje ten sam
+/// próg co dawniej (trzykrotność, ok. 150 ms), a przy celu 0,25 s trzyma opóźnienie poniżej
+/// ok. 0,35 s zamiast pozwalać mu rosnąć do 0,75 s.
+const RING_TRIM_MARGIN_SAMPLES: usize = TARGET_RING_LATENCY_SAMPLES * (RING_TRIM_FACTOR - 1);
+
+/// Styl „Wg warstw”: jak długo po początku zdarzenia trzymamy styl jego warstwy (0,3 s przy
+/// 48 kHz). Kroki w biegu są co ok. 0,25–0,35 s, więc styl kroków trwa przez cały bieg.
+const LAYER_STYLE_HOLD_FRAMES: u64 = 14_400;
+/// Styl warstwy włącza się tyle przed początkiem zdarzenia (5 ms), żeby płynne przejście
+/// zdążyło przed uderzeniem.
+const LAYER_STYLE_LOOKAHEAD_FRAMES: u64 = 240;
+/// Najwięcej zdarzeń warstw czekających na wyjście; starsze odrzucamy.
+const MAX_LAYER_EVENTS: usize = 64;
+
+/// Warstwa dźwięku, który gra w danej ramce po każdej stronie, z klasyfikacji radaru. Zasila
+/// styl wskazówki „Wg warstw” (`MonoCueStyle::PerLayer`). `None` = brak rozpoznanego zdarzenia
+/// po tej stronie (dźwięk ze środka nie trafia na żadną stronę).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SideLayers {
+    pub(crate) left: Option<layers::Layer>,
+    pub(crate) right: Option<layers::Layer>,
+}
 
 /// Domyślna zmiana głośności na słuchawkach w trybie mono (dB): strzały i wybuchy o tyle ciszej,
 /// kroki o tyle głośniej. Suwak w panelu ustawia wartość z zakresu 0–12 dB.
@@ -950,6 +1181,18 @@ struct MonoRing {
     /// Docelowa zmiana Scout w dB dla każdej ramki w kolejce, równolegle do `frames`. Liczona
     /// przy wejściu, więc odczyt widzi ją z wyprzedzeniem.
     scout_targets: VecDeque<f32>,
+    /// Czy po podniesieniu celu opóźnienia czekamy, aż bufor się do niego dopełni. Bez tego
+    /// opóźnienie zostawałoby krótkie (cel tylko przycina bufor), a decyzja klasy przychodziłaby
+    /// już po początku dźwięku.
+    priming: bool,
+    /// Czy styl „Wg warstw” jest włączony (zbieramy zdarzenia warstw i znaczniki ramek).
+    layer_styles_enabled: bool,
+    /// Zdarzenia warstw: (numer ramki początku, warstwa, strona: 0 = lewa, 1 = prawa), od najstarszego.
+    layer_events: VecDeque<(u64, layers::Layer, usize)>,
+    /// Bieżące zdarzenie po każdej stronie: (numer ramki początku, warstwa).
+    layer_active: [Option<(u64, layers::Layer)>; 2],
+    /// Znaczniki ostatnio odczytanej ramki, powtarzane, gdy bufor na chwilę wyschnie.
+    last_layers: SideLayers,
 }
 
 impl Default for MonoRing {
@@ -968,11 +1211,59 @@ impl Default for MonoRing {
             scout_env: 0.0,
             scout_gain: 1.0,
             scout_targets: VecDeque::new(),
+            priming: false,
+            layer_styles_enabled: false,
+            layer_events: VecDeque::new(),
+            layer_active: [None; 2],
+            last_layers: SideLayers::default(),
         }
     }
 }
 
 impl MonoRing {
+    /// Ustawia cel opóźnienia: długi, gdy działa zmiana głośności klas albo styl „Wg warstw”
+    /// (obie czekają na decyzję klasy), krótki w przeciwnym razie. Po podniesieniu celu odczyt
+    /// czeka, aż bufor się dopełni (patrz [`Self::priming`]).
+    fn update_target_latency(&mut self) {
+        let wanted = if self.class_gain_enabled || self.layer_styles_enabled {
+            CLASS_GAIN_LATENCY_SAMPLES
+        } else {
+            TARGET_RING_LATENCY_SAMPLES
+        };
+        if wanted > self.target_samples && self.frames.len() < wanted {
+            self.priming = true;
+        } else if wanted < self.target_samples {
+            self.priming = false;
+        }
+        self.target_samples = wanted;
+    }
+
+    /// Warstwy grające po obu stronach w ramce `front_index`, dla stylu „Wg warstw”. Zdarzenie
+    /// zaczyna działać [`LAYER_STYLE_LOOKAHEAD_FRAMES`] przed swoim początkiem i trwa
+    /// [`LAYER_STYLE_HOLD_FRAMES`] albo do następnego zdarzenia po tej samej stronie.
+    fn next_layers(&mut self) -> SideLayers {
+        if !self.layer_styles_enabled {
+            self.last_layers = SideLayers::default();
+            return self.last_layers;
+        }
+        let frame = self.front_index;
+        while let Some(&(onset, layer, side)) = self.layer_events.front() {
+            if onset > frame + LAYER_STYLE_LOOKAHEAD_FRAMES {
+                break;
+            }
+            self.layer_events.pop_front();
+            self.layer_active[side] = Some((onset, layer));
+        }
+        let current = |active: Option<(u64, layers::Layer)>| {
+            active.filter(|&(onset, _)| frame < onset + LAYER_STYLE_HOLD_FRAMES).map(|(_, layer)| layer)
+        };
+        self.last_layers = SideLayers {
+            left: current(self.layer_active[0]),
+            right: current(self.layer_active[1]),
+        };
+        self.last_layers
+    }
+
     /// Mnożnik głośności dla ramki o numerze `front_index`, z wygładzeniem narastania i powrotu.
     fn next_gain(&mut self) -> f32 {
         if !self.class_gain_enabled {
@@ -1064,7 +1355,7 @@ pub struct SharedAudioAnalysis {
     /// `host.input_devices()`, więc lookup zawsze się nie powodził i routing
     /// w ogóle nie startował (błąd widoczny tylko w konsoli, niewidoczny w UI).
     mono_ring: Arc<Mutex<MonoRing>>,
-    /// Ostatnia próbka realnie zdjęta z `mono_ring` przez [`Self::read_stereo_pan`]
+    /// Ostatnia próbka realnie zdjęta z `mono_ring` przez [`Self::read_stereo_pan_tagged`]
     /// — trzymana, żeby przy podkręceniu bufora (patrz tam) powtórzyć ją
     /// zamiast wstawiać twarde zero.
     last_pan: Arc<Mutex<(f32, f32)>>,
@@ -1146,7 +1437,7 @@ impl SharedAudioAnalysis {
                 ring.frames.push_back(s);
                 ring.scout_targets.push_back(db);
             }
-            if ring.frames.len() > ring.target_samples * RING_TRIM_FACTOR {
+            if ring.frames.len() > ring.target_samples + RING_TRIM_MARGIN_SAMPLES {
                 let excess = ring.frames.len() - ring.target_samples;
                 for _ in 0..excess {
                     ring.frames.pop_front();
@@ -1167,11 +1458,59 @@ impl SharedAudioAnalysis {
                 return;
             }
             ring.class_gain_enabled = enabled;
-            ring.target_samples = if enabled { CLASS_GAIN_LATENCY_SAMPLES } else { TARGET_RING_LATENCY_SAMPLES };
+            ring.update_target_latency();
             if !enabled {
                 ring.class_gains.clear();
                 ring.current_event = None;
                 ring.gain = 1.0;
+            }
+        }
+    }
+
+    /// Włącza albo wyłącza zbieranie zdarzeń warstw dla stylu wskazówki „Wg warstw”. Tak jak
+    /// zmiana głośności klas wymaga opóźnienia [`CLASS_GAIN_LATENCY_SAMPLES`], żeby styl warstwy
+    /// zdążył przed początkiem dźwięku.
+    pub(crate) fn set_mono_layer_styles(&self, enabled: bool) {
+        if let Ok(mut ring) = self.mono_ring.lock() {
+            if ring.layer_styles_enabled == enabled {
+                return;
+            }
+            ring.layer_styles_enabled = enabled;
+            ring.update_target_latency();
+            if !enabled {
+                ring.layer_events.clear();
+                ring.layer_active = [None; 2];
+                ring.last_layers = SideLayers::default();
+            }
+        }
+    }
+
+    /// Zapisuje zdarzenia warstw dla stylu „Wg warstw”, z numerem ramki początku (jak
+    /// [`Self::push_class_gains`]) i stroną. Zdarzenie bliżej środka niż martwa strefa
+    /// rozdzielania kierunkowego (ok. 1,5 dB różnicy L/P) nie trafia na żadną stronę.
+    pub(crate) fn push_layer_events(&self, hits: &[layers::LayerHit], sample_rate: f32) {
+        if hits.is_empty() {
+            return;
+        }
+        if let Ok(mut ring) = self.mono_ring.lock() {
+            if !ring.layer_styles_enabled {
+                return;
+            }
+            let dead_zone = 10f32.powf(crate::sound::directional::ILD_DEAD_ZONE_DB / 20.0);
+            let min_pan = layers::pan_from_rms(1.0, dead_zone);
+            for hit in hits {
+                let side = if hit.pan >= min_pan {
+                    1
+                } else if hit.pan <= -min_pan {
+                    0
+                } else {
+                    continue;
+                };
+                let frame = (hit.onset_s * f64::from(sample_rate)).round().max(0.0) as u64;
+                ring.layer_events.push_back((frame, hit.layer, side));
+            }
+            while ring.layer_events.len() > MAX_LAYER_EVENTS {
+                ring.layer_events.pop_front();
             }
         }
     }
@@ -1222,22 +1561,36 @@ impl SharedAudioAnalysis {
     /// klatkę — jedna-dwie powtórzone próbki są niesłyszalne (zero-order
     /// hold), a przy dłuższym zaniku (przechwytywanie faktycznie stoi) i tak
     /// płynnie spada do ciszy zamiast zapętlać się w nieskończoność.
-    pub(crate) fn read_stereo_pan(&self, count: usize) -> Vec<(f32, f32)> {
+    ///
+    /// Do każdej ramki dokłada warstwy grające w niej po obu stronach (patrz [`SideLayers`]),
+    /// dla stylu wskazówki „Wg warstw”.
+    ///
+    /// Po podniesieniu celu opóźnienia (zmiana głośności klas albo styl „Wg warstw”) odczyt
+    /// najpierw czeka, aż bufor dopełni się do celu, i do tego czasu powtarza wygaszaną ostatnią
+    /// próbkę, tak jak przy wyschnięciu bufora. To jednorazowa przerwa przy przełączeniu.
+    pub(crate) fn read_stereo_pan_tagged(&self, count: usize) -> (Vec<(f32, f32)>, Vec<SideLayers>) {
         const HOLD_DECAY: f32 = 0.999;
         let mut out = Vec::with_capacity(count);
+        let mut tags = Vec::with_capacity(count);
         let mut last = self.last_pan.lock().map(|g| *g).unwrap_or((0.0, 0.0));
         if let Ok(mut ring) = self.mono_ring.lock() {
+            if ring.priming && ring.frames.len() >= ring.target_samples {
+                ring.priming = false;
+            }
             for _ in 0..count {
-                let sample = match ring.frames.pop_front() {
+                let popped = if ring.priming { None } else { ring.frames.pop_front() };
+                let sample = match popped {
                     Some(s) => {
                         last = s;
                         let gain = ring.next_gain();
+                        tags.push(ring.next_layers());
                         ring.front_index += 1;
                         let own_db = ring.scout_targets.pop_front().unwrap_or(0.0);
                         ring.scout_apply(s.0 * gain, s.1 * gain, own_db)
                     }
                     None => {
                         last = (last.0 * HOLD_DECAY, last.1 * HOLD_DECAY);
+                        tags.push(ring.last_layers);
                         let mult = ring.gain * ring.scout_gain;
                         (last.0 * mult, last.1 * mult)
                     }
@@ -1246,11 +1599,18 @@ impl SharedAudioAnalysis {
             }
         } else {
             out.resize(count, (0.0, 0.0));
+            tags.resize(count, SideLayers::default());
         }
         if let Ok(mut guard) = self.last_pan.lock() {
             *guard = last;
         }
-        out
+        (out, tags)
+    }
+
+    /// Same próbki z [`Self::read_stereo_pan_tagged`], bez znaczników warstw (do testów).
+    #[cfg(test)]
+    pub(crate) fn read_stereo_pan(&self, count: usize) -> Vec<(f32, f32)> {
+        self.read_stereo_pan_tagged(count).0
     }
 
     /// Czy logger próbek (`sample_logger::SampleLogger`) jest aktualnie
@@ -1642,8 +2002,10 @@ pub(crate) fn update_analysis(
         (tracker.take_ready(), accepted)
     };
 
-    // Zmiana głośności w trybie mono: strzały ciszej, kroki głośniej (patrz `push_class_gains`).
+    // Zmiana głośności w trybie mono: strzały ciszej, kroki głośniej (patrz `push_class_gains`),
+    // i styl wskazówki „Wg warstw” (patrz `push_layer_events`).
     analysis.push_class_gains(&layer_hits, sample_rate);
+    analysis.push_layer_events(&layer_hits, sample_rate);
 
     // Wskaźniki kierunku i kroki idą z tego samego, szybkiego detektora kanałów.
     let direction_events: Vec<DirectionEvent> = channel_activity
@@ -1857,6 +2219,73 @@ mod tests {
         value.as_object_mut().unwrap().remove("speaker_setup");
         let cfg: RadarConfig = serde_json::from_value(value).unwrap();
         assert_eq!(cfg.speaker_setup, SpeakerSetup::Stereo);
+    }
+
+    #[test]
+    fn removed_cue_styles_load_as_default_without_dropping_other_settings() {
+        for name in ["Pulse", "Muffled", "Dark", "Echo", "Notch", "PitchWobble", "Nieznany"] {
+            let mut value = serde_json::to_value(RadarConfig { radius: 77.0, ..RadarConfig::default() }).unwrap();
+            value["mono_cue_style"] = serde_json::Value::String(name.into());
+            let cfg: RadarConfig = serde_json::from_value(value).unwrap();
+            assert_eq!(cfg.mono_cue_style, MonoCueStyle::default(), "{name}");
+            assert_eq!(cfg.radius, 77.0, "{name}: reszta ustawień ma zostać");
+        }
+    }
+
+    #[test]
+    fn every_cue_style_survives_json_round_trip() {
+        // Nazwy z `from_config_name` muszą zgadzać się z tym, co zapisuje `Serialize`.
+        for &style in MonoCueStyle::ALL {
+            let json = serde_json::to_string(&style).unwrap();
+            let back: MonoCueStyle = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, style, "{json}");
+        }
+    }
+
+    #[test]
+    fn layer_styles_load_with_defaults_and_fall_back_to_allowed_choices() {
+        // Stary plik bez pola: domyślne style warstw.
+        let mut value = serde_json::to_value(RadarConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("mono_layer_styles");
+        let cfg: RadarConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.mono_layer_styles, MonoLayerStyles::default());
+
+        // Tylko jedna warstwa w pliku: reszta z wartości domyślnych.
+        let mut value = serde_json::to_value(RadarConfig::default()).unwrap();
+        value["mono_layer_styles"] = serde_json::json!({ "steps": "BreathBuzz" });
+        let cfg: RadarConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.mono_layer_styles.steps, MonoCueStyle::BreathBuzz);
+        assert_eq!(cfg.mono_layer_styles.shots, MonoLayerStyles::default().shots);
+
+        // Styl spoza listy dla warstwy: kanałowy daje kierunkowy, „Wg warstw” daje brak wskazówki.
+        let styles = MonoLayerStyles {
+            shots: MonoCueStyle::Buzz,
+            steps: MonoCueStyle::PerLayer,
+            rest: MonoCueStyle::Tremolo,
+        };
+        assert_eq!(
+            styles.in_layer_order(),
+            [MonoCueStyle::DirectionalBuzz, MonoCueStyle::Off, MonoCueStyle::DirectionalBreath]
+        );
+        for &style in MonoCueStyle::ALL {
+            assert!(MonoCueStyle::LAYER_CHOICES.contains(&style.as_layer_choice()), "{style:?}");
+        }
+    }
+
+    #[test]
+    fn cue_style_groups_cover_every_style_exactly_once() {
+        let grouped: Vec<MonoCueStyle> =
+            MonoCueStyle::CHANNEL.iter().chain(MonoCueStyle::DIRECTIONAL).copied().collect();
+        assert_eq!(grouped.len(), MonoCueStyle::ALL.len());
+        for style in MonoCueStyle::ALL {
+            assert_eq!(grouped.iter().filter(|s| *s == style).count(), 1, "{style:?}");
+        }
+        for &style in MonoCueStyle::DIRECTIONAL {
+            assert!(style.is_directional(), "{style:?}");
+            if !style.uses_breath() && style != MonoCueStyle::PerLayer {
+                assert!(MonoCueStyle::CHANNEL.contains(&style.base_cue()), "{style:?}: efekt stylu kanałowego");
+            }
+        }
     }
 
     #[test]
@@ -2112,7 +2541,7 @@ mod tests {
         // Strzał: 0,5 ciszej po zdarzeniu (ok. −6 dB), a przed nim bez zmian.
         let quiet = SharedAudioAnalysis::new();
         quiet.set_mono_class_gain(true, MONO_CLASS_GAIN_DB_DEFAULT);
-        quiet.push_stereo_pan(&vec![(0.5, 0.5); 4_000]);
+        quiet.push_stereo_pan(&vec![(0.5, 0.5); CLASS_GAIN_LATENCY_SAMPLES + 4_000]);
         quiet.push_class_gains(&[class_hit(layers::Layer::Shots, 0.01)], 48_000.0); // ramka 480
         let out = quiet.read_stereo_pan(3_000);
         assert_eq!(out[100], (0.5, 0.5), "przed zdarzeniem bez zmian");
@@ -2121,7 +2550,7 @@ mod tests {
         // Krok: głośniej po zdarzeniu (ok. +6 dB).
         let loud = SharedAudioAnalysis::new();
         loud.set_mono_class_gain(true, MONO_CLASS_GAIN_DB_DEFAULT);
-        loud.push_stereo_pan(&vec![(0.3, 0.3); 4_000]);
+        loud.push_stereo_pan(&vec![(0.3, 0.3); CLASS_GAIN_LATENCY_SAMPLES + 4_000]);
         loud.push_class_gains(&[class_hit(layers::Layer::Steps, 0.01)], 48_000.0);
         let out = loud.read_stereo_pan(3_000);
         assert!(out[2_000].0 > 0.55, "krok ok. +6 dB: {}", out[2_000].0);
@@ -2175,7 +2604,7 @@ mod tests {
         // Suwak 12 dB: strzał ok. 0,5 × 10^(−12/20) ≈ 0,125.
         let analysis = SharedAudioAnalysis::new();
         analysis.set_mono_class_gain(true, 12.0);
-        analysis.push_stereo_pan(&vec![(0.5, 0.5); 4_000]);
+        analysis.push_stereo_pan(&vec![(0.5, 0.5); CLASS_GAIN_LATENCY_SAMPLES + 4_000]);
         analysis.push_class_gains(&[class_hit(layers::Layer::Shots, 0.01)], 48_000.0);
         let out = analysis.read_stereo_pan(3_000);
         assert!((out[2_000].0 - 0.126).abs() < 0.02, "strzał przy 12 dB: {}", out[2_000].0);
@@ -2201,6 +2630,76 @@ mod tests {
             ring.front_index += 1;
         }
         assert!(last > 0.95, "po wygaśnięciu zdarzenia głośność wraca do pełnej: {last}");
+    }
+
+    fn side_hit(layer: layers::Layer, onset_s: f64, pan: f32) -> layers::LayerHit {
+        layers::LayerHit { pan, ..class_hit(layer, onset_s) }
+    }
+
+    #[test]
+    fn layer_events_tag_the_side_they_came_from() {
+        let analysis = SharedAudioAnalysis::new();
+        analysis.set_mono_layer_styles(true);
+        analysis.push_stereo_pan(&vec![(0.1, 0.1); CLASS_GAIN_LATENCY_SAMPLES]);
+        analysis.push_layer_events(
+            &[
+                side_hit(layers::Layer::Steps, 0.1, 0.8),  // ramka 4 800, prawa
+                side_hit(layers::Layer::Shots, 0.2, -0.8), // ramka 9 600, lewa
+                side_hit(layers::Layer::Shots, 0.3, 0.0),  // środek: bez strony
+            ],
+            48_000.0,
+        );
+        // Wejście i wyjście po tyle samo, jak w prawdziwym strumieniu: opóźnienie stoi na 0,25 s.
+        let mut tags = Vec::new();
+        for _ in 0..40 {
+            analysis.push_stereo_pan(&[(0.1, 0.1); 1_000]);
+            tags.extend(analysis.read_stereo_pan_tagged(1_000).1);
+        }
+        let lookahead = LAYER_STYLE_LOOKAHEAD_FRAMES as usize;
+        let hold = LAYER_STYLE_HOLD_FRAMES as usize;
+        assert_eq!(tags[4_800 - lookahead - 1].right, None, "przed zdarzeniem nic");
+        assert_eq!(tags[4_800 - lookahead].right, Some(layers::Layer::Steps), "styl rusza 5 ms przed zdarzeniem");
+        assert_eq!(tags[4_800 + hold - 1].right, Some(layers::Layer::Steps));
+        assert_eq!(tags[4_800 + hold].right, None, "po czasie trzymania styl wraca do reszty");
+        assert_eq!(tags[10_000].left, Some(layers::Layer::Shots), "strzał z lewej oznacza lewą stronę");
+        assert!(tags.iter().all(|t| t.right != Some(layers::Layer::Shots)), "strzał ze środka nie trafia na stronę");
+    }
+
+    #[test]
+    fn layer_events_are_ignored_while_the_per_layer_style_is_off() {
+        let analysis = SharedAudioAnalysis::new();
+        analysis.push_stereo_pan(&vec![(0.1, 0.1); 20_000]);
+        analysis.push_layer_events(&[side_hit(layers::Layer::Steps, 0.01, 0.9)], 48_000.0);
+        let (_, tags) = analysis.read_stereo_pan_tagged(10_000);
+        assert!(tags.iter().all(|t| *t == SideLayers::default()));
+    }
+
+    #[test]
+    fn raising_the_latency_waits_until_the_buffer_holds_it() {
+        // Bez dopełnienia opóźnienie zostałoby krótkie, a decyzja klasy (ok. 0,15 s po
+        // początku dźwięku) przychodziłaby za późno.
+        let analysis = SharedAudioAnalysis::new();
+        analysis.push_stereo_pan(&vec![(0.2, 0.2); TARGET_RING_LATENCY_SAMPLES]);
+        analysis.set_mono_layer_styles(true);
+        let waiting = analysis.read_stereo_pan(1_000);
+        assert!(waiting.iter().all(|s| s.0 < 0.2), "czeka na dopełnienie, zamiast grać od razu");
+        assert_eq!(analysis.mono_ring.lock().unwrap().frames.len(), TARGET_RING_LATENCY_SAMPLES, "nic nie zdjęte");
+        analysis.push_stereo_pan(&vec![(0.5, 0.5); CLASS_GAIN_LATENCY_SAMPLES]);
+        let playing = analysis.read_stereo_pan(10);
+        assert!(playing.iter().all(|&s| s == (0.2, 0.2)), "po dopełnieniu gra od najstarszej próbki");
+        let buffered = analysis.mono_ring.lock().unwrap().frames.len();
+        assert!(buffered >= CLASS_GAIN_LATENCY_SAMPLES, "w buforze zostaje całe opóźnienie: {buffered}");
+    }
+
+    #[test]
+    fn long_latency_buffer_stays_below_the_trim_limit() {
+        let analysis = SharedAudioAnalysis::new();
+        analysis.set_mono_class_gain(true, MONO_CLASS_GAIN_DB_DEFAULT);
+        for _ in 0..100 {
+            analysis.push_stereo_pan(&[(0.1, 0.1); 500]);
+        }
+        let len = analysis.mono_ring.lock().unwrap().frames.len();
+        assert!(len <= CLASS_GAIN_LATENCY_SAMPLES + RING_TRIM_MARGIN_SAMPLES, "opóźnienie do ok. 0,35 s, jest {len}");
     }
 
     #[test]
