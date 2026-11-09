@@ -900,13 +900,29 @@ impl MonoCueStyle {
 /// Styl wskazówki dla każdej warstwy w stylu „Wg warstw” (`MonoCueStyle::PerLayer`). Domyślnie
 /// trzy różne faktury: grzebień (pusta barwa) dla strzałów, brzęczenie dla kroków (mieści kilka
 /// cykli w krótkim kroku) i oddech dla reszty (najlepszy dla dźwięków ciągłych).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// Każda warstwa ma też głośność (dB, [`MONO_LAYER_VOLUME_DB_MIN`]..[`MONO_LAYER_VOLUME_DB_MAX`])
+/// i intensywność wskazówki (0–1: 0 = bez efektu, 1 = pełny efekt stylu). Obie dotyczą tylko
+/// dźwięku z przeciwnej strony rozpoznanego jako ta warstwa. Domyślnie 0 dB i 100 %, czyli bez
+/// zmian. Plik zapisany przed tymi polami wczytuje się z wartościami domyślnymi.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct MonoLayerStyles {
     pub shots: MonoCueStyle,
     pub steps: MonoCueStyle,
     pub rest: MonoCueStyle,
+    pub shots_volume_db: f32,
+    pub steps_volume_db: f32,
+    pub rest_volume_db: f32,
+    pub shots_intensity: f32,
+    pub steps_intensity: f32,
+    pub rest_intensity: f32,
 }
+
+/// Zakres głośności warstwy w stylu „Wg warstw” (dB). W dół więcej niż w górę: ściszenie
+/// głośnych strzałów nie grozi przesterowaniem, a podbicie powyżej 12 dB już tak.
+pub const MONO_LAYER_VOLUME_DB_MIN: f32 = -18.0;
+pub const MONO_LAYER_VOLUME_DB_MAX: f32 = 12.0;
 
 impl Default for MonoLayerStyles {
     fn default() -> Self {
@@ -914,11 +930,46 @@ impl Default for MonoLayerStyles {
             shots: MonoCueStyle::DirectionalComb,
             steps: MonoCueStyle::DirectionalBuzz,
             rest: MonoCueStyle::DirectionalBreath,
+            shots_volume_db: 0.0,
+            steps_volume_db: 0.0,
+            rest_volume_db: 0.0,
+            shots_intensity: 1.0,
+            steps_intensity: 1.0,
+            rest_intensity: 1.0,
         }
     }
 }
 
 impl MonoLayerStyles {
+    /// Głośność warstwy (dB), do suwaka w UI.
+    pub fn volume_db_mut(&mut self, layer: layers::Layer) -> &mut f32 {
+        match layer {
+            layers::Layer::Shots => &mut self.shots_volume_db,
+            layers::Layer::Steps => &mut self.steps_volume_db,
+            layers::Layer::Rest => &mut self.rest_volume_db,
+        }
+    }
+
+    /// Intensywność wskazówki warstwy (0–1), do suwaka w UI.
+    pub fn intensity_mut(&mut self, layer: layers::Layer) -> &mut f32 {
+        match layer {
+            layers::Layer::Shots => &mut self.shots_intensity,
+            layers::Layer::Steps => &mut self.steps_intensity,
+            layers::Layer::Rest => &mut self.rest_intensity,
+        }
+    }
+
+    /// Głośności w kolejności `layers::Layer::ALL`, przycięte do dozwolonego zakresu (dB).
+    pub fn volume_db_in_layer_order(&self) -> [f32; 3] {
+        [self.shots_volume_db, self.steps_volume_db, self.rest_volume_db]
+            .map(|db| db.clamp(MONO_LAYER_VOLUME_DB_MIN, MONO_LAYER_VOLUME_DB_MAX))
+    }
+
+    /// Intensywności w kolejności `layers::Layer::ALL`, przycięte do 0–1.
+    pub fn intensity_in_layer_order(&self) -> [f32; 3] {
+        [self.shots_intensity, self.steps_intensity, self.rest_intensity].map(|v| v.clamp(0.0, 1.0))
+    }
+
     pub fn get(&self, layer: layers::Layer) -> MonoCueStyle {
         match layer {
             layers::Layer::Shots => self.shots,
@@ -2256,12 +2307,26 @@ mod tests {
         let cfg: RadarConfig = serde_json::from_value(value).unwrap();
         assert_eq!(cfg.mono_layer_styles.steps, MonoCueStyle::BreathBuzz);
         assert_eq!(cfg.mono_layer_styles.shots, MonoLayerStyles::default().shots);
+        // Zapis sprzed głośności i intensywności warstw: bez zmian (0 dB, 100 %).
+        assert_eq!(cfg.mono_layer_styles.volume_db_in_layer_order(), [0.0; 3]);
+        assert_eq!(cfg.mono_layer_styles.intensity_in_layer_order(), [1.0; 3]);
+
+        // Wartości spoza zakresu są przycinane.
+        let wild = MonoLayerStyles {
+            shots_volume_db: -40.0,
+            steps_volume_db: 30.0,
+            rest_intensity: 2.0,
+            ..MonoLayerStyles::default()
+        };
+        assert_eq!(wild.volume_db_in_layer_order(), [MONO_LAYER_VOLUME_DB_MIN, MONO_LAYER_VOLUME_DB_MAX, 0.0]);
+        assert_eq!(wild.intensity_in_layer_order(), [1.0, 1.0, 1.0]);
 
         // Styl spoza listy dla warstwy: kanałowy daje kierunkowy, „Wg warstw” daje brak wskazówki.
         let styles = MonoLayerStyles {
             shots: MonoCueStyle::Buzz,
             steps: MonoCueStyle::PerLayer,
             rest: MonoCueStyle::Tremolo,
+            ..MonoLayerStyles::default()
         };
         assert_eq!(
             styles.in_layer_order(),

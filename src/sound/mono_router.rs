@@ -45,7 +45,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
-use crate::sound::devices::{MonoCueStyle, MonoEar, SharedAudioAnalysis, SideLayers};
+use crate::sound::devices::{MonoCueStyle, MonoEar, MonoLayerStyles, SharedAudioAnalysis, SideLayers};
 use crate::sound::directional::{self, DirectionalSplit, Opposite, SplitSample};
 use crate::sound::layers::Layer;
 
@@ -397,6 +397,10 @@ struct OutputSettings {
     /// Styl „Wg warstw”: styl dla strzałów, kroków i reszty (kolejność `layers::Layer::ALL`),
     /// każdy z [`MonoCueStyle::LAYER_CHOICES`].
     layer_styles: [MonoCueStyle; 3],
+    /// Styl „Wg warstw”: głośność każdej warstwy (mnożnik liniowy) i intensywność wskazówki
+    /// (0–1: udział efektu względem czystego dźwięku), w tej samej kolejności.
+    layer_gains: [f32; 3],
+    layer_intensity: [f32; 3],
 }
 
 impl OutputSettings {
@@ -411,7 +415,9 @@ impl OutputSettings {
             breath_timbre: directional::DEFAULT_TIMBRE,
             buzz_depth: directional::DEFAULT_BUZZ_DEPTH,
             buzz_makeup: am_makeup(directional::DEFAULT_BUZZ_DEPTH),
-            layer_styles: crate::sound::devices::MonoLayerStyles::default().in_layer_order(),
+            layer_styles: MonoLayerStyles::default().in_layer_order(),
+            layer_gains: [1.0; 3],
+            layer_intensity: [1.0; 3],
         }
     }
 
@@ -424,9 +430,11 @@ impl OutputSettings {
         self
     }
 
-    /// Ustawia style warstw dla stylu „Wg warstw”.
-    fn with_layer_styles(mut self, styles: [MonoCueStyle; 3]) -> Self {
-        self.layer_styles = styles.map(MonoCueStyle::as_layer_choice);
+    /// Ustawia style, głośności i intensywności warstw dla stylu „Wg warstw”.
+    fn with_layers(mut self, layers: &MonoLayerStyles) -> Self {
+        self.layer_styles = layers.in_layer_order();
+        self.layer_gains = layers.volume_db_in_layer_order().map(db_to_linear);
+        self.layer_intensity = layers.intensity_in_layer_order();
         self
     }
 
@@ -588,7 +596,7 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
         breath_depth: f32,
         breath_timbre: f32,
         buzz_depth: f32,
-        layer_styles: [MonoCueStyle; 3],
+        layers: MonoLayerStyles,
     }
     let s = analysis
         .lock()
@@ -606,7 +614,7 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
                 breath_depth: c.mono_breath_depth,
                 breath_timbre: c.mono_breath_timbre,
                 buzz_depth: c.mono_buzz_depth,
-                layer_styles: c.mono_layer_styles.in_layer_order(),
+                layers: c.mono_layer_styles,
             }
         })
         .unwrap_or(Snapshot {
@@ -621,7 +629,7 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
             breath_depth: directional::DEFAULT_DEPTH,
             breath_timbre: directional::DEFAULT_TIMBRE,
             buzz_depth: directional::DEFAULT_BUZZ_DEPTH,
-            layer_styles: crate::sound::devices::MonoLayerStyles::default().in_layer_order(),
+            layers: MonoLayerStyles::default(),
         });
     // Przełączniki i siły idą do bufora; zastosują się od następnego callbacku.
     analysis.set_mono_class_gain(s.class_gain, s.class_gain_db);
@@ -629,7 +637,7 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
     analysis.set_mono_layer_styles(s.cue_style == MonoCueStyle::PerLayer);
     OutputSettings::new(s.ear, db_to_linear(s.boost_db), s.cue_style, s.tone_db)
         .with_breath(s.breath_depth, s.breath_timbre, s.buzz_depth)
-        .with_layer_styles(s.layer_styles)
+        .with_layers(&s.layers)
 }
 
 // ── Wypełnianie bufora wyjściowego ───────────────────────────────────────────
@@ -643,8 +651,8 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
 /// (opóźnienie o okno FFT, ok. 11 ms).
 ///
 /// „Wg warstw” wybiera efekt z `tags`: warstwa rozpoznana po przeciwnej stronie (strzały,
-/// kroki) dostaje swój styl, a gdy nic nie rozpoznano, obowiązuje styl reszty. Przejścia są
-/// płynne ([`LAYER_FADE_MS`]).
+/// kroki) dostaje swój styl, głośność i intensywność, a gdy nic nie rozpoznano, obowiązują
+/// ustawienia reszty. Przejścia są płynne ([`LAYER_FADE_MS`]).
 #[inline]
 fn mix_for_ear(
     left: f32,
@@ -680,7 +688,9 @@ fn mix_for_ear(
         cue_state.layer_weights[slot] += (target - cue_state.layer_weights[slot]) * fade;
         let effect =
             directional_effect(settings.layer_styles[slot], split, settings, sample_rate, &mut cue_state.layer_effects[slot]);
-        marked += cue_state.layer_weights[slot] * effect;
+        // Intensywność miesza efekt z czystym dźwiękiem z przeciwnej strony, głośność mnoży całość.
+        let blended = split.part + settings.layer_intensity[slot] * (effect - split.part);
+        marked += cue_state.layer_weights[slot] * settings.layer_gains[slot] * blended;
     }
     split.rest + marked
 }
@@ -1089,12 +1099,49 @@ mod tests {
     /// (strzały: grzebień, kroki: brzęczenie, reszta: oddech). W drugiej sekundzie znacznik kroków
     /// stoi po stronie wybranej przez `tag`.
     fn run_per_layer(tag: fn(Option<Layer>) -> SideLayers) -> Vec<f32> {
+        run_per_layer_with(&MonoLayerStyles::default(), tag)
+    }
+
+    /// Jak [`run_per_layer`], z własnymi ustawieniami warstw.
+    fn run_per_layer_with(layers: &MonoLayerStyles, tag: fn(Option<Layer>) -> SideLayers) -> Vec<f32> {
         let n = 96_000;
         let pan_frames: Vec<(f32, f32)> = (0..n).map(|i| (sine(1_000.0, i) * 0.5, sine(1_000.0, i))).collect();
         let tags: Vec<SideLayers> =
             (0..n).map(|i| tag(if i >= n / 2 { Some(Layer::Steps) } else { None })).collect();
-        let settings = OutputSettings::plain(MonoEar::Left, 1.0, MonoCueStyle::PerLayer);
+        let settings = OutputSettings::plain(MonoEar::Left, 1.0, MonoCueStyle::PerLayer).with_layers(layers);
         output_channel(&run_tagged(settings, &pan_frames, &tags), 0)
+    }
+
+    fn steps_from_the_right(layer: Option<Layer>) -> SideLayers {
+        SideLayers { left: None, right: layer }
+    }
+
+    #[test]
+    fn per_layer_volume_changes_only_its_own_layer() {
+        // Wszystkie warstwy bez wskazówki, kroki +6 dB: głośniej robi się tylko odcinek z krokami.
+        let layers = MonoLayerStyles {
+            shots: MonoCueStyle::Off,
+            steps: MonoCueStyle::Off,
+            rest: MonoCueStyle::Off,
+            steps_volume_db: 6.0,
+            ..MonoLayerStyles::default()
+        };
+        let out = run_per_layer_with(&layers, steps_from_the_right);
+        let gain_db = 20.0 * (rms(&out[60_000..94_000]) / rms(&out[12_000..46_000])).log10();
+        assert!((gain_db - 6.0).abs() < 0.3, "kroki +6 dB, reszta bez zmian: {gain_db:.2} dB");
+    }
+
+    #[test]
+    fn per_layer_intensity_blends_the_cue_with_the_plain_sound() {
+        use crate::sound::directional::test_signals::modulation_index;
+        let buzz_at = |intensity: f32| {
+            let layers = MonoLayerStyles { steps_intensity: intensity, ..MonoLayerStyles::default() };
+            modulation_index(&run_per_layer_with(&layers, steps_from_the_right)[60_000..94_000], 45.0)
+        };
+        let (none, half, full) = (buzz_at(0.0), buzz_at(0.5), buzz_at(1.0));
+        assert!(none < 0.05, "intensywność 0 %: bez brzęczenia, jest {none:.2}");
+        assert!(half > 0.3 && half < 0.6, "intensywność 50 %: połowa brzęczenia, jest {half:.2}");
+        assert!(full > 0.8, "intensywność 100 %: pełne brzęczenie, jest {full:.2}");
     }
 
     #[test]

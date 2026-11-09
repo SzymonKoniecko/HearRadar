@@ -787,6 +787,37 @@ impl HearRadarApp {
                     *self.radar_config.mono_layer_styles.get_mut(layer) = chosen;
                     self.write_radar_config();
                 }
+                // Głośność i intensywność tej warstwy (dotyczą tylko dźwięku z przeciwnej strony).
+                let mut changed = false;
+                ui.indent(("mono_layer_levels", layer.index()), |ui| {
+                    let layers = &mut self.radar_config.mono_layer_styles;
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                layers.volume_db_mut(layer),
+                                devices::MONO_LAYER_VOLUME_DB_MIN..=devices::MONO_LAYER_VOLUME_DB_MAX,
+                            )
+                            .text("Głośność")
+                            .suffix(" dB"),
+                        )
+                        .on_hover_text("Głośność dźwięku z przeciwnej strony rozpoznanego jako ta warstwa. 0 dB = bez zmian.")
+                        .changed();
+                    changed |= ui
+                        .add_enabled(
+                            chosen != MonoCueStyle::Off,
+                            egui::Slider::new(layers.intensity_mut(layer), 0.0..=1.0)
+                                .text("Intensywność")
+                                .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+                        )
+                        .on_hover_text(
+                            "Jak mocno działa wskazówka tej warstwy: 0 % = czysty dźwięk bez efektu, \
+                             100 % = pełny efekt wybranego stylu.",
+                        )
+                        .changed();
+                });
+                if changed {
+                    self.write_radar_config();
+                }
             }
         }
 
