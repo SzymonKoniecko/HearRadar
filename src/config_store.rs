@@ -9,6 +9,10 @@
 //! się łatwo znaleźć, wersjonować albo skopiować razem z projektem zamiast
 //! szukać jej w `~/Library/Application Support` czy `%APPDATA%`.
 //!
+//! Plik zapisuje się tylko na wyraźne życzenie (przycisk „Zapisz” w UI), nie
+//! przy każdej zmianie. Obok można trzymać nazwane profile, czyli pełne kopie
+//! konfiguracji w `config/profile/` (patrz [`profile_dir`]).
+//!
 //! Testy nie dotykają tego pliku: zapis i odczyt działają na ścieżce podanej
 //! przez wywołującego (`save_to`/`load_from`), a testy podają plik tymczasowy.
 
@@ -70,6 +74,79 @@ pub fn load_from(path: &Path) -> Result<RadarConfig> {
         serde_json::from_str(&data).with_context(|| format!("nieprawidłowy JSON w {}", path.display()))?;
     cfg.migrate_mono_level();
     Ok(cfg)
+}
+
+// ── Profile: nazwane kopie całej konfiguracji ────────────────────────────────
+
+/// Podkatalog `config/` z profilami. Każdy profil to pełna konfiguracja (jak
+/// `radar_config.json`) w pliku `<nazwa>.json`. Profil nie wczytuje się przy
+/// starcie: przy starcie zawsze obowiązuje `radar_config.json`.
+const PROFILE_DIR_NAME: &str = "profile";
+
+/// Katalog z profilami (`config/profile/`).
+pub fn profile_dir() -> PathBuf {
+    config_dir().join(PROFILE_DIR_NAME)
+}
+
+/// Nazwy profili (bez `.json`) z `config/profile/`, alfabetycznie. Brak
+/// katalogu to po prostu brak profili.
+pub fn list_profiles() -> Vec<String> {
+    list_profiles_in(&profile_dir())
+}
+
+/// Jak [`list_profiles`], dla podanego katalogu.
+pub fn list_profiles_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")))
+        .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()).map(str::to_owned))
+        .collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    names
+}
+
+/// Nazwy zarezerwowane przez Windows (nie da się utworzyć takiego pliku).
+const RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1",
+    "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Nazwa profilu nadająca się na nazwę pliku: bez końcówki `.json`, znaki
+/// niedozwolone w nazwach plików (`\ / : * ? " < > |` i sterujące) zamienione
+/// na `_`, bez spacji i kropek na końcach. Błąd, gdy nic nie zostaje albo
+/// nazwa jest zarezerwowana przez Windows.
+pub fn sanitize_profile_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    let without_ext = match trimmed.len().checked_sub(5) {
+        Some(cut) if trimmed.is_char_boundary(cut) && trimmed[cut..].eq_ignore_ascii_case(".json") => &trimmed[..cut],
+        _ => trimmed,
+    };
+    let cleaned: String = without_ext
+        .chars()
+        .map(|c| if c.is_control() || r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace()).to_owned();
+    if cleaned.is_empty() {
+        anyhow::bail!("podaj nazwę profilu");
+    }
+    if RESERVED_NAMES.iter().any(|reserved| reserved.eq_ignore_ascii_case(&cleaned)) {
+        anyhow::bail!("„{cleaned}” to nazwa zarezerwowana przez Windows, wybierz inną");
+    }
+    Ok(cleaned)
+}
+
+/// Ścieżka pliku profilu o nazwie `name` (po [`sanitize_profile_name`]).
+pub fn profile_path(name: &str) -> Result<PathBuf> {
+    profile_path_in(&profile_dir(), name)
+}
+
+/// Jak [`profile_path`], dla podanego katalogu.
+pub fn profile_path_in(dir: &Path, name: &str) -> Result<PathBuf> {
+    Ok(dir.join(format!("{}.json", sanitize_profile_name(name)?)))
 }
 
 #[cfg(test)]
@@ -136,10 +213,9 @@ mod tests {
     #[test]
     fn applying_a_built_in_color_profile_survives_save_and_load() {
         // To dokładnie ścieżka z UI: użytkownik klika profil w
-        // `ui_color_profile_picker`, co nadpisuje `color_rules` i woła
-        // `write_radar_config()` — a ta od teraz od razu zapisuje na dysk
-        // (patrz `HearRadarApp::write_radar_config`), więc nowy profil musi
-        // przetrwać zapis/wczytanie identycznie jak reszta konfiguracji.
+        // `ui_color_profile_picker`, co nadpisuje `color_rules`, a po kliknięciu
+        // „Zapisz” trafia na dysk, więc nowy profil musi przetrwać
+        // zapis/wczytanie identycznie jak reszta konfiguracji.
         let path = temp_config_path("color_profile");
         let profile = crate::sound::color_profiles::built_in_profiles()
             .first()
@@ -177,6 +253,41 @@ mod tests {
         assert_eq!(again.mono_boost_db, loaded.mono_boost_db);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn profile_names_become_safe_file_names() {
+        assert_eq!(sanitize_profile_name("  grzebień 13 ms ").unwrap(), "grzebień 13 ms");
+        assert_eq!(sanitize_profile_name("kroki.JSON").unwrap(), "kroki");
+        assert_eq!(sanitize_profile_name("a/b\\c:d*e?f\"g<h>i|j").unwrap(), "a_b_c_d_e_f_g_h_i_j");
+        assert_eq!(sanitize_profile_name("koniec. ").unwrap(), "koniec");
+        assert!(sanitize_profile_name("   ").is_err());
+        assert!(sanitize_profile_name(".json").is_err());
+        assert!(sanitize_profile_name("nul").is_err());
+        assert!(sanitize_profile_name("ż.json").is_ok(), "końcówka po wielobajtowym znaku");
+    }
+
+    #[test]
+    fn profiles_are_listed_by_name_and_round_trip() {
+        let dir = std::env::temp_dir().join(format!("hearradar_profiles_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(list_profiles_in(&dir).is_empty(), "brak katalogu = brak profili");
+
+        let combo = RadarConfig { mono_cue_style: crate::sound::devices::MonoCueStyle::DirectionalComb, ..RadarConfig::default() };
+        save_to(&profile_path_in(&dir, "Zestaw b").unwrap(), &combo).unwrap();
+        save_to(&profile_path_in(&dir, "a.json").unwrap(), &RadarConfig::default()).unwrap();
+        std::fs::write(dir.join("notatka.txt"), "nie profil").unwrap();
+
+        assert_eq!(list_profiles_in(&dir), ["a", "Zestaw b"]);
+        assert_eq!(load_from(&profile_path_in(&dir, "Zestaw b").unwrap()).unwrap(), combo);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profiles_live_next_to_the_main_config() {
+        assert_eq!(profile_dir().parent().unwrap(), config_dir());
+        assert_eq!(profile_path("x").unwrap(), profile_dir().join("x.json"));
     }
 
     #[test]

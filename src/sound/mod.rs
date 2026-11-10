@@ -11,6 +11,7 @@ pub mod layers;
 pub mod mono_router;
 pub mod playback;
 pub mod recorder;
+pub mod ring_clock;
 pub mod radar_log;
 pub mod sample_logger;
 pub mod spectrum;

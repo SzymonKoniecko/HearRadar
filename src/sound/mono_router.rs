@@ -46,7 +46,7 @@ use cpal::{
 };
 
 use crate::sound::devices::{MonoCueStyle, MonoEar, MonoLayerStyles, SharedAudioAnalysis, SideLayers};
-use crate::sound::directional::{self, DirectionalSplit, Opposite, SplitSample};
+use crate::sound::directional::{self, DirectionalSplit, Opposite, SplitParams, SplitSample};
 use crate::sound::layers::Layer;
 
 /// Częstotliwość (Hz) ring modulation dla [`MonoCueStyle::Buzz`] — na tyle
@@ -102,6 +102,23 @@ pub(crate) const TREMOLO_LPF_HZ: f32 = 4_000.0;
 const BRIGHT_DIRECTIONAL_MAKEUP: f32 = 0.452;
 /// Jak [`BRIGHT_DIRECTIONAL_MAKEUP`], dla Grzebienia: cały efekt jest ok. 5,3 dB cichszy.
 const COMB_DIRECTIONAL_MAKEUP: f32 = 1.84;
+
+/// Jasny „w dół”: największe wzmocnienie efektu to `1 + BRIGHT_BOOST_GAIN` (2,5 przy górze pasma),
+/// więc dzielimy przez nie. Góra zostaje na poziomie oryginału, reszta jest ściszona.
+const BRIGHT_PEAK_MAKEUP: f32 = 1.0 / (1.0 + BRIGHT_BOOST_GAIN);
+
+/// Limiter z pierwszeństwem dla strony własnej: wyprzedzenie (ms), narastanie i powrót ściszenia
+/// strony przeciwnej (ms), zanik obwiedni szczytowych (ms) i najmocniejsze ściszenie (dB).
+/// Narastanie jest dwa razy krótsze niż wyprzedzenie, więc ściszenie dochodzi w ok. 86 % przed
+/// szczytem; resztę łapie [`soft_limit`].
+const PRIORITY_LOOKAHEAD_MS: f32 = 1.0;
+const PRIORITY_ATTACK_MS: f32 = 0.5;
+const PRIORITY_RELEASE_MS: f32 = 80.0;
+const PRIORITY_ENV_RELEASE_MS: f32 = 20.0;
+const PRIORITY_MIN_GAIN_DB: f32 = -18.0;
+
+/// Wygładzenie świeżości (ms) przed użyciem w miksie, żeby skok przy początku dźwięku nie trzaskał.
+const FRESH_SMOOTH_MS: f32 = 3.0;
 
 /// Bufor opóźnienia: zapisuje próbkę i zwraca tę sprzed `delay_samples` (interpolacja liniowa).
 #[inline]
@@ -190,12 +207,24 @@ struct CueState {
     tag_pos: usize,
     /// Współczynnik wygładzania wag warstw na jedną próbkę.
     layer_fade: f32,
-    /// Stan korekcji tonu sumy trafiającej do słuchawki (patrz [`apply_tone`]).
+    /// Stan korekcji tonu: strony własnej (w stylach kanałowych całej sumy) i przeciwnej.
+    /// Filtr jest liniowy, więc dwa osobne dają tę samą sumę co jeden.
     tone: ToneState,
+    tone_opp: ToneState,
+    /// Świeżość dźwięku z przeciwnej strony po wygładzeniu (patrz `SplitSample::fresh`).
+    fresh: f32,
+    fresh_smooth: f32,
+    /// Limiter z pierwszeństwem dla strony własnej (style kierunkowe).
+    limiter: PriorityLimiter,
 }
 
 /// Wagi warstw na starcie: cały dźwięk z przeciwnej strony ma styl reszty.
 const REST_ONLY: [f32; 3] = [0.0, 0.0, 1.0];
+
+/// Współczynnik wygładzania jednobiegunowego na jedną próbkę dla stałej czasu `ms`.
+fn smoothing_per_sample(ms: f32, sample_rate: f32) -> f32 {
+    1.0 - (-1.0 / (ms * 0.001 * sample_rate.max(1.0))).exp()
+}
 
 impl CueState {
     fn new(sample_rate: f32) -> Self {
@@ -205,10 +234,14 @@ impl CueState {
             directional_active: false,
             layer_effects: [EffectState::default(), EffectState::default(), EffectState::default()],
             layer_weights: REST_ONLY,
-            tag_delay: vec![SideLayers::default(); directional::FFT_LEN],
+            tag_delay: vec![SideLayers::default(); directional::LATENCY],
             tag_pos: 0,
-            layer_fade: 1.0 - (-1.0 / (LAYER_FADE_MS * 0.001 * sample_rate.max(1.0))).exp(),
+            layer_fade: smoothing_per_sample(LAYER_FADE_MS, sample_rate),
             tone: ToneState::default(),
+            tone_opp: ToneState::default(),
+            fresh: 0.0,
+            fresh_smooth: smoothing_per_sample(FRESH_SMOOTH_MS, sample_rate),
+            limiter: PriorityLimiter::new(sample_rate),
         }
     }
 
@@ -218,6 +251,9 @@ impl CueState {
         self.tag_delay.fill(SideLayers::default());
         self.tag_pos = 0;
         self.layer_weights = REST_ONLY;
+        self.fresh = 0.0;
+        self.tone_opp = ToneState::default();
+        self.limiter.reset();
     }
 
     /// Zapisuje znaczniki bieżącej ramki i zwraca te sprzed okna FFT, czyli z tej samej chwili
@@ -309,16 +345,48 @@ fn am_makeup(depth: f32) -> f32 {
     1.0 / (mean * mean + swing * swing * 0.5).sqrt().max(1e-6)
 }
 
-/// Wyrównanie głośności stylu kierunkowego: dźwięk z przeciwnej strony dostaje cały efekt,
-/// a ma brzmieć tak samo głośno jak bez niego (zmienia się tylko charakter, nie głośność).
-fn directional_makeup(style: MonoCueStyle) -> f32 {
-    match style {
-        MonoCueStyle::DirectionalBuzz => am_makeup(1.0),
-        MonoCueStyle::DirectionalSqueaky => am_makeup(RING_MOD_SQUEAKY_DEPTH),
-        MonoCueStyle::DirectionalBright => BRIGHT_DIRECTIONAL_MAKEUP,
-        MonoCueStyle::DirectionalComb => COMB_DIRECTIONAL_MAKEUP,
+/// Wyrównanie stylu kierunkowego. Dźwięk z przeciwnej strony dostaje cały efekt, a potem:
+/// - `subtractive` (wskazówki tylko „w dół”): największe wzmocnienie efektu to 1, więc dźwięk
+///   nigdzie i nigdy nie jest głośniej niż bez wskazówki, a średnio jest ciszej,
+/// - inaczej: ma brzmieć średnio tak samo głośno jak bez efektu (zmienia się tylko charakter).
+fn directional_makeup(style: MonoCueStyle, subtractive: bool) -> f32 {
+    match (style, subtractive) {
+        (MonoCueStyle::DirectionalBright, true) => BRIGHT_PEAK_MAKEUP,
+        (_, true) => 1.0,
+        (MonoCueStyle::DirectionalBuzz, false) => am_makeup(1.0),
+        (MonoCueStyle::DirectionalSqueaky, false) => am_makeup(RING_MOD_SQUEAKY_DEPTH),
+        (MonoCueStyle::DirectionalBright, false) => BRIGHT_DIRECTIONAL_MAKEUP,
+        (MonoCueStyle::DirectionalComb, false) => COMB_DIRECTIONAL_MAKEUP,
         _ => 1.0,
     }
+}
+
+/// Grzebień „w dół”: `HP₁₅₀[(1 − γ/2)·x + (γ/2)·x(t − 1,2 ms)]`. Szczyty na poziomie oryginału,
+/// dołki (ok. 417, 1250, 2083… Hz) o głębokości `20·log10(1 − γ)` dB. Szerokie dołki dają
+/// rozpoznawalną „pustą” barwę, a energii nic nie dokłada.
+#[inline]
+fn comb_dips(sample: f32, gamma: f32, sample_rate: f32, state: &mut EffectState) -> f32 {
+    let sample_rate = sample_rate.max(1.0);
+    let delayed = delay_line_step(&mut state.delay, &mut state.pos, sample, COMB_DELAY_S * sample_rate);
+    let mixed = (1.0 - gamma * 0.5) * sample + gamma * 0.5 * delayed;
+    let bass = one_pole_lowpass_step(mixed, sample_rate, COMB_HPF_HZ, &mut state.lp);
+    mixed - bass
+}
+
+/// Siła wskazówki i dodatkowy poziom dla stylu przy świeżości `fresh` (1 tuż po początku dźwięku
+/// z przeciwnej strony, potem 0): `(intensywność, poziom)`. Style z
+/// [`MonoCueStyle::fades_after_onset`] po początku dźwięku spadają do `cue_tail`, a dźwięk do
+/// `tail_gain`, żeby po wycofaniu dołków nie zrobił się głośniejszy. Pozostałe style i siła
+/// od [`directional::NO_FADE_CUE_TAIL`] (wycofywanie wyłączone): `(1, 1)`.
+#[inline]
+fn fade_after_onset(style: MonoCueStyle, fresh: f32, settings: &OutputSettings) -> (f32, f32) {
+    if !style.fades_after_onset() || settings.cue_tail >= directional::NO_FADE_CUE_TAIL {
+        return (1.0, 1.0);
+    }
+    let fresh = fresh.clamp(0.0, 1.0);
+    let intensity = settings.cue_tail + (1.0 - settings.cue_tail) * fresh;
+    let level = settings.tail_gain + (1.0 - settings.tail_gain) * fresh;
+    (intensity, level)
 }
 
 /// Efekt pojedynczego stylu kierunkowego nałożony na dźwięk z przeciwnej strony (bez reszty).
@@ -332,22 +400,24 @@ fn directional_effect(
     sample_rate: f32,
     state: &mut EffectState,
 ) -> f32 {
+    let subtractive = settings.subtractive;
+    let breath = |state: &mut EffectState| {
+        directional::breath_gain(settings.breath_depth, sample_rate, &mut state.breath_phase, subtractive)
+    };
     match style {
-        MonoCueStyle::DirectionalBreath => {
-            split.part_timbre * directional::breath_gain(settings.breath_depth, sample_rate, &mut state.breath_phase)
-        }
+        MonoCueStyle::DirectionalBreath => split.part_timbre * breath(state),
         MonoCueStyle::BreathBuzz => {
             // Oddech oznacza długie dźwięki, lekkie brzęczenie (45 Hz, kilka cykli na krok) krótkie.
-            let breathed = split.part_timbre
-                * directional::breath_gain(settings.breath_depth, sample_rate, &mut state.breath_phase);
-            am_modulate(breathed, RING_MOD_BUZZ_HZ, settings.buzz_depth, sample_rate, &mut state.phase)
-                * settings.buzz_makeup
+            let breathed = split.part_timbre * breath(state);
+            let makeup = if subtractive { 1.0 } else { settings.buzz_makeup };
+            am_modulate(breathed, RING_MOD_BUZZ_HZ, settings.buzz_depth, sample_rate, &mut state.phase) * makeup
         }
+        MonoCueStyle::DirectionalComb if subtractive => comb_dips(split.part, settings.comb_gamma, sample_rate, state),
         MonoCueStyle::DirectionalBuzz
         | MonoCueStyle::DirectionalSqueaky
         | MonoCueStyle::DirectionalBright
         | MonoCueStyle::DirectionalComb => {
-            apply_cue(style, split.part, sample_rate, state) * directional_makeup(style)
+            apply_cue(style, split.part, sample_rate, state) * directional_makeup(style, subtractive)
         }
         _ => split.part,
     }
@@ -401,6 +471,66 @@ struct OutputSettings {
     /// (0–1: udział efektu względem czystego dźwięku), w tej samej kolejności.
     layer_gains: [f32; 3],
     layer_intensity: [f32; 3],
+    /// Strona przeciwna w stylach kierunkowych (patrz [`OppositeSettings`]): wskazówki tylko
+    /// „w dół”, współczynnik γ grzebienia, poziom (mnożnik), ustępowanie (dB), cień głowy (0–0,7),
+    /// siła wskazówki po początku dźwięku (0–1) i poziom ogona (mnożnik).
+    subtractive: bool,
+    comb_gamma: f32,
+    opposite_gain: f32,
+    duck_db: f32,
+    shadow: f32,
+    cue_tail: f32,
+    tail_gain: f32,
+}
+
+/// Ustawienia strony przeciwnej w stylach kierunkowych, tak jak w configu (dB i ułamki).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OppositeSettings {
+    /// Wskazówki tylko „w dół”: strona przeciwna nigdzie nie jest głośniej niż bez wskazówki.
+    subtractive: bool,
+    /// Głębokość dołków grzebienia w trybie „w dół” (dB, ujemna).
+    comb_notch_db: f32,
+    /// Poziom całej oznaczonej strony przeciwnej (dB).
+    level_db: f32,
+    /// Ile dB strona przeciwna ustępuje w paśmie, w którym gra strona własna.
+    duck_db: f32,
+    /// Udział cienia głowy (0 = wyłączony).
+    shadow: f32,
+    /// Siła wskazówki po początku dźwięku (1 = bez wycofywania).
+    tail: f32,
+    /// Poziom ogona po wycofaniu wskazówki (dB, ≤ 0).
+    tail_level_db: f32,
+}
+
+impl Default for OppositeSettings {
+    fn default() -> Self {
+        Self {
+            subtractive: true,
+            comb_notch_db: directional::DEFAULT_COMB_NOTCH_DB,
+            level_db: directional::DEFAULT_OPPOSITE_LEVEL_DB,
+            duck_db: directional::DEFAULT_DUCK_DB,
+            shadow: 0.0,
+            tail: directional::DEFAULT_CUE_TAIL,
+            tail_level_db: directional::DEFAULT_TAIL_LEVEL_DB,
+        }
+    }
+}
+
+impl OppositeSettings {
+    /// Wszystko wyłączone: strona przeciwna jak przed tymi poprawkami (wyrównana głośność,
+    /// pełny poziom, bez ustępowania, cienia i wycofywania).
+    #[cfg(test)]
+    fn neutral() -> Self {
+        Self {
+            subtractive: false,
+            comb_notch_db: directional::DEFAULT_COMB_NOTCH_DB,
+            level_db: 0.0,
+            duck_db: 0.0,
+            shadow: 0.0,
+            tail: 1.0,
+            tail_level_db: 0.0,
+        }
+    }
 }
 
 impl OutputSettings {
@@ -418,6 +548,39 @@ impl OutputSettings {
             layer_styles: MonoLayerStyles::default().in_layer_order(),
             layer_gains: [1.0; 3],
             layer_intensity: [1.0; 3],
+            subtractive: true,
+            comb_gamma: 0.0,
+            opposite_gain: 1.0,
+            duck_db: 0.0,
+            shadow: 0.0,
+            cue_tail: 1.0,
+            tail_gain: 1.0,
+        }
+        .with_opposite(OppositeSettings::default())
+    }
+
+    /// Ustawia stronę przeciwną dla stylów kierunkowych, przyciętą do dozwolonych zakresów.
+    fn with_opposite(mut self, opposite: OppositeSettings) -> Self {
+        let notch_db = opposite.comb_notch_db.clamp(directional::MIN_COMB_NOTCH_DB, directional::MAX_COMB_NOTCH_DB);
+        self.subtractive = opposite.subtractive;
+        self.comb_gamma = 1.0 - db_to_linear(notch_db);
+        self.opposite_gain = db_to_linear(
+            opposite.level_db.clamp(directional::MIN_OPPOSITE_LEVEL_DB, directional::MAX_OPPOSITE_LEVEL_DB),
+        );
+        self.duck_db = opposite.duck_db.clamp(0.0, directional::MAX_DUCK_DB);
+        self.shadow = opposite.shadow.clamp(0.0, directional::MAX_SHADOW);
+        self.cue_tail = opposite.tail.clamp(0.0, 1.0);
+        self.tail_gain = db_to_linear(opposite.tail_level_db.clamp(directional::MIN_TAIL_LEVEL_DB, 0.0));
+        self
+    }
+
+    /// Parametry rozdzielania kierunkowego dla tej próbki.
+    fn split_params(&self) -> SplitParams {
+        SplitParams {
+            timbre: self.breath_timbre,
+            subtractive: self.subtractive,
+            duck_db: self.duck_db,
+            shadow: self.shadow,
         }
     }
 
@@ -483,7 +646,7 @@ fn build_output_stream(
                 &stream_config,
                 move |out: &mut [f32], _| {
                     let frames = out.len() / out_channels.max(1);
-                    let (pan, tags) = analysis.read_stereo_pan_tagged(frames);
+                    let (pan, tags) = analysis.read_stereo_pan_tagged(frames, sample_rate);
                     let settings = read_output_settings(&analysis);
                     fill_output_f32(out, &pan, &tags, out_channels, &settings, sample_rate, &mut cue_state);
                 },
@@ -497,7 +660,7 @@ fn build_output_stream(
                 &stream_config,
                 move |out: &mut [i16], _| {
                     let frames = out.len() / out_channels.max(1);
-                    let (pan, tags) = analysis.read_stereo_pan_tagged(frames);
+                    let (pan, tags) = analysis.read_stereo_pan_tagged(frames, sample_rate);
                     let settings = read_output_settings(&analysis);
                     // Konwersja f32 → i16
                     let mut tmp = vec![0.0f32; out.len()];
@@ -516,7 +679,7 @@ fn build_output_stream(
                 &stream_config,
                 move |out: &mut [u16], _| {
                     let frames = out.len() / out_channels.max(1);
-                    let (pan, tags) = analysis.read_stereo_pan_tagged(frames);
+                    let (pan, tags) = analysis.read_stereo_pan_tagged(frames, sample_rate);
                     let settings = read_output_settings(&analysis);
                     let mut tmp = vec![0.0f32; out.len()];
                     fill_output_f32(&mut tmp, &pan, &tags, out_channels, &settings, sample_rate, &mut cue_state);
@@ -576,6 +739,97 @@ fn soft_limit(x: f32) -> f32 {
     x.signum() * compressed
 }
 
+/// Wyprzedzenie limitera z pierwszeństwem w próbkach (co najmniej 1).
+fn priority_lookahead_samples(sample_rate: f32) -> usize {
+    ((PRIORITY_LOOKAHEAD_MS * 0.001 * sample_rate.max(1.0)).round() as usize).max(1)
+}
+
+/// Stałe opóźnienie stylów kierunkowych (ms przy 48 kHz): rozdzielanie i wyprzedzenie limitera.
+pub(crate) fn directional_latency_ms() -> f32 {
+    (directional::LATENCY + priority_lookahead_samples(48_000.0)) as f32 / 48.0
+}
+
+/// Limiter z pierwszeństwem dla strony własnej (style kierunkowe).
+///
+/// Wspólny [`soft_limit`] na sumie ściszał całość, więc głośny dźwięk z przeciwnej strony
+/// chwilowo ściszał też stronę własną. Tu, zanim suma dojdzie do progu, ścisza się najpierw
+/// tylko strona przeciwna: `g = (próg − obwiednia własnej) / obwiednia przeciwnej`, od 1 w dół
+/// do [`PRIORITY_MIN_GAIN_DB`]. Obwiednie liczone są z [`PRIORITY_LOOKAHEAD_MS`] wyprzedzenia
+/// (oba sygnały idą przez krótką linię opóźnienia), więc ściszenie zdąży przed szczytem.
+/// `soft_limit` na końcu zostaje jako ostatnie zabezpieczenie (np. gdy sama strona własna
+/// przekracza próg).
+#[derive(Debug, Clone)]
+struct PriorityLimiter {
+    own_delay: Vec<f32>,
+    opp_delay: Vec<f32>,
+    pos: usize,
+    env_own: f32,
+    env_opp: f32,
+    gain: f32,
+    min_gain: f32,
+    env_release: f32,
+    attack: f32,
+    release: f32,
+}
+
+impl PriorityLimiter {
+    fn new(sample_rate: f32) -> Self {
+        let lookahead = priority_lookahead_samples(sample_rate);
+        Self {
+            own_delay: vec![0.0; lookahead],
+            opp_delay: vec![0.0; lookahead],
+            pos: 0,
+            env_own: 0.0,
+            env_opp: 0.0,
+            gain: 1.0,
+            min_gain: db_to_linear(PRIORITY_MIN_GAIN_DB),
+            env_release: smoothing_per_sample(PRIORITY_ENV_RELEASE_MS, sample_rate),
+            attack: smoothing_per_sample(PRIORITY_ATTACK_MS, sample_rate),
+            release: smoothing_per_sample(PRIORITY_RELEASE_MS, sample_rate),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.own_delay.fill(0.0);
+        self.opp_delay.fill(0.0);
+        self.pos = 0;
+        self.env_own = 0.0;
+        self.env_opp = 0.0;
+        self.gain = 1.0;
+    }
+
+    /// Obwiednia szczytowa: od razu w górę, w dół z [`PRIORITY_ENV_RELEASE_MS`].
+    #[inline]
+    fn follow(env: &mut f32, x: f32, release: f32) {
+        let mag = x.abs();
+        if mag > *env {
+            *env = mag;
+        } else {
+            *env += (mag - *env) * release;
+        }
+    }
+
+    /// Strona własna i przeciwna (po tonie i wzmocnieniu) na jedną próbkę wyjścia, opóźnioną
+    /// o wyprzedzenie.
+    #[inline]
+    fn process(&mut self, own: f32, opp: f32) -> f32 {
+        Self::follow(&mut self.env_own, own, self.env_release);
+        Self::follow(&mut self.env_opp, opp, self.env_release);
+        let target = if self.env_opp > 1e-9 {
+            ((SOFT_LIMIT_KNEE - self.env_own) / self.env_opp).clamp(self.min_gain, 1.0)
+        } else {
+            1.0
+        };
+        let speed = if target < self.gain { self.attack } else { self.release };
+        self.gain += (target - self.gain) * speed;
+
+        let own_late = std::mem::replace(&mut self.own_delay[self.pos], own);
+        let opp_late = std::mem::replace(&mut self.opp_delay[self.pos], opp);
+        self.pos = (self.pos + 1) % self.own_delay.len();
+        soft_limit(own_late + self.gain * opp_late)
+    }
+}
+
 /// Czyta `mono_ear`, `mono_boost_db`, `mono_cue_style` i `mono_tone_db` jednym
 /// lockiem i od razu zamienia dB na mnożniki liniowe — wołane raz na każdy
 /// callback wyjściowy. Korekcja tonu rozkłada dB symetrycznie: `+x` dB na
@@ -597,6 +851,7 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
         breath_timbre: f32,
         buzz_depth: f32,
         layers: MonoLayerStyles,
+        opposite: OppositeSettings,
     }
     let s = analysis
         .lock()
@@ -615,6 +870,15 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
                 breath_timbre: c.mono_breath_timbre,
                 buzz_depth: c.mono_buzz_depth,
                 layers: c.mono_layer_styles,
+                opposite: OppositeSettings {
+                    subtractive: c.mono_cue_subtractive,
+                    comb_notch_db: c.mono_comb_notch_db,
+                    level_db: c.mono_opposite_level_db,
+                    duck_db: c.mono_opposite_duck_db,
+                    shadow: c.mono_opposite_shadow,
+                    tail: c.mono_cue_tail,
+                    tail_level_db: c.mono_cue_tail_level_db,
+                },
             }
         })
         .unwrap_or(Snapshot {
@@ -630,6 +894,7 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
             breath_timbre: directional::DEFAULT_TIMBRE,
             buzz_depth: directional::DEFAULT_BUZZ_DEPTH,
             layers: MonoLayerStyles::default(),
+            opposite: OppositeSettings::default(),
         });
     // Przełączniki i siły idą do bufora; zastosują się od następnego callbacku.
     analysis.set_mono_class_gain(s.class_gain, s.class_gain_db);
@@ -638,17 +903,22 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
     OutputSettings::new(s.ear, db_to_linear(s.boost_db), s.cue_style, s.tone_db)
         .with_breath(s.breath_depth, s.breath_timbre, s.buzz_depth)
         .with_layers(&s.layers)
+        .with_opposite(s.opposite)
 }
 
 // ── Wypełnianie bufora wyjściowego ───────────────────────────────────────────
 
-/// Jedna próbka do granego ucha w trybie jednousznym: swoja strona plus strona `opposite`
-/// oznaczona wybraną wskazówką.
+/// Jedna próbka do granego ucha w trybie jednousznym jako para `(własna, przeciwna)`: swoja
+/// strona i strona `opposite` oznaczona wybraną wskazówką. Suma pary to próbka do ucha.
 ///
-/// Style kanałowe modulują cały KANAŁ przeciwny ([`apply_cue`]). Style kierunkowe biorą oba
-/// kanały naraz: `DirectionalSplit` oddziela dźwięk, który przychodzi z przeciwnej strony,
-/// i tylko on dostaje efekt, z wyrównaną głośnością. Środek i swoja strona zostają czyste
-/// (opóźnienie o okno FFT, ok. 11 ms).
+/// Style kanałowe modulują cały KANAŁ przeciwny ([`apply_cue`]) i oddają wszystko jako
+/// „własną” (przeciwna = 0), bo kanału nie da się podzielić na strony.
+///
+/// Style kierunkowe biorą oba kanały naraz: `DirectionalSplit` oddziela dźwięk, który przychodzi
+/// z przeciwnej strony (już z ustępowaniem i cieniem głowy), i tylko on dostaje efekt. Środek
+/// i swoja strona zostają czyste (opóźnienie rozdzielania, ok. 5,3 ms). Oznaczona strona przeciwna
+/// dostaje jeszcze poziom `opposite_gain`, a style bez wolnej modulacji wycofują wskazówkę po
+/// początku dźwięku ([`fade_after_onset`]).
 ///
 /// „Wg warstw” wybiera efekt z `tags`: warstwa rozpoznana po przeciwnej stronie (strzały,
 /// kroki) dostaje swój styl, głośność i intensywność, a gdy nic nie rozpoznano, obowiązują
@@ -662,19 +932,25 @@ fn mix_for_ear(
     settings: &OutputSettings,
     sample_rate: f32,
     cue_state: &mut CueState,
-) -> f32 {
+) -> (f32, f32) {
     let style = settings.cue_style;
     if !style.is_directional() {
-        return match opposite {
+        let mixed = match opposite {
             Opposite::Right => left + apply_cue(style, right, sample_rate, &mut cue_state.effect),
             Opposite::Left => right + apply_cue(style, left, sample_rate, &mut cue_state.effect),
         };
+        return (mixed, 0.0);
     }
-    let split = cue_state.directional.process(left, right, opposite, settings.breath_timbre);
+    let split = cue_state.directional.process(left, right, opposite, settings.split_params());
+    cue_state.fresh += (split.fresh - cue_state.fresh) * cue_state.fresh_smooth;
+    let fresh = cue_state.fresh;
     // Znaczniki zapisujemy zawsze, żeby po przełączeniu na „Wg warstw” były od razu zgrane.
     let tags = cue_state.delayed_tags(tags);
     if style != MonoCueStyle::PerLayer {
-        return split.rest + directional_effect(style, split, settings, sample_rate, &mut cue_state.effect);
+        let effect = directional_effect(style, split, settings, sample_rate, &mut cue_state.effect);
+        let (intensity, level) = fade_after_onset(style, fresh, settings);
+        let marked = level * (split.part + intensity * (effect - split.part));
+        return (split.rest, settings.opposite_gain * marked);
     }
     let layer = match opposite {
         Opposite::Left => tags.left,
@@ -686,13 +962,36 @@ fn mix_for_ear(
     for (slot, &slot_layer) in Layer::ALL.iter().enumerate() {
         let target = if slot_layer == layer { 1.0 } else { 0.0 };
         cue_state.layer_weights[slot] += (target - cue_state.layer_weights[slot]) * fade;
-        let effect =
-            directional_effect(settings.layer_styles[slot], split, settings, sample_rate, &mut cue_state.layer_effects[slot]);
+        let slot_style = settings.layer_styles[slot];
+        let effect = directional_effect(slot_style, split, settings, sample_rate, &mut cue_state.layer_effects[slot]);
         // Intensywność miesza efekt z czystym dźwiękiem z przeciwnej strony, głośność mnoży całość.
-        let blended = split.part + settings.layer_intensity[slot] * (effect - split.part);
-        marked += cue_state.layer_weights[slot] * settings.layer_gains[slot] * blended;
+        let (fade_intensity, level) = fade_after_onset(slot_style, fresh, settings);
+        let intensity = settings.layer_intensity[slot] * fade_intensity;
+        let blended = split.part + intensity * (effect - split.part);
+        marked += cue_state.layer_weights[slot] * settings.layer_gains[slot] * level * blended;
     }
-    split.rest + marked
+    (split.rest, settings.opposite_gain * marked)
+}
+
+/// Próbka do granego ucha: ton, wzmocnienie i limiter. Style kierunkowe idą przez limiter
+/// z pierwszeństwem dla strony własnej, kanałowe przez wspólny [`soft_limit`].
+#[inline]
+fn ear_sample(
+    (own, opp): (f32, f32),
+    directional: bool,
+    settings: &OutputSettings,
+    sample_rate: f32,
+    cue_state: &mut CueState,
+) -> f32 {
+    let OutputSettings { gain, tone_low_gain, tone_high_gain, .. } = *settings;
+    let tone = |x: f32, state: &mut ToneState| apply_tone(x, sample_rate, tone_low_gain, tone_high_gain, state);
+    if directional {
+        let own = tone(own, &mut cue_state.tone) * gain;
+        let opp = tone(opp, &mut cue_state.tone_opp) * gain;
+        cue_state.limiter.process(own, opp)
+    } else {
+        soft_limit(tone(own + opp, &mut cue_state.tone) * gain)
+    }
 }
 
 /// Zapisuje `pan` (pary "ważonego mono" `(left, right)`, patrz
@@ -717,7 +1016,9 @@ fn mix_for_ear(
 /// oznaczenia.
 ///
 /// Style kierunkowe nie działają na kanale, tylko na dźwięku z przeciwnej
-/// strony: patrz [`mix_for_ear`] i `sound::directional`.
+/// strony: patrz [`mix_for_ear`] i `sound::directional`. Obie strony idą
+/// osobno przez ton i wzmocnienie, a potem przez [`PriorityLimiter`], który
+/// przy głośnej sumie ścisza najpierw stronę przeciwną (+1 ms opóźnienia).
 #[inline]
 fn fill_output_f32(
     out: &mut [f32],
@@ -730,7 +1031,6 @@ fn fill_output_f32(
 ) {
     let ch = out_channels.max(1);
     let OutputSettings { ear, gain, tone_low_gain, tone_high_gain, .. } = *settings;
-    let tone = |x: f32, state: &mut ToneState| apply_tone(x, sample_rate, tone_low_gain, tone_high_gain, state);
 
     // Styl kierunkowy trzyma okno FFT z poprzednich buforów. Gdy wraca po przerwie (styl
     // kanałowy, inne ucho), zaczyna od czystego okna zamiast wypuścić resztki sprzed przełączenia.
@@ -751,21 +1051,20 @@ fn fill_output_f32(
             MonoEar::Off => { /* cisza */ }
             MonoEar::Left => {
                 let mixed = mix_for_ear(left, right, layers, Opposite::Right, settings, sample_rate, cue_state);
-                frame[0] = soft_limit(tone(mixed, &mut cue_state.tone) * gain);
-            }
-            MonoEar::Right if ch >= 2 => {
-                let mixed = mix_for_ear(left, right, layers, Opposite::Left, settings, sample_rate, cue_state);
-                frame[1] = soft_limit(tone(mixed, &mut cue_state.tone) * gain);
+                frame[0] = ear_sample(mixed, directional, settings, sample_rate, cue_state);
             }
             MonoEar::Right => {
-                // mono device fallback
                 let mixed = mix_for_ear(left, right, layers, Opposite::Left, settings, sample_rate, cue_state);
-                frame[0] = soft_limit(tone(mixed, &mut cue_state.tone) * gain);
+                // Urządzenie z jednym kanałem: gramy w nim.
+                let slot = if ch >= 2 { 1 } else { 0 };
+                frame[slot] = ear_sample(mixed, directional, settings, sample_rate, cue_state);
             }
             MonoEar::Both => {
                 // Oba uszy już słyszą osobno lewą/prawą stronę (stereo
                 // wyjście) — bez efektu cue, ale tonem objęty jest cały miks.
-                let sample = soft_limit(tone(left + right, &mut cue_state.tone) * gain);
+                let sample = soft_limit(
+                    apply_tone(left + right, sample_rate, tone_low_gain, tone_high_gain, &mut cue_state.tone) * gain,
+                );
                 frame[0] = sample;
                 if ch >= 2 {
                     frame[1] = sample;
@@ -967,13 +1266,31 @@ mod tests {
         20.0 * (max / min.max(1e-9)).log10()
     }
 
-    /// Pary `(L, P)` przez `fill_output_f32` w kilku buforach, jak w prawdziwym callbacku:
-    /// okno FFT stylów kierunkowych ma przejść przez ich granice.
-    fn run_pan(style: MonoCueStyle, pan_frames: &[(f32, f32)], ear: MonoEar) -> Vec<f32> {
-        run_tagged(OutputSettings::plain(ear, 1.0, style), pan_frames, &[])
+    /// Ucho lewe, same wskazówki „w dół” bez poziomu, ustępowania, cienia i wycofywania:
+    /// do sprawdzania kształtu samego efektu.
+    fn cues_only(style: MonoCueStyle) -> OutputSettings {
+        OutputSettings::plain(MonoEar::Left, 1.0, style).with_opposite(OppositeSettings {
+            level_db: 0.0,
+            duck_db: 0.0,
+            shadow: 0.0,
+            tail: 1.0,
+            tail_level_db: 0.0,
+            ..OppositeSettings::default()
+        })
     }
 
-    /// Jak [`run_pan`], z ustawieniami i znacznikami warstw dla każdej ramki.
+    /// Ucho lewe, strona przeciwna jak przed poprawkami (patrz [`OppositeSettings::neutral`]).
+    fn neutral(style: MonoCueStyle) -> OutputSettings {
+        OutputSettings::plain(MonoEar::Left, 1.0, style).with_opposite(OppositeSettings::neutral())
+    }
+
+    /// Opóźnienie stylów kierunkowych przy 48 kHz: okno FFT i wyprzedzenie limitera.
+    fn directional_latency() -> usize {
+        directional::LATENCY + priority_lookahead_samples(48_000.0)
+    }
+
+    /// Pary `(L, P)` przez `fill_output_f32` w kilku buforach, jak w prawdziwym callbacku (okno
+    /// FFT stylów kierunkowych ma przejść przez ich granice), ze znacznikami warstw dla każdej ramki.
     fn run_tagged(settings: OutputSettings, pan_frames: &[(f32, f32)], tags: &[SideLayers]) -> Vec<f32> {
         let mut out = vec![0.0f32; pan_frames.len() * 2];
         let mut cue_state = CueState::default();
@@ -992,9 +1309,14 @@ mod tests {
 
     /// Sekunda sinusa `hz` z poziomami `gain_left`/`gain_right` po obu stronach.
     fn run_directional(style: MonoCueStyle, hz: f32, gain_left: f32, gain_right: f32, ear: MonoEar) -> Vec<f32> {
+        run_directional_with(OutputSettings::plain(ear, 1.0, style), hz, gain_left, gain_right)
+    }
+
+    /// Jak [`run_directional`], z własnymi ustawieniami.
+    fn run_directional_with(settings: OutputSettings, hz: f32, gain_left: f32, gain_right: f32) -> Vec<f32> {
         let pan_frames: Vec<(f32, f32)> =
             (0..48_000).map(|i| (sine(hz, i) * gain_left, sine(hz, i) * gain_right)).collect();
-        run_pan(style, &pan_frames, ear)
+        run_tagged(settings, &pan_frames, &[])
     }
 
     fn output_channel(out: &[f32], index: usize) -> Vec<f32> {
@@ -1011,7 +1333,8 @@ mod tests {
         let from_right = run_directional(style, 1_000.0, 0.5, 1.0, MonoEar::Left);
         assert!(from_right.chunks_exact(2).all(|f| f[1] == 0.0), "prawy kanał wyjścia ma być cichy");
         let swing = block_swing_db(&output_channel(&from_right, 0)[12_000..]);
-        assert!(swing > 5.0, "dźwięk z prawej (+6 dB) ma oddychać w lewym uchu: {swing:.2} dB");
+        // Domyślnie „w dół” z głębokością 0,44: od 0 do −5 dB.
+        assert!(swing > 4.0, "dźwięk z prawej (+6 dB) ma oddychać w lewym uchu: {swing:.2} dB");
 
         let from_left = run_directional(style, 1_000.0, 1.0, 0.5, MonoEar::Left);
         let swing = block_swing_db(&output_channel(&from_left, 0)[12_000..]);
@@ -1027,19 +1350,20 @@ mod tests {
         let from_left = run_directional(MonoCueStyle::DirectionalBreath, 1_000.0, 1.0, 0.5, MonoEar::Right);
         assert!(from_left.chunks_exact(2).all(|f| f[0] == 0.0), "lewy kanał wyjścia ma być cichy");
         let swing = block_swing_db(&output_channel(&from_left, 1)[12_000..]);
-        assert!(swing > 5.0, "przy prawym uchu ma oddychać dźwięk z lewej: {swing:.2} dB");
+        assert!(swing > 4.0, "przy prawym uchu ma oddychać dźwięk z lewej: {swing:.2} dB");
     }
 
     #[test]
     fn directional_styles_leave_center_and_own_side_untouched() {
         // Środek i swoja strona trafiają w całości do reszty, więc każdy styl kierunkowy oddaje
-        // je co do próbki, tylko opóźnione o okno FFT.
-        let latency = directional::FFT_LEN;
+        // je co do próbki, tylko opóźnione o rozdzielanie i wyprzedzenie limitera. 1,1 kHz, żeby
+        // opóźnienie nie wypadało w całych okresach i błąd opóźnienia był widoczny.
+        let latency = directional_latency();
         for &style in MonoCueStyle::DIRECTIONAL {
             for (gain_left, gain_right) in [(1.0, 1.0), (1.0, 0.5)] {
-                let out = output_channel(&run_directional(style, 1_000.0, gain_left, gain_right, MonoEar::Left), 0);
+                let out = output_channel(&run_directional(style, 1_100.0, gain_left, gain_right, MonoEar::Left), 0);
                 for (t, &y) in out.iter().enumerate().skip(12_000) {
-                    let expected = sine(1_000.0, t - latency) * (gain_left + gain_right);
+                    let expected = sine(1_100.0, t - latency) * (gain_left + gain_right);
                     assert!((y - expected).abs() < 1e-3, "{style:?} L={gain_left} P={gain_right}, próbka {t}");
                 }
             }
@@ -1048,16 +1372,19 @@ mod tests {
 
     #[test]
     fn directional_styles_mark_the_sound_from_the_opposite_side() {
+        // Kształt samych wskazówek „w dół” (bez poziomu i wycofywania).
         use crate::sound::directional::test_signals::modulation_index;
         let from_right = |style: MonoCueStyle, hz: f32| {
-            output_channel(&run_directional(style, hz, 0.5, 1.0, MonoEar::Left), 0)[12_000..].to_vec()
+            output_channel(&run_directional_with(cues_only(style), hz, 0.5, 1.0), 0)[12_000..].to_vec()
         };
+        // Oddech 0,44 „w dół”: obwiednia 1 − 0,44·lfo, czyli m = 0,22 / 0,78 ≈ 0,28.
         let breath = from_right(MonoCueStyle::DirectionalBreath, 1_000.0);
-        assert!(modulation_index(&breath, 4.0) > 0.3, "Oddech kierunkowy: oddech 4 Hz");
+        let m = modulation_index(&breath, 4.0);
+        assert!(m > 0.24, "Oddech kierunkowy: oddech 4 Hz, m = {m:.2}");
 
         let combo = from_right(MonoCueStyle::BreathBuzz, 1_000.0);
         let (m_breath, m_buzz) = (modulation_index(&combo, 4.0), modulation_index(&combo, 45.0));
-        assert!(m_breath > 0.25 && m_buzz > 0.2, "Oddech + brzęczenie: oddech {m_breath:.2}, brzęczenie {m_buzz:.2}");
+        assert!(m_breath > 0.2 && m_buzz > 0.2, "Oddech + brzęczenie: oddech {m_breath:.2}, brzęczenie {m_buzz:.2}");
 
         let buzz = from_right(MonoCueStyle::DirectionalBuzz, 1_000.0);
         assert!(modulation_index(&buzz, 45.0) > 0.8, "Brzęczenie kierunkowe: pełne wahanie 45 Hz");
@@ -1065,12 +1392,18 @@ mod tests {
         let squeaky = from_right(MonoCueStyle::DirectionalSqueaky, 1_000.0);
         assert!(modulation_index(&squeaky, 140.0) > 0.3, "Piskliwy kierunkowy: wahanie 140 Hz");
 
-        // Grzebień: pierwszy dołek (1 / 2,4 ms ≈ 417 Hz) prawie wygasza dźwięk z przeciwnej strony.
+        // Grzebień „w dół”: pierwszy dołek (1 / 2,4 ms ≈ 417 Hz) ma głębokość z suwaka (−14 dB),
+        // a szczyt (833 Hz) zostaje na poziomie oryginału.
         let notch_hz = 0.5 / COMB_DELAY_S;
-        let comb = from_right(MonoCueStyle::DirectionalComb, notch_hz);
-        let plain = rms(&(12_000..48_000).map(|i| sine(notch_hz, i) * 1.5).collect::<Vec<_>>());
-        let notch_db = 20.0 * (rms(&comb) / plain).log10();
-        assert!(notch_db < -12.0, "Grzebień kierunkowy: dołek przy {notch_hz:.0} Hz, jest {notch_db:.1} dB");
+        let plain_at = |hz: f32| rms(&(12_000..48_000).map(|i| sine(hz, i) * 1.5).collect::<Vec<_>>());
+        let notch_db = 20.0 * (rms(&from_right(MonoCueStyle::DirectionalComb, notch_hz)) / plain_at(notch_hz)).log10();
+        assert!(
+            (notch_db - directional::DEFAULT_COMB_NOTCH_DB).abs() < 1.5,
+            "Grzebień kierunkowy: dołek przy {notch_hz:.0} Hz, jest {notch_db:.1} dB"
+        );
+        let peak_hz = 2.0 * notch_hz;
+        let peak_db = 20.0 * (rms(&from_right(MonoCueStyle::DirectionalComb, peak_hz)) / plain_at(peak_hz)).log10();
+        assert!(peak_db.abs() < 0.5, "Grzebień kierunkowy: szczyt przy {peak_hz:.0} Hz, jest {peak_db:+.1} dB");
 
         // Jasny: góra wyraźnie głośniej niż dół.
         let high = rms(&from_right(MonoCueStyle::DirectionalBright, 8_000.0));
@@ -1080,36 +1413,211 @@ mod tests {
     }
 
     #[test]
-    fn directional_styles_keep_the_loudness_of_the_opposite_side() {
-        // Dźwięk z przeciwnej strony (szum różowy, ILD +9 dB) ma brzmieć dla ucha tak samo
-        // głośno jak bez wskazówki: zmienia się charakter, nie głośność.
+    fn subtractive_cues_never_raise_the_opposite_side_above_the_original() {
+        // Wskazówki „w dół”: żaden styl, w żadnym paśmie ani fazie modulacji, nie daje dźwięku
+        // z przeciwnej strony głośniej niż bez wskazówki (szczyt sinusa najwyżej jak oryginał).
+        let original_peak = 0.2 * 1.5;
+        for &style in MonoCueStyle::DIRECTIONAL.iter().filter(|&&s| s != MonoCueStyle::PerLayer) {
+            for hz in [100.0, 417.0, 833.0, 1_000.0, 3_000.0, 8_000.0] {
+                let out = output_channel(&run_directional_with(cues_only(style), hz, 0.5, 1.0), 0);
+                let peak = out[12_000..].iter().fold(0.0f32, |m, &y| m.max(y.abs()));
+                assert!(
+                    peak <= original_peak * 1.03,
+                    "{style:?} {hz} Hz: szczyt {:+.2} dB względem oryginału",
+                    20.0 * (peak / original_peak).log10()
+                );
+            }
+        }
+    }
+
+    /// Szum różowy z prawej (ILD +9 dB) przez styl: zmiana głośności dla ucha (ważenie A, dB)
+    /// względem samej sumy kanałów.
+    fn loudness_change_db(settings: OutputSettings) -> f32 {
         use crate::sound::directional::test_signals::{a_weighted_db, pan, pink};
         let (l, r) = pan(&pink(96_000, 21), 9.0);
         let pan_frames: Vec<(f32, f32)> = l.iter().copied().zip(r.iter().copied()).collect();
         let plain: Vec<f32> = l.iter().zip(&r).map(|(a, b)| a + b).collect();
-        let reference = a_weighted_db(&plain[24_000 - directional::FFT_LEN..]);
+        let reference = a_weighted_db(&plain[24_000 - directional_latency()..96_000 - directional_latency()]);
+        let out = output_channel(&run_tagged(settings, &pan_frames, &[]), 0);
+        a_weighted_db(&out[24_000..]) - reference
+    }
+
+    #[test]
+    fn loudness_neutral_mode_keeps_the_loudness_of_the_opposite_side() {
+        // Tryb z wyrównaną głośnością (poprawki wyłączone): zmienia się charakter, nie głośność.
         for &style in MonoCueStyle::DIRECTIONAL {
-            let out = output_channel(&run_pan(style, &pan_frames, MonoEar::Left), 0);
-            let diff = a_weighted_db(&out[24_000..]) - reference;
+            let diff = loudness_change_db(neutral(style));
             assert!(diff.abs() < 1.5, "{style:?}: głośność strony przeciwnej zmieniona o {diff:+.2} dB");
         }
     }
 
+    #[test]
+    fn subtractive_cues_only_make_the_opposite_side_quieter() {
+        // „W dół”: strona przeciwna nigdy głośniej niż oryginał, ale też nie znika.
+        for &style in MonoCueStyle::DIRECTIONAL {
+            let diff = loudness_change_db(cues_only(style));
+            assert!((-10.0..=0.3).contains(&diff), "{style:?}: zmiana głośności {diff:+.2} dB");
+        }
+        // Z domyślnym poziomem (−3 dB) i wycofywaniem: co najmniej o tyle ciszej.
+        for &style in MonoCueStyle::DIRECTIONAL {
+            let diff = loudness_change_db(OutputSettings::plain(MonoEar::Left, 1.0, style));
+            assert!(
+                diff <= directional::DEFAULT_OPPOSITE_LEVEL_DB + 0.3,
+                "{style:?}: z domyślnymi ustawieniami zmiana głośności {diff:+.2} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn opposite_level_scales_only_the_opposite_side() {
+        // „Wg warstw” bez wskazówek: zostaje sam poziom strony przeciwnej.
+        let layers = MonoLayerStyles {
+            shots: MonoCueStyle::Off,
+            steps: MonoCueStyle::Off,
+            rest: MonoCueStyle::Off,
+            ..MonoLayerStyles::default()
+        };
+        let level = |level_db: f32, gain_left: f32, gain_right: f32| {
+            let settings = OutputSettings::plain(MonoEar::Left, 1.0, MonoCueStyle::PerLayer)
+                .with_layers(&layers)
+                .with_opposite(OppositeSettings { level_db, duck_db: 0.0, ..OppositeSettings::default() });
+            rms(&output_channel(&run_directional_with(settings, 1_000.0, gain_left, gain_right), 0)[12_000..])
+        };
+        let opposite_db = 20.0 * (level(-3.0, 0.5, 1.0) / level(0.0, 0.5, 1.0)).log10();
+        assert!((opposite_db + 3.0).abs() < 0.2, "strona przeciwna −3 dB, jest {opposite_db:+.2} dB");
+        let own_db = 20.0 * (level(-3.0, 1.0, 0.5) / level(0.0, 1.0, 0.5)).log10();
+        assert!(own_db.abs() < 0.05, "swoja strona bez zmian, jest {own_db:+.2} dB");
+    }
+
+    #[test]
+    fn priority_limiter_keeps_the_own_side_when_the_opposite_side_is_loud() {
+        // Cichy dźwięk ze swojej strony (1,1 kHz) na tle głośnego z przeciwnej (200 Hz, szczyt 1,2):
+        // wspólny limiter ściszał go razem z całością, limiter z pierwszeństwem ścisza tylko
+        // stronę przeciwną.
+        use crate::sound::directional::test_signals::tone_level;
+        let n = 96_000;
+        let own: Vec<f32> = (0..n).map(|i| 0.02 * (std::f32::consts::TAU * 1_100.0 * i as f32 / 48_000.0).sin()).collect();
+        let opp: Vec<f32> = (0..n).map(|i| 1.2 * (std::f32::consts::TAU * 200.0 * i as f32 / 48_000.0).sin()).collect();
+        let mut limiter = PriorityLimiter::new(48_000.0);
+        let priority: Vec<f32> = own.iter().zip(&opp).map(|(&a, &b)| limiter.process(a, b)).collect();
+        let shared: Vec<f32> = own.iter().zip(&opp).map(|(&a, &b)| soft_limit(a + b)).collect();
+        let reference = tone_level(&own[48_000..], 1_100.0);
+        let lookahead = priority_lookahead_samples(48_000.0);
+        let kept_db = 20.0 * (tone_level(&priority[48_000 + lookahead..n], 1_100.0) / reference).log10();
+        let shared_db = 20.0 * (tone_level(&shared[48_000..], 1_100.0) / reference).log10();
+        assert!(kept_db > -1.0, "limiter z pierwszeństwem: swoja strona {kept_db:+.1} dB");
+        assert!(shared_db < -3.0, "wspólny limiter: swoja strona {shared_db:+.1} dB");
+        assert!(priority.iter().all(|y| y.abs() <= 1.0), "wyjście w zakresie");
+    }
+
+    #[test]
+    fn priority_limiter_leaves_normal_levels_alone() {
+        // Poniżej progu nic nie ściszamy: wyjście to wejście opóźnione o wyprzedzenie.
+        let mut limiter = PriorityLimiter::new(48_000.0);
+        let lookahead = priority_lookahead_samples(48_000.0);
+        let input: Vec<(f32, f32)> = (0..4_800).map(|i| (sine(700.0, i), sine(300.0, i) * 1.5)).collect();
+        for (t, &(own, opp)) in input.iter().enumerate() {
+            let y = limiter.process(own, opp);
+            let expected = input.get(t.wrapping_sub(lookahead)).map_or(0.0, |&(a, b)| a + b);
+            assert!((y - expected).abs() < 1e-6, "próbka {t}: {y} zamiast {expected}");
+        }
+    }
+
+    /// Ćwierć sekundy ciszy, potem dźwięk z prawej (+6 dB) z `source`: wyjście lewego ucha
+    /// i numer próbki wyjścia, od której słychać dźwięk.
+    fn run_onset(settings: OutputSettings, source: impl Fn(usize) -> f32) -> (Vec<f32>, usize) {
+        let start = 12_000;
+        let pan_frames: Vec<(f32, f32)> = (0..72_000)
+            .map(|i| if i < start { (0.0, 0.0) } else { let s = source(i - start); (s * 0.5, s) })
+            .collect();
+        (output_channel(&run_tagged(settings, &pan_frames, &[]), 0), start + directional_latency())
+    }
+
+    #[test]
+    fn comb_cue_fades_after_the_onset_without_getting_louder() {
+        use crate::sound::directional::test_signals::noise;
+        let settings = OutputSettings::plain(MonoEar::Left, 1.0, MonoCueStyle::DirectionalComb);
+        let ms = |x: usize| x * 48;
+
+        // Na dołku grzebienia wskazówka jest wyraźna zaraz po początku i słabnie po ok. 0,5 s.
+        let notch_hz = 0.5 / COMB_DELAY_S;
+        let (out, at) = run_onset(settings, |i| 0.2 * (std::f32::consts::TAU * notch_hz * i as f32 / 48_000.0).sin());
+        let early = rms(&out[at + ms(40)..at + ms(170)]);
+        let late = rms(&out[at + ms(700)..at + ms(1_000)]);
+        let fade_db = 20.0 * (late / early).log10();
+        assert!(fade_db > 5.0, "dołek ma się spłycić po początku dźwięku: {fade_db:+.1} dB");
+
+        // Szum (płaskie widmo, więc RMS dobrze oddaje średnie i wysokie pasma): ogon nie jest
+        // głośniejszy niż oznaczony początek.
+        let white = noise(60_000, 5);
+        let (out, at) = run_onset(settings, |i| 0.3 * white[i]);
+        let db = |x: &[f32]| 20.0 * rms(x).log10();
+        let early = db(&out[at + ms(40)..at + ms(170)]);
+        let late = db(&out[at + ms(700)..at + ms(1_000)]);
+        assert!(late <= early + 0.5, "ogon {late:.1} dB, początek {early:.1} dB");
+
+        // 100 %: bez wycofywania.
+        let steady = OutputSettings::plain(MonoEar::Left, 1.0, MonoCueStyle::DirectionalComb)
+            .with_opposite(OppositeSettings { tail: 1.0, ..OppositeSettings::default() });
+        let (out, at) = run_onset(steady, |i| 0.2 * (std::f32::consts::TAU * notch_hz * i as f32 / 48_000.0).sin());
+        let early = rms(&out[at + ms(40)..at + ms(170)]);
+        let late = rms(&out[at + ms(700)..at + ms(1_000)]);
+        let fade_db = 20.0 * (late / early).log10();
+        assert!(fade_db.abs() < 0.5, "przy 100 % wskazówka się nie zmienia: {fade_db:+.1} dB");
+    }
+
+    #[test]
+    fn breath_cue_keeps_breathing_after_the_onset() {
+        use crate::sound::directional::test_signals::modulation_index;
+        let settings = OutputSettings::plain(MonoEar::Left, 1.0, MonoCueStyle::DirectionalBreath);
+        let (out, at) = run_onset(settings, |i| sine(1_000.0, i));
+        let late = &out[at + 24_000..at + 48_000];
+        let m = modulation_index(late, 4.0);
+        assert!(m > 0.24, "oddech nie wycofuje się po początku dźwięku: m = {m:.2}");
+    }
+
     /// Dwie sekundy sinusa 1 kHz z prawej (+6 dB) przez „Wg warstw” z domyślnymi stylami
     /// (strzały: grzebień, kroki: brzęczenie, reszta: oddech). W drugiej sekundzie znacznik kroków
-    /// stoi po stronie wybranej przez `tag`.
+    /// stoi po stronie wybranej przez `tag`. Strona przeciwna z wyrównaną głośnością i bez
+    /// wycofywania, żeby sprawdzać samo przełączanie warstw.
     fn run_per_layer(tag: fn(Option<Layer>) -> SideLayers) -> Vec<f32> {
         run_per_layer_with(&MonoLayerStyles::default(), tag)
     }
 
     /// Jak [`run_per_layer`], z własnymi ustawieniami warstw.
     fn run_per_layer_with(layers: &MonoLayerStyles, tag: fn(Option<Layer>) -> SideLayers) -> Vec<f32> {
+        run_per_layer_settings(neutral(MonoCueStyle::PerLayer).with_layers(layers), tag)
+    }
+
+    /// Jak [`run_per_layer`], z pełnymi ustawieniami.
+    fn run_per_layer_settings(settings: OutputSettings, tag: fn(Option<Layer>) -> SideLayers) -> Vec<f32> {
         let n = 96_000;
         let pan_frames: Vec<(f32, f32)> = (0..n).map(|i| (sine(1_000.0, i) * 0.5, sine(1_000.0, i))).collect();
         let tags: Vec<SideLayers> =
             (0..n).map(|i| tag(if i >= n / 2 { Some(Layer::Steps) } else { None })).collect();
-        let settings = OutputSettings::plain(MonoEar::Left, 1.0, MonoCueStyle::PerLayer).with_layers(layers);
         output_channel(&run_tagged(settings, &pan_frames, &tags), 0)
+    }
+
+    #[test]
+    fn per_layer_fades_only_layers_with_styles_that_fade() {
+        // Domyślnie: reszta (oddech) oddycha cały czas, kroki (brzęczenie) wycofują wskazówkę.
+        // Znacznik kroków wchodzi po sekundzie, ale dźwięk trwa od początku, więc brzęczenie
+        // trafia już na ogon (40 %).
+        use crate::sound::directional::test_signals::modulation_index;
+        let out = run_per_layer_settings(
+            OutputSettings::plain(MonoEar::Left, 1.0, MonoCueStyle::PerLayer).with_layers(&MonoLayerStyles::default()),
+            steps_from_the_right,
+        );
+        let rest = modulation_index(&out[24_000..46_000], 4.0);
+        assert!(rest > 0.24, "reszta: oddech bez wycofywania, m = {rest:.2}");
+        // Pełne brzęczenie to obwiednia 0,5 + 0,5·sin. Przy intensywności I: 1 − I/2 + (I/2)·sin,
+        // czyli m = (I/2) / (1 − I/2) (0,25 dla ogona 40 %).
+        let steps = modulation_index(&out[60_000..94_000], 45.0);
+        let half = directional::DEFAULT_CUE_TAIL * 0.5;
+        let expected = half / (1.0 - half);
+        assert!((steps / expected - 1.0).abs() < 0.2, "kroki: brzęczenie na ogonie, m = {steps:.2}");
+        let full = modulation_index(&run_per_layer(steps_from_the_right)[60_000..94_000], 45.0);
+        assert!(full > 0.8, "bez wycofywania pełne brzęczenie, m = {full:.2}");
     }
 
     fn steps_from_the_right(layer: Option<Layer>) -> SideLayers {
@@ -1150,7 +1658,7 @@ mod tests {
         let out = run_per_layer(|layer| SideLayers { left: None, right: layer });
         // Nic nie rozpoznano: styl reszty, czyli oddech 4 Hz bez brzęczenia.
         let rest = &out[12_000..46_000];
-        assert!(modulation_index(rest, 4.0) > 0.3, "reszta: oddech");
+        assert!(modulation_index(rest, 4.0) > 0.24, "reszta: oddech (m ≈ 0,28 przy głębokości 0,44)");
         assert!(modulation_index(rest, 45.0) < 0.05, "reszta: bez brzęczenia");
         // Kroki z prawej (przeciwnej) strony: brzęczenie 45 Hz bez oddechu.
         let steps = &out[60_000..94_000];
@@ -1164,7 +1672,7 @@ mod tests {
         // Kroki rozpoznane po lewej (swojej) stronie nie zmieniają stylu dźwięku z prawej.
         let out = run_per_layer(|layer| SideLayers { left: layer, right: None });
         let late = &out[60_000..94_000];
-        assert!(modulation_index(late, 4.0) > 0.3, "dalej styl reszty");
+        assert!(modulation_index(late, 4.0) > 0.24, "dalej styl reszty");
         assert!(modulation_index(late, 45.0) < 0.05, "kroki ze swojej strony nie dają brzęczenia");
     }
 
@@ -1173,7 +1681,7 @@ mod tests {
         // Sinus 1 kHz o amplitudzie ok. 0,5 (z oddechem i wyrównaniem głośności) zmienia się
         // najwyżej o ok. 0,07 na próbkę. Twarde przełączenie stylu dawałoby skok do ok. 0,5.
         let out = run_per_layer(|layer| SideLayers { left: None, right: layer });
-        let switch_at = 48_000 + directional::FFT_LEN;
+        let switch_at = 48_000 + directional::LATENCY;
         let max_step = out[switch_at - 2_000..switch_at + 2_000]
             .windows(2)
             .map(|w| (w[1] - w[0]).abs())

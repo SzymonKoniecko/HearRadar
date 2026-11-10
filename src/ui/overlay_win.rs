@@ -507,6 +507,18 @@ impl EdgeStrip {
     }
 }
 
+/// Lewy-górny róg okna o boku `overlay_size` na ekranie `screen` (szerokość, wysokość) wg
+/// `anchor_x`/`anchor_y` (0–1) z marginesem `margin`. Radar większy niż ekran daje ujemny zakres:
+/// wtedy pozycja 0,5 go wyśrodkowuje, a brzegi wychodzą poza ekran (zamiast przyklejać go do
+/// lewego-górnego rogu i ucinać tylko z jednej strony).
+fn anchored_position(screen: (f32, f32), overlay_size: f32, anchor_x: f32, anchor_y: f32, margin: f32) -> (i32, i32) {
+    let usable_w = screen.0 - overlay_size - 2.0 * margin;
+    let usable_h = screen.1 - overlay_size - 2.0 * margin;
+    let x = margin + anchor_x * usable_w;
+    let y = margin + anchor_y * usable_h;
+    (x.round() as i32, y.round() as i32)
+}
+
 /// Natywny overlay sterowany bezpośrednio przez WinAPI zamiast przez viewport `eframe`: małe okno
 /// wokół tarczy radaru i, przy `edge_glow_enabled`, wąskie paski przy krawędziach ekranu na poświatę.
 /// Dawniej poświata krawędzi rozciągała całe okno na monitor i co klatkę wysyłała pełnoekranowy bufor,
@@ -540,11 +552,7 @@ impl WinOverlay {
     /// `HearRadarApp::overlay_anchored_position` dla ścieżki `eframe`.
     fn position_from_anchor(overlay_size: f32, anchor_x: f32, anchor_y: f32, margin: f32) -> (i32, i32) {
         let (screen_w, screen_h) = Self::screen_size();
-        let usable_w = (screen_w as f32 - overlay_size - 2.0 * margin).max(0.0);
-        let usable_h = (screen_h as f32 - overlay_size - 2.0 * margin).max(0.0);
-        let x = margin + anchor_x * usable_w;
-        let y = margin + anchor_y * usable_h;
-        (x.round() as i32, y.round() as i32)
+        anchored_position((screen_w as f32, screen_h as f32), overlay_size, anchor_x, anchor_y, margin)
     }
 
     /// Rysuje jedną klatkę radaru w małym oknie wokół tarczy i, przy `edge_glow_enabled`, poświatę
@@ -628,6 +636,17 @@ mod tests {
 
     fn screen() -> Rect {
         Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0))
+    }
+
+    #[test]
+    fn radar_bigger_than_the_screen_stays_centred_on_the_anchor() {
+        let screen = (3440.0, 1440.0);
+        // Mieści się: jak dawniej, od marginesu do marginesu.
+        assert_eq!(anchored_position(screen, 660.0, 0.0, 0.0, 28.0), (28, 28));
+        assert_eq!(anchored_position(screen, 660.0, 1.0, 1.0, 28.0), (3440 - 28 - 660, 1440 - 28 - 660));
+        // Wyższy niż ekran: przy pozycji 0,5 środek tarczy wypada na środku ekranu.
+        let (x, y) = anchored_position(screen, 1500.0, 0.5, 0.5, 28.0);
+        assert_eq!((x + 750, y + 750), (1720, 720));
     }
 
     #[test]

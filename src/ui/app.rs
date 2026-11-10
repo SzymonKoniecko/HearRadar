@@ -33,6 +33,12 @@ const OVERLAY_SCREEN_MARGIN: f32 = 28.0;
 /// Dodatkowe miejsce wokół tarczy radaru w oknie overlay — na wskaźnik LFE
 /// i ewentualne etykiety kierunków, żeby nic się nie ucinało.
 const OVERLAY_PADDING: f32 = 60.0;
+/// Zakres suwaka rozmiaru radaru (promień tarczy w px). 720 px to średnica równa wysokości ekranu
+/// 1440p. Większy radar też działa (np. wpisany w config), tylko jest przycinany na brzegach ekranu.
+const RADAR_RADIUS_MIN: f32 = 40.0;
+const RADAR_RADIUS_MAX: f32 = 720.0;
+/// Podgląd w oknie ustawień nie jest szerszy niż kolumna: większy radar rysujemy pomniejszony.
+const PREVIEW_MIN_RADIUS: f32 = 60.0;
 /// Domyślna liczba kanałów używana do podglądu/scenariuszy testowych, zanim
 /// jakikolwiek strumień audio dostarczy prawdziwą liczbę kanałów (7.1 pokazuje
 /// pełny zestaw kierunków, w tym wskaźnik LFE).
@@ -111,6 +117,13 @@ pub struct HearRadarApp {
     /// pokazywany pod przyciskami w panelu kolorów (`Ok(..)` na zielono,
     /// `Err(..)` na czerwono). `None` = nic jeszcze nie robiono w tej sesji.
     config_status: Option<Result<String, String>>,
+    /// Konfiguracja tak, jak leży w `config/radar_config.json` (ostatnio wczytana albo zapisana).
+    /// Różnica z `radar_config` to niezapisane zmiany: na dysk trafiają tylko po kliknięciu „Zapisz”.
+    saved_config: RadarConfig,
+    /// Wybrany profil z `config/profile/` (nazwa pliku bez `.json`).
+    profile_selected: Option<String>,
+    /// Nazwa nowego profilu wpisywana obok „Zapisz jako nowy profil”.
+    profile_new_name: String,
 
     /// Nagrania do odsłuchu z `recordings/` (lista w panelu „Źródło audio”).
     playable: Vec<PlayableFile>,
@@ -165,6 +178,7 @@ impl HearRadarApp {
         if let Ok(mut lock) = analysis.lock() {
             lock.radar_config = radar_config.clone();
         }
+        let saved_config = radar_config.clone();
 
         Self {
             analysis,
@@ -191,6 +205,9 @@ impl HearRadarApp {
             #[cfg(windows)]
             win_overlay: None,
             config_status: None,
+            saved_config,
+            profile_selected: None,
+            profile_new_name: String::new(),
             playable: playback::list_playable(&crate::sound::recorder::recordings_dir()),
             playable_selected: 0,
             file_player: None,
@@ -345,20 +362,15 @@ impl HearRadarApp {
         }
     }
 
-    /// Synchronizuje bieżącą konfigurację ze strumieniem audio (który czyta
-    /// `analysis.lock().radar_config` niezależnie od `self.radar_config`) i
-    /// zapisuje ją na dysk — każda zmiana w panelu ustawień przetrwa więc
-    /// restart aplikacji automatycznie, bez ręcznego klikania „Zapisz do
-    /// pliku” (ten przycisk w [`Self::ui_config_persistence`] zostaje jako
-    /// jawny „zapisz teraz i pokaż mi ścieżkę”, ale nie jest już jedynym
-    /// sposobem na trwały zapis).
-    fn write_radar_config(&mut self) {
+    /// Przekazuje bieżącą konfigurację strumieniowi audio (który czyta
+    /// `analysis.lock().radar_config` niezależnie od `self.radar_config`), więc
+    /// zmiana działa od razu. Na dysk nic nie trafia: plik zapisuje się tylko
+    /// po kliknięciu „Zapisz” w [`Self::ui_config_persistence`], a do tego
+    /// czasu panel pokazuje niezapisane zmiany.
+    fn apply_radar_config(&mut self) {
         self.radar_config.remember_appearance();
         if let Ok(mut lock) = self.analysis.lock() {
             lock.radar_config = self.radar_config.clone();
-        }
-        if let Err(e) = config_store::save(&self.radar_config) {
-            self.config_status = Some(Err(format!("Błąd automatycznego zapisu: {e}")));
         }
     }
 
@@ -729,6 +741,9 @@ impl HearRadarApp {
                 }
             }
         });
+        if self.mono_router.is_some() {
+            self.ui_mono_latency(ui);
+        }
 
         // Efekt na stronie przeciwnej do granego ucha (patrz
         // `mono_router::apply_cue`) — bez tego w trybie jednousznym
@@ -744,7 +759,7 @@ impl HearRadarApp {
                         .clicked()
                     {
                         self.radar_config.mono_cue_style = style;
-                        self.write_radar_config();
+                        self.apply_radar_config();
                     }
                 }
             });
@@ -752,8 +767,9 @@ impl HearRadarApp {
         ui.weak(
             "Dotyczy tylko ucha Lewe/Prawe. Na kanale: efekt dostaje cały kanał przeciwny, więc \
              trochę też dźwięki ze środka i z Twojej strony. Kierunkowo: efekt dostaje tylko dźwięk, \
-             który przychodzi z przeciwnej strony (osobno w każdym paśmie), w całości i bez zmiany \
-             głośności; środek (np. własna broń) i Twoja strona zostają czyste. Dodaje ok. 11 ms opóźnienia.",
+             który przychodzi z przeciwnej strony (osobno w każdym paśmie); środek (np. własna broń) \
+             i Twoja strona zostają czyste i mają pierwszeństwo (patrz „Strona przeciwna” niżej). \
+             Dodaje ok. 6 ms opóźnienia.",
         );
 
         // „Wg warstw”: osobny styl dla strzałów, kroków i reszty (patrz `MonoLayerStyles`).
@@ -785,7 +801,7 @@ impl HearRadarApp {
                 });
                 if chosen != current {
                     *self.radar_config.mono_layer_styles.get_mut(layer) = chosen;
-                    self.write_radar_config();
+                    self.apply_radar_config();
                 }
                 // Głośność i intensywność tej warstwy (dotyczą tylko dźwięku z przeciwnej strony).
                 let mut changed = false;
@@ -816,7 +832,7 @@ impl HearRadarApp {
                         .changed();
                 });
                 if changed {
-                    self.write_radar_config();
+                    self.apply_radar_config();
                 }
             }
         }
@@ -834,11 +850,12 @@ impl HearRadarApp {
                         }),
                 )
                 .on_hover_text(
-                    "Jak mocno oddycha dźwięk w pełni z przeciwnej strony. Średnia głośność zostaje ta sama.",
+                    "Jak mocno oddycha dźwięk w pełni z przeciwnej strony. Przy „Wskazówki tylko w dół” \
+                     od pełnej głośności w dół, inaczej wokół niej (ta sama średnia głośność).",
                 )
                 .changed()
             {
-                self.write_radar_config();
+                self.apply_radar_config();
             }
             if ui
                 .add(
@@ -847,12 +864,13 @@ impl HearRadarApp {
                         .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
                 )
                 .on_hover_text(
-                    "Cieńsze brzmienie dźwięku z przeciwnej strony (mniej dołu i góry, jak w zwykłym \
-                     Oddechu), bez ściszania. Pomaga przy krótkich dźwiękach, np. krokach. 0 % = sam oddech.",
+                    "Cieńsze brzmienie dźwięku z przeciwnej strony (mniej dołu, trochę mniej najwyższej \
+                     góry). Przy „Wskazówki tylko w dół” tylko ścina, inaczej z wyrównaną głośnością. \
+                     Pomaga przy krótkich dźwiękach, np. krokach. 0 % = sam oddech.",
                 )
                 .changed()
             {
-                self.write_radar_config();
+                self.apply_radar_config();
             }
         }
         if (style == MonoCueStyle::BreathBuzz || (per_layer && layer_styles.any_uses_breath_buzz()))
@@ -875,7 +893,13 @@ impl HearRadarApp {
                 )
                 .changed()
         {
-            self.write_radar_config();
+            self.apply_radar_config();
+        }
+
+        // Strona przeciwna w stylach kierunkowych: hierarchia poziomu i pierwszeństwo strony
+        // własnej (patrz `mono_router::OppositeSettings` i `wskazowki_strony_mono.md`).
+        if style.is_directional() {
+            self.ui_mono_opposite_side(ui, style, per_layer);
         }
 
         // Wzmocnienie sygnału mono na wyjściu — odpowiednik `INTENSITY_SCALE`
@@ -893,7 +917,7 @@ impl HearRadarApp {
             )
             .changed()
         {
-            self.write_radar_config();
+            self.apply_radar_config();
         }
 
         // Korekcja barwy (pochylenie bas↔wysokie wokół 500 Hz) — to NIE zmiana
@@ -907,7 +931,7 @@ impl HearRadarApp {
             .on_hover_text("Dodatnie: podbija wysokie i tłumi bas. Ujemne: odwrotnie. 0 = bez zmian.")
             .changed()
         {
-            self.write_radar_config();
+            self.apply_radar_config();
         }
 
         // Zmiana głośności z klasyfikacji: strzały ciszej, kroki głośniej. Wymaga opóźnienia
@@ -920,7 +944,7 @@ impl HearRadarApp {
             .on_hover_text("Na podstawie klasyfikacji radaru: strzały i wybuchy ciszej, kroki głośniej.")
             .changed()
         {
-            self.write_radar_config();
+            self.apply_radar_config();
         }
 
         // Wielkość zmiany klas: strzały i wybuchy o tyle ciszej, kroki o tyle głośniej.
@@ -933,7 +957,7 @@ impl HearRadarApp {
             )
             .changed()
         {
-            self.write_radar_config();
+            self.apply_radar_config();
         }
 
         // Scout: podbija ciche (kroki, przeładowanie) i ścisza głośne (wybuchy) w mono.
@@ -941,7 +965,7 @@ impl HearRadarApp {
             .checkbox(&mut self.radar_config.mono_scout, "Scout: wzmocnij ciche, ścisz głośne (mono)")
             .changed()
         {
-            self.write_radar_config();
+            self.apply_radar_config();
         }
         if ui
             .add_enabled(
@@ -952,7 +976,7 @@ impl HearRadarApp {
             )
             .changed()
         {
-            self.write_radar_config();
+            self.apply_radar_config();
         }
 
         let is_routing = self.mono_router.is_some();
@@ -996,6 +1020,143 @@ impl HearRadarApp {
 
         if let Some(msg) = &self.mono_status {
             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg);
+        }
+    }
+
+    /// Zmierzone opóźnienie toru mono w aplikacji: bufor między wejściem a słuchawkami (patrz
+    /// `sound::ring_clock`) plus rozdzielanie i limiter stylów kierunkowych.
+    fn ui_mono_latency(&self, ui: &mut egui::Ui) {
+        let latency = self.analysis.mono_latency();
+        let directional = self.radar_config.mono_cue_style.is_directional()
+            && matches!(self.mono_ear, MonoEar::Left | MonoEar::Right);
+        let processing = if directional { mono_router::directional_latency_ms() } else { 0.0 };
+        let Some(buffer) = latency.buffer_ms else {
+            ui.weak("Opóźnienie w aplikacji: mierzę…");
+            return;
+        };
+        ui.label(format!("Opóźnienie w aplikacji: ok. {:.0} ms", buffer + processing)).on_hover_text(
+            "Od wejścia (np. VB-Cable) do wysłania dźwięku do słuchawek. Nie obejmuje buforów samych \
+             urządzeń: VB-Cable i Windows dokładają zwykle po ok. 10 ms, słuchawki Bluetooth 100–200 ms.",
+        );
+        let processing_text = if directional {
+            format!(", rozdzielanie i limiter {processing:.1} ms")
+        } else {
+            String::new()
+        };
+        ui.weak(format!(
+            "bufor {buffer:.0} ms (cel {:.0} ms){processing_text} · przerwy: {} · korekta zegara {:+.0} ppm",
+            latency.target_ms, latency.underruns, latency.correction_ppm
+        ))
+        .on_hover_text(
+            "Bufor sam trzyma się celu: korekta zegara to drobne przyspieszenie albo zwolnienie \
+             odczytu (najwyżej ±0,5 %, niesłyszalne), które wyrównuje różnicę tempa wejścia i \
+             słuchawek. Przerwa to chwila, w której zabrakło dźwięku; po niej cel rośnie o 2 ms, \
+             a po 30 s bez przerw wolno wraca. „Wg warstw” i zmiana głośności klas trzymają 250 ms.",
+        );
+    }
+
+    /// Sekcja „Strona przeciwna” dla stylów kierunkowych: wskazówki tylko w dół, poziom,
+    /// ustępowanie, cień głowy, wycofywanie wskazówki i głębokość dołków grzebienia.
+    fn ui_mono_opposite_side(&mut self, ui: &mut egui::Ui, style: MonoCueStyle, per_layer: bool) {
+        use crate::sound::directional as d;
+        let in_use = if per_layer { self.radar_config.mono_layer_styles.in_layer_order() } else { [style; 3] };
+        let c = &mut self.radar_config;
+        let mut changed = false;
+        ui.add_space(4.0);
+        ui.label("Strona przeciwna (style kierunkowe):");
+        ui.indent("mono_opposite_side", |ui| {
+            changed |= ui
+                .checkbox(&mut c.mono_cue_subtractive, "Wskazówki tylko w dół")
+                .on_hover_text(
+                    "Efekt nigdzie nie podnosi dźwięku z przeciwnej strony ponad oryginał: oddech od pełnej \
+                     głośności w dół, grzebień z samymi dołkami, jasny ścisza dół zamiast podbijać górę. \
+                     Wyłączone = dawne wyrównanie głośności (do porównania).",
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut c.mono_opposite_level_db,
+                        d::MIN_OPPOSITE_LEVEL_DB..=d::MAX_OPPOSITE_LEVEL_DB,
+                    )
+                    .text("Poziom")
+                    .suffix(" dB"),
+                )
+                .on_hover_text(
+                    "Głośność całego dźwięku z przeciwnej strony. Ujemny poziom oddaje część naturalnego \
+                     cienia głowy, więc Twoja strona jest wyraźniejsza. W „Wg warstw” dodaje się do \
+                     głośności warstwy (krok z 0 dB też dostaje ten poziom).",
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut c.mono_opposite_duck_db, 0.0..=d::MAX_DUCK_DB)
+                        .text("Ustępowanie")
+                        .custom_formatter(|v, _| if v < 0.05 { "wyłączone".into() } else { format!("{v:.0} dB") }),
+                )
+                .on_hover_text(
+                    "Gdy w jakimś paśmie gra coś z Twojej strony i grozi mu zagłuszenie, strona przeciwna \
+                     jest w tym paśmie ciszej o tyle dB. Pozostałe pasma bez zmian. Środek (np. własna \
+                     broń) nie steruje.",
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut c.mono_opposite_shadow, 0.0..=d::MAX_SHADOW)
+                        .text("Cień głowy")
+                        .custom_formatter(|v, _| {
+                            if v < 0.005 { "wyłączony".into() } else { format!("{:.0} %", v * 100.0) }
+                        }),
+                )
+                .on_hover_text(
+                    "Dźwięki bardziej z boku są ciszej, jak naturalnie za głową. Przy 50 % dźwięk \
+                     z różnicą stron 10 dB jest ok. 4 dB ciszej, a z różnicą 6 dB ok. 2 dB.",
+                )
+                .changed();
+            if in_use.iter().any(|s| s.fades_after_onset()) {
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut c.mono_cue_tail, 0.0..=1.0)
+                            .text("Wskazówka po początku dźwięku")
+                            .custom_formatter(|v, _| {
+                                if v >= f64::from(d::NO_FADE_CUE_TAIL) {
+                                    "100 % (bez wycofywania)".into()
+                                } else {
+                                    format!("{:.0} %", v * 100.0)
+                                }
+                            }),
+                    )
+                    .on_hover_text(
+                        "Grzebień, jasny, piskliwy i brzęczenie oznaczają w pełni pierwsze 0,2 s dźwięku \
+                         z przeciwnej strony, potem w 0,3 s słabną do tej wartości. Oddech zostaje ciągły.",
+                    )
+                    .changed();
+                changed |= ui
+                    .add_enabled(
+                        c.mono_cue_tail < d::NO_FADE_CUE_TAIL,
+                        egui::Slider::new(&mut c.mono_cue_tail_level_db, d::MIN_TAIL_LEVEL_DB..=0.0)
+                            .text("Ściszenie ogona")
+                            .suffix(" dB"),
+                    )
+                    .on_hover_text("O ile ciszej gra dźwięk z przeciwnej strony po wycofaniu wskazówki.")
+                    .changed();
+            }
+            if c.mono_cue_subtractive && in_use.contains(&MonoCueStyle::DirectionalComb) {
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut c.mono_comb_notch_db, d::MIN_COMB_NOTCH_DB..=d::MAX_COMB_NOTCH_DB)
+                            .text("Głębokość dołków grzebienia")
+                            .suffix(" dB"),
+                    )
+                    .on_hover_text(
+                        "Jak głębokie są dołki grzebienia (ok. 420, 1250, 2080 Hz…). Głębiej = wyraźniejsza \
+                         „pusta” barwa. Szczyty zostają na poziomie oryginału.",
+                    )
+                    .changed();
+            }
+        });
+        if changed {
+            self.apply_radar_config();
         }
     }
 
@@ -1061,7 +1222,7 @@ impl HearRadarApp {
             ui.heading("Konfiguracja radaru");
             if ui.small_button("↺ Reset").clicked() {
                 self.radar_config = RadarConfig::default();
-                self.write_radar_config();
+                self.apply_radar_config();
             }
         });
 
@@ -1086,7 +1247,7 @@ impl HearRadarApp {
         ui.weak("Rozmiar, przezroczystości, czułość, kolory i wzmocnienia zapisują się osobno dla każdego trybu. Pozycja na ekranie jest wspólna.");
 
         if changed {
-            self.write_radar_config();
+            self.apply_radar_config();
         }
 
         // Każdy tryb pokazuje tylko te ustawienia, których faktycznie używa.
@@ -1102,7 +1263,13 @@ impl HearRadarApp {
                 .changed();
             position_changed |= ui
                 .add(
-                    egui::Slider::new(&mut self.radar_config.radius, 40.0..=300.0).text("Rozmiar (px)"),
+                    egui::Slider::new(&mut self.radar_config.radius, RADAR_RADIUS_MIN..=RADAR_RADIUS_MAX)
+                        .text("Rozmiar (px)"),
+                )
+                .on_hover_text(
+                    "Promień tarczy w pikselach. Powyżej 300 px łuki grubieją razem z radarem. Radar \
+                     większy niż ekran jest ustawiany wg pozycji X/Y i przycinany na brzegach. Duży \
+                     radar kosztuje więcej procesora (rysowanie co klatkę).",
                 )
                 .changed();
         }
@@ -1187,7 +1354,7 @@ impl HearRadarApp {
         ui.label("Skrót ⌥/Alt+R pokazuje/ukrywa overlay (działa, gdy to okno ma fokus).");
 
         if changed {
-            self.write_radar_config();
+            self.apply_radar_config();
         }
     }
 
@@ -1213,7 +1380,7 @@ impl HearRadarApp {
             changed = true;
         }
         if changed {
-            self.write_radar_config();
+            self.apply_radar_config();
         }
     }
 
@@ -1443,7 +1610,7 @@ impl HearRadarApp {
             ui.heading("Kolory wg częstotliwości");
             if ui.small_button("↺ Domyślne 5 pasm").clicked() {
                 self.radar_config.color_rules = spectrum::default_color_rules();
-                self.write_radar_config();
+                self.apply_radar_config();
             }
         });
         ui.label("Dowolna liczba reguł: zakres Hz → kolor. Kropka bierze kolor reguły z najsilniejszą energią w danej ramce.");
@@ -1553,7 +1720,7 @@ impl HearRadarApp {
         }
 
         if changed {
-            self.write_radar_config();
+            self.apply_radar_config();
         }
 
     }
@@ -1600,7 +1767,7 @@ impl HearRadarApp {
                 ui.horizontal(|ui| {
                     if ui.button(profile.name).clicked() {
                         self.radar_config.color_rules = (profile.build)();
-                        self.write_radar_config();
+                        self.apply_radar_config();
                     }
                     ui.weak(profile.description);
                 });
@@ -1609,22 +1776,106 @@ impl HearRadarApp {
         });
     }
 
-    /// Zapis/wczytanie konfiguracji radaru (w tym reguł kolorów) do lokalnego
-    /// pliku JSON w katalogu konfiguracyjnym systemu — patrz [`config_store`].
-    fn ui_config_persistence(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("💾 Zapisz do pliku").clicked() {
-                self.config_status = Some(
-                    config_store::save(&self.radar_config)
-                        .map(|path| format!("Zapisano: {}", path.display()))
-                        .map_err(|e| format!("Błąd zapisu: {e}")),
-                );
+    /// Czy bieżąca konfiguracja różni się od zapisanej w `config/radar_config.json`.
+    fn has_unsaved_changes(&self) -> bool {
+        self.radar_config != self.saved_config
+    }
+
+    /// Zapisuje bieżącą konfigurację do `config/radar_config.json` (wczytywanego przy starcie).
+    fn save_main_config(&mut self) {
+        self.radar_config.remember_appearance();
+        self.config_status = Some(match config_store::save(&self.radar_config) {
+            Ok(path) => {
+                self.saved_config = self.radar_config.clone();
+                Ok(format!("Zapisano: {}", path.display()))
             }
-            if ui.button("📂 Wczytaj z pliku").clicked() {
+            Err(e) => Err(format!("Błąd zapisu: {e}")),
+        });
+    }
+
+    /// Zapisuje bieżącą konfigurację jako profil `name` w `config/profile/`. Bez `overwrite`
+    /// odmawia, gdy profil o tej nazwie już istnieje.
+    fn save_profile(&mut self, name: &str, overwrite: bool) {
+        self.radar_config.remember_appearance();
+        let result = config_store::profile_path(name).and_then(|path| {
+            if !overwrite && path.exists() {
+                anyhow::bail!("profil „{}” już istnieje: wybierz go z listy i kliknij „Nadpisz”", display_stem(&path));
+            }
+            config_store::save_to(&path, &self.radar_config)?;
+            Ok(path)
+        });
+        self.config_status = Some(match result {
+            Ok(path) => {
+                let saved = display_stem(&path);
+                self.profile_selected = Some(saved.clone());
+                self.profile_new_name.clear();
+                Ok(format!("Zapisano profil „{saved}”: {}", path.display()))
+            }
+            Err(e) => Err(format!("Błąd zapisu profilu: {e}")),
+        });
+    }
+
+    /// Wczytuje profil `name` i od razu go stosuje. Plik startowy zostaje bez zmian, dopóki
+    /// nie klikniesz „Zapisz”.
+    fn load_profile(&mut self, name: &str) {
+        let result = config_store::profile_path(name).and_then(|path| config_store::load_from(&path));
+        self.config_status = Some(match result {
+            Ok(cfg) => {
+                self.radar_config = cfg;
+                self.apply_radar_config();
+                Ok(format!(
+                    "Wczytano profil „{name}”. Kliknij „Zapisz”, żeby wczytywał się też przy starcie."
+                ))
+            }
+            Err(e) => Err(format!("Błąd wczytywania profilu: {e}")),
+        });
+    }
+
+    /// Pasek pod tytułem: stan zapisu i przycisk „Zapisz”, widoczne bez przewijania.
+    fn ui_save_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let unsaved = self.has_unsaved_changes();
+            if ui
+                .add_enabled(unsaved, egui::Button::new("💾 Zapisz"))
+                .on_hover_text("Zapisuje bieżące ustawienia do config/radar_config.json, wczytywanego przy starcie.")
+                .clicked()
+            {
+                self.save_main_config();
+            }
+            if unsaved {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 170, 60),
+                    "● Niezapisane zmiany: działają już teraz, ale po restarcie wróci zapisana konfiguracja.",
+                );
+            } else {
+                ui.weak("Wszystko zapisane.");
+            }
+        });
+    }
+
+    /// Zapis/wczytanie konfiguracji radaru (w tym reguł kolorów) do pliku JSON
+    /// w `config/` w repo i nazwane profile w `config/profile/` — patrz
+    /// [`config_store`]. Nic nie zapisuje się samo: tylko po kliknięciu.
+    fn ui_config_persistence(&mut self, ui: &mut egui::Ui) {
+        ui.label("Konfiguracja");
+        ui.horizontal(|ui| {
+            if ui
+                .button("💾 Zapisz")
+                .on_hover_text("Zapisuje bieżące ustawienia do pliku wczytywanego przy starcie.")
+                .clicked()
+            {
+                self.save_main_config();
+            }
+            if ui
+                .button("📂 Wczytaj")
+                .on_hover_text("Wraca do ustawień z pliku startowego (porzuca niezapisane zmiany).")
+                .clicked()
+            {
                 match config_store::load() {
                     Ok(cfg) => {
                         self.radar_config = cfg;
-                        self.write_radar_config();
+                        self.apply_radar_config();
+                        self.saved_config = self.radar_config.clone();
                         self.config_status = Some(Ok("Wczytano konfigurację z pliku.".to_string()));
                     }
                     Err(e) => {
@@ -1632,8 +1883,62 @@ impl HearRadarApp {
                     }
                 }
             }
+            if self.has_unsaved_changes() {
+                ui.colored_label(egui::Color32::from_rgb(230, 170, 60), "● niezapisane zmiany");
+            }
         });
-        ui.weak(format!("Plik: {}", config_store::config_file_path().display()));
+        ui.weak(format!("Plik startowy: {}", config_store::config_file_path().display()));
+
+        // Profile: nazwane kopie całej konfiguracji (np. do porównywania ustawień mono).
+        ui.add_space(4.0);
+        ui.label("Profile (cała konfiguracja pod własną nazwą):");
+        ui.horizontal(|ui| {
+            let selected_text = self.profile_selected.clone().unwrap_or_else(|| "(wybierz profil)".to_string());
+            egui::ComboBox::from_id_salt("config_profile")
+                .selected_text(selected_text)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    let profiles = config_store::list_profiles();
+                    if profiles.is_empty() {
+                        ui.weak("Brak profili");
+                    }
+                    for name in profiles {
+                        let checked = self.profile_selected.as_deref() == Some(name.as_str());
+                        if ui.selectable_label(checked, &name).clicked() {
+                            self.profile_selected = Some(name);
+                        }
+                    }
+                });
+            let selected = self.profile_selected.clone();
+            if ui
+                .add_enabled(selected.is_some(), egui::Button::new("📂 Wczytaj profil"))
+                .on_hover_text("Stosuje profil od razu. Plik startowy zmieni się dopiero po „Zapisz”.")
+                .clicked()
+                && let Some(name) = &selected
+            {
+                self.load_profile(name);
+            }
+            if ui
+                .add_enabled(selected.is_some(), egui::Button::new("Nadpisz profil"))
+                .on_hover_text("Zapisuje bieżące ustawienia w miejsce wybranego profilu.")
+                .clicked()
+                && let Some(name) = &selected
+            {
+                self.save_profile(name, true);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.profile_new_name)
+                    .hint_text("nazwa nowego profilu")
+                    .desired_width(260.0),
+            );
+            if ui.button("💾 Zapisz jako nowy profil").clicked() {
+                let name = self.profile_new_name.clone();
+                self.save_profile(&name, false);
+            }
+        });
+        ui.weak(format!("Katalog profili: {}", config_store::profile_dir().display()));
 
         if let Some(status) = &self.config_status {
             match status {
@@ -1656,19 +1961,27 @@ impl HearRadarApp {
     // ── Panel: podgląd radaru (mały obszar rysowania w głównym oknie) ────
     fn ui_radar_preview(&mut self, ui: &mut egui::Ui) {
         ui.heading("Podgląd radaru");
-        let size = self.radar_config.radius * 2.0 + 40.0_f32.max(overlay_padding_needed(&self.radar_config));
-        let (rect, _response) =
-            ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+        let padding = 40.0_f32.max(overlay_padding_needed(&self.radar_config));
+        // Radar szerszy niż kolumna rysujemy w podglądzie pomniejszony do jej szerokości.
+        let fit_radius = ((ui.available_width() - padding) * 0.5).max(PREVIEW_MIN_RADIUS);
+        let scaled;
+        let cfg = if self.radar_config.radius > fit_radius {
+            ui.weak(format!(
+                "Pomniejszony: na ekranie promień {:.0} px, tu {fit_radius:.0} px.",
+                self.radar_config.radius
+            ));
+            let mut smaller = self.radar_config.clone();
+            smaller.radius = fit_radius;
+            scaled = smaller;
+            &scaled
+        } else {
+            &self.radar_config
+        };
+        let size = cfg.radius * 2.0 + 40.0_f32.max(overlay_padding_needed(cfg));
+        let (rect, _response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
         let painter = ui.painter_at(rect);
         let now = ui.input(|i| i.time);
-        draw_radar(
-            &painter,
-            rect.center(),
-            &self.radar_config,
-            &mut self.radar_state,
-            self.current_channels,
-            now,
-        );
+        draw_radar(&painter, rect.center(), cfg, &mut self.radar_state, self.current_channels, now);
     }
 
     /// Oblicza pozycję lewego-górnego rogu okna overlay na ekranie z
@@ -1683,8 +1996,9 @@ impl HearRadarApp {
         if monitor_size.x <= 1.0 || monitor_size.y <= 1.0 {
             return None;
         }
-        let usable_w = (monitor_size.x - overlay_size - 2.0 * OVERLAY_SCREEN_MARGIN).max(0.0);
-        let usable_h = (monitor_size.y - overlay_size - 2.0 * OVERLAY_SCREEN_MARGIN).max(0.0);
+        // Ujemny zakres = radar większy niż ekran: pozycja 0,5 go wyśrodkowuje, brzegi są przycinane.
+        let usable_w = monitor_size.x - overlay_size - 2.0 * OVERLAY_SCREEN_MARGIN;
+        let usable_h = monitor_size.y - overlay_size - 2.0 * OVERLAY_SCREEN_MARGIN;
         let x = OVERLAY_SCREEN_MARGIN + self.radar_config.anchor_x * usable_w;
         let y = OVERLAY_SCREEN_MARGIN + self.radar_config.anchor_y * usable_h;
         Some(egui::pos2(x, y))
@@ -1718,8 +2032,9 @@ impl HearRadarApp {
     /// (patrz [`Self::overlay_anchored_position`] dla trybu przeciwnego).
     #[cfg(not(windows))]
     fn dial_center_in(&self, rect: egui::Rect, dial_size: f32) -> egui::Pos2 {
-        let usable_w = (rect.width() - dial_size - 2.0 * OVERLAY_SCREEN_MARGIN).max(0.0);
-        let usable_h = (rect.height() - dial_size - 2.0 * OVERLAY_SCREEN_MARGIN).max(0.0);
+        // Ujemny zakres = radar większy niż ekran: pozycja 0,5 go wyśrodkowuje, brzegi są przycinane.
+        let usable_w = rect.width() - dial_size - 2.0 * OVERLAY_SCREEN_MARGIN;
+        let usable_h = rect.height() - dial_size - 2.0 * OVERLAY_SCREEN_MARGIN;
         let x = rect.left() + OVERLAY_SCREEN_MARGIN + self.radar_config.anchor_x * usable_w + dial_size / 2.0;
         let y = rect.top() + OVERLAY_SCREEN_MARGIN + self.radar_config.anchor_y * usable_h + dial_size / 2.0;
         egui::pos2(x, y)
@@ -1862,7 +2177,8 @@ impl eframe::App for HearRadarApp {
 
         egui::CentralPanel::default().show(root_ui, |ui| {
             ui.heading("Hear Radar !!!");
-            ui.add_space(8.0);
+            self.ui_save_bar(ui);
+            ui.add_space(4.0);
             self.ui_speaker_setup(ui);
             ui.add_space(4.0);
 
@@ -1979,6 +2295,11 @@ impl eframe::App for HearRadarApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         egui::Rgba::TRANSPARENT.to_array()
     }
+}
+
+/// Nazwa profilu z jego ścieżki (nazwa pliku bez `.json`).
+fn display_stem(path: &std::path::Path) -> String {
+    path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// Podgląd reguł na osi częstotliwości 20 Hz – 20 kHz (skala logarytmiczna,

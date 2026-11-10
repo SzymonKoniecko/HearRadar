@@ -1022,7 +1022,7 @@ fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, 
 
     let r = cfg.radius;
     let fg = cfg.fg_alpha;
-    let thickness = (r * 0.06).clamp(3.0, 9.0) * cfg.line_thickness.max(0.5);
+    let thickness = layer_arc_thickness(r) * cfg.line_thickness.max(0.5);
     let inner = r * cfg.layer_arc_inner;
     let spacing = r * cfg.layer_arc_spacing;
     let highlighted = state.layer_bars.highlighted_layer();
@@ -1104,7 +1104,7 @@ const INNER_LAYERS: [Layer; 2] = [Layer::Shots, Layer::Steps];
 fn draw_layer_bars_2x2<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, state: &RadarState, now: f64) {
     let r = cfg.radius;
     let fg = cfg.fg_alpha;
-    let thickness = (r * 0.06).clamp(3.0, 9.0) * cfg.line_thickness.max(0.5);
+    let thickness = layer_arc_thickness(r) * cfg.line_thickness.max(0.5);
     let inner = r * cfg.layer_arc_inner;
     // Zewnętrzny łuk leży na obwodzie, tam gdzie stare wskaźniki reszty.
     let rim_thickness = stereo_arc_thickness(r, cfg.line_thickness.max(0.0));
@@ -1986,8 +1986,20 @@ fn dominant_speaker(layout: &[ChannelRole], levels: &[f32]) -> Option<usize> {
     (top >= MIN_LEVEL && top - second > DOMINANCE_MARGIN).then_some(idx)
 }
 
+/// Od tego promienia (px) łuki przestają mieć stałą, największą grubość i rosną razem z radarem.
+/// Do niego wygląd jest taki jak przed powiększeniem zakresu rozmiaru.
+const ARC_GROWTH_RADIUS: f32 = 300.0;
+
+/// Grubość łuków stereo (obwód) przy promieniu `r` i grubości linii `lt`: 5 % promienia w zakresie
+/// 3–8 px, a powyżej [`ARC_GROWTH_RADIUS`] proporcjonalnie do promienia.
 fn stereo_arc_thickness(r: f32, lt: f32) -> f32 {
-    (r * 0.05).clamp(3.0, 8.0) * lt.max(0.5)
+    (r * 0.05).clamp(3.0, 8.0).max(r * 8.0 / ARC_GROWTH_RADIUS) * lt.max(0.5)
+}
+
+/// Grubość łuków warstw (przy grubości linii 1): 6 % promienia w zakresie 3–9 px, a powyżej
+/// [`ARC_GROWTH_RADIUS`] proporcjonalnie do promienia.
+fn layer_arc_thickness(r: f32) -> f32 {
+    (r * 0.06).clamp(3.0, 9.0).max(r * 9.0 / ARC_GROWTH_RADIUS)
 }
 
 fn draw_arc<C: RadarCanvas>(
@@ -2267,6 +2279,19 @@ pub fn draw_edge_glow_indicators<C: RadarCanvas>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arcs_keep_their_look_up_to_300_px_and_grow_with_a_bigger_radar() {
+        // Do 300 px jak dawniej (stała największa grubość od ok. 150–160 px).
+        for r in [40.0, 100.0, 160.0, 250.0, 300.0] {
+            assert_eq!(layer_arc_thickness(r), (r * 0.06).clamp(3.0, 9.0), "warstwy, r = {r}");
+            assert_eq!(stereo_arc_thickness(r, 1.0), (r * 0.05).clamp(3.0, 8.0), "stereo, r = {r}");
+        }
+        // Powyżej rośnie proporcjonalnie: dwa razy większy radar, dwa razy grubsze łuki.
+        assert!((layer_arc_thickness(600.0) - 18.0).abs() < 1e-4);
+        assert!((stereo_arc_thickness(600.0, 1.0) - 16.0).abs() < 1e-4);
+        assert!((stereo_arc_thickness(600.0, 2.0) - 32.0).abs() < 1e-4, "grubość linii dalej mnoży");
+    }
 
     #[test]
     fn dominant_speaker_needs_a_clear_gap_over_the_second_loudest() {

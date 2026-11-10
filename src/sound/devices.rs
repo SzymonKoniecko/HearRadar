@@ -10,6 +10,7 @@ use std::time::Instant;
 use crate::sound::direction::{self, analyze_channels};
 use crate::sound::layers::{self, LayerHit};
 use crate::sound::recorder;
+use crate::sound::ring_clock;
 use crate::sound::sample_logger;
 use crate::sound::spectrum::{self, ColorRule};
 use std::collections::BTreeMap;
@@ -319,7 +320,7 @@ pub struct RadarConfig {
     #[serde(default)]
     pub mono_cue_style: MonoCueStyle,
     /// Głębokość oddechu w stylach kierunkowych z oddechem (`MonoCueStyle::uses_breath`),
-    /// 0–0,95. 0,6 daje wahanie ok. 8 dB dla dźwięku w pełni z przeciwnej strony.
+    /// 0–0,95. Domyślne 0,44 to dołek −5 dB dla dźwięku w pełni z przeciwnej strony.
     #[serde(default = "default_mono_breath_depth")]
     pub mono_breath_depth: f32,
     /// Siła cieńszej barwy w stylach kierunkowych z oddechem, 0–1: 0 = sam oddech, 1 = kształt
@@ -333,6 +334,30 @@ pub struct RadarConfig {
     /// Styl wskazówki dla strzałów, kroków i reszty w stylu „Wg warstw” (`MonoCueStyle::PerLayer`).
     #[serde(default)]
     pub mono_layer_styles: MonoLayerStyles,
+    /// Strona przeciwna w stylach kierunkowych (patrz `mono_router::OppositeSettings`).
+    /// Wskazówki tylko „w dół”: efekt nigdzie nie podnosi dźwięku z przeciwnej strony ponad
+    /// oryginał (oddech od 0 dB w dół, grzebień z samymi dołkami). Wyłączone = wyrównana głośność.
+    #[serde(default = "default_mono_cue_subtractive")]
+    pub mono_cue_subtractive: bool,
+    /// Głębokość dołków grzebienia w trybie „w dół” (dB, −24…−6).
+    #[serde(default = "default_mono_comb_notch_db")]
+    pub mono_comb_notch_db: f32,
+    /// Poziom oznaczonej strony przeciwnej (dB, −12…+6). W „Wg warstw” dodaje się do głośności warstwy.
+    #[serde(default = "default_mono_opposite_level_db")]
+    pub mono_opposite_level_db: f32,
+    /// O ile dB strona przeciwna ustępuje w paśmie, w którym gra strona własna (0–12, 0 = wyłączone).
+    #[serde(default = "default_mono_opposite_duck_db")]
+    pub mono_opposite_duck_db: f32,
+    /// Cień głowy dla strony przeciwnej (0–0,7, 0 = wyłączony): dźwięki bardziej z boku ciszej.
+    #[serde(default)]
+    pub mono_opposite_shadow: f32,
+    /// Siła wskazówki po początku dźwięku w stylach bez wolnej modulacji (grzebień, jasny, piskliwy,
+    /// brzęczenie), 0–1. 1 = wskazówka cały czas tak samo mocna.
+    #[serde(default = "default_mono_cue_tail")]
+    pub mono_cue_tail: f32,
+    /// Ściszenie ogona po wycofaniu wskazówki (dB, −6…0).
+    #[serde(default = "default_mono_cue_tail_level_db")]
+    pub mono_cue_tail_level_db: f32,
     /// Włącza odejmowanie energii wspólnej dla wszystkich kanałów kierunkowych
     /// przed sprawdzeniem onsetu (patrz [`crate::sound::direction::CONTRAST_AMOUNT`]
     /// i doc-komentarz [`crate::sound::direction::detect_channel_activity`]) —
@@ -541,12 +566,36 @@ fn default_mono_breath_depth() -> f32 {
     crate::sound::directional::DEFAULT_DEPTH
 }
 
+fn default_mono_cue_subtractive() -> bool {
+    true
+}
+
 fn default_mono_breath_timbre() -> f32 {
     crate::sound::directional::DEFAULT_TIMBRE
 }
 
 fn default_mono_buzz_depth() -> f32 {
     crate::sound::directional::DEFAULT_BUZZ_DEPTH
+}
+
+fn default_mono_comb_notch_db() -> f32 {
+    crate::sound::directional::DEFAULT_COMB_NOTCH_DB
+}
+
+fn default_mono_opposite_level_db() -> f32 {
+    crate::sound::directional::DEFAULT_OPPOSITE_LEVEL_DB
+}
+
+fn default_mono_opposite_duck_db() -> f32 {
+    crate::sound::directional::DEFAULT_DUCK_DB
+}
+
+fn default_mono_cue_tail() -> f32 {
+    crate::sound::directional::DEFAULT_CUE_TAIL
+}
+
+fn default_mono_cue_tail_level_db() -> f32 {
+    crate::sound::directional::DEFAULT_TAIL_LEVEL_DB
 }
 
 fn default_mono_class_gain_db() -> f32 {
@@ -663,6 +712,13 @@ impl Default for RadarConfig {
             mono_breath_timbre: default_mono_breath_timbre(),
             mono_buzz_depth: default_mono_buzz_depth(),
             mono_layer_styles: MonoLayerStyles::default(),
+            mono_cue_subtractive: true,
+            mono_comb_notch_db: default_mono_comb_notch_db(),
+            mono_opposite_level_db: default_mono_opposite_level_db(),
+            mono_opposite_duck_db: default_mono_opposite_duck_db(),
+            mono_opposite_shadow: 0.0,
+            mono_cue_tail: default_mono_cue_tail(),
+            mono_cue_tail_level_db: default_mono_cue_tail_level_db(),
             direction_contrast_enabled: false,
             visualization_mode: VisualizationMode::default(),
             speaker_setup: SpeakerSetup::default(),
@@ -717,8 +773,8 @@ impl MonoEar {
 /// Style są w dwóch grupach. Kanałowe ([`Self::CHANNEL`]) dają efekt całemu
 /// kanałowi przeciwnemu, więc dostaje go też kopia dźwięków ze środka i ze swojej
 /// strony. Kierunkowe ([`Self::DIRECTIONAL`]) dają efekt tylko dźwiękowi, który
-/// przychodzi z przeciwnej strony (patrz `sound::directional`), w całości
-/// i z wyrównaną głośnością; opóźniają wyjście o ok. 11 ms.
+/// przychodzi z przeciwnej strony (patrz `sound::directional`); opóźniają wyjście o ok. 6 ms
+/// (rozdzielanie i limiter).
 ///
 /// Usunięte style (Pulsowanie, Stłumiony, Ciemny, Odbicie, Wycięcie środka,
 /// Falowanie) wczytują się ze starego configu jako styl domyślny, patrz
@@ -852,6 +908,16 @@ impl MonoCueStyle {
     /// Czy styl kierunkowy ma oddech i cieńszą barwę (suwaki głębokości i barwy).
     pub fn uses_breath(self) -> bool {
         matches!(self, Self::DirectionalBreath | Self::BreathBuzz)
+    }
+
+    /// Czy styl kierunkowy oznacza mocno tylko początek dźwięku, a potem wycofuje wskazówkę
+    /// („oznacz i wycofaj”). Tak działają style bez wolnej modulacji. Oddech zostaje ciągły,
+    /// bo jego wskazówką jest właśnie długie wahanie.
+    pub fn fades_after_onset(self) -> bool {
+        matches!(
+            self,
+            Self::DirectionalComb | Self::DirectionalBright | Self::DirectionalSqueaky | Self::DirectionalBuzz
+        )
     }
 
     /// Styl kanałowy, którego efekt wersja kierunkowa nakłada na dźwięk z przeciwnej strony.
@@ -1119,36 +1185,20 @@ impl AudioAnalysis {
 }
 
 /// Pojemność bufora kołowego próbek mono — ok. 1,36 s przy 48 kHz (potęga dwójki). To TWARDY
-/// limit pamięci, NIE docelowe opóźnienie. Opóźnienie utrzymuje [`TARGET_RING_LATENCY_SAMPLES`].
+/// limit pamięci, NIE docelowe opóźnienie. Opóźnienie utrzymuje [`ring_clock::RingClock`].
 const MONO_RING_CAPACITY: usize = 65_536;
-
-/// Docelowe opóźnienie wyjścia mono względem wejścia, w trybie zwykłym (50 ms przy 48 kHz).
-/// Z włączoną zmianą głośności klas używamy [`CLASS_GAIN_LATENCY_SAMPLES`].
-const TARGET_RING_LATENCY_SAMPLES: usize = 2_400;
 
 /// Opóźnienie wyjścia z włączoną zmianą głośności klas albo stylem wskazówki „Wg warstw”
 /// (0,25 s przy 48 kHz). Tyle trwa klasyfikacja zdarzenia (ok. 0,15 s, patrz
 /// `layers::LayerTracker::take_ready`) plus zapas, żeby zmiana zdążyła przed początkiem dźwięku.
+/// Bez nich cel jest krótki i liczony na bieżąco (patrz [`ring_clock::RingClock::short_target`]).
 const CLASS_GAIN_LATENCY_SAMPLES: usize = 12_000;
 
-/// Próg, po przekroczeniu którego bufor jest od razu przycinany z powrotem do
-/// [`TARGET_RING_LATENCY_SAMPLES`], zamiast czekać, aż urośnie do
-/// [`MONO_RING_CAPACITY`]. Wejście i wyjście to dwa NIEZALEŻNE zegary
-/// sprzętowe (patrz doc-komentarz [`SharedAudioAnalysis::mono_ring`]) — gdy
-/// wejście choćby ułamek procenta wyprzedza tempem wyjście, bufor bez tego
-/// progu monotonicznie rośnie i UTYKA na twardym limicie (~340ms), więc
-/// KAŻDA odtworzona próbka jest odtąd trwale spóźniona o tyle. Przycinanie
-/// dużo wcześniej, przy przekroczeniu tego niższego progu, utrzymuje
-/// opóźnienie blisko `TARGET_RING_LATENCY_SAMPLES` bez względu na kierunek
-/// dryfu. ~150 ms przy 48 kHz — trzykrotność celu, żeby nie przycinać przy
-/// zwykłym, chwilowym jitterze.
-const RING_TRIM_FACTOR: usize = 3;
-
-/// Zapas ponad docelowe opóźnienie, po którego przekroczeniu bufor jest przycinany (patrz
-/// [`RING_TRIM_FACTOR`]). Stały, a nie proporcjonalny do celu: przy zwykłym celu daje ten sam
-/// próg co dawniej (trzykrotność, ok. 150 ms), a przy celu 0,25 s trzyma opóźnienie poniżej
-/// ok. 0,35 s zamiast pozwalać mu rosnąć do 0,75 s.
-const RING_TRIM_MARGIN_SAMPLES: usize = TARGET_RING_LATENCY_SAMPLES * (RING_TRIM_FACTOR - 1);
+/// Zapas ponad cel, po którego przekroczeniu bufor jest od razu przycinany do celu (60 ms przy
+/// 48 kHz). Dryf zegarów wejścia i wyjścia koryguje na bieżąco [`ring_clock::RingClock`], więc
+/// to tylko zabezpieczenie na skoki: wyjście stanęło (zmiana urządzenia), wejście oddało naraz
+/// zaległe kawałki. Bez przycinania bufor rósłby do [`MONO_RING_CAPACITY`] i tam utykał.
+const RING_TRIM_MARGIN_SAMPLES: usize = 2_880;
 
 /// Styl „Wg warstw”: jak długo po początku zdarzenia trzymamy styl jego warstwy (0,3 s przy
 /// 48 kHz). Kroki w biegu są co ok. 0,25–0,35 s, więc styl kroków trwa przez cały bieg.
@@ -1217,8 +1267,16 @@ struct MonoRing {
     gain: f32,
     /// Czy zmiana głośności z klasyfikacji jest włączona (przełącznik w configu).
     class_gain_enabled: bool,
-    /// Docelowe opóźnienie bufora w ramkach: zwykłe albo z włączoną zmianą klas.
-    target_samples: usize,
+    /// Czy obowiązuje długie opóźnienie ([`CLASS_GAIN_LATENCY_SAMPLES`]); patrz
+    /// [`Self::update_target_latency`].
+    long_latency: bool,
+    /// Krótki cel opóźnienia, korekta dryfu zegarów i licznik przerw.
+    clock: ring_clock::RingClock,
+    /// Ułamkowa pozycja odczytu między `frames[0]` i `frames[1]` (0..1). Odczyt bierze z bufora
+    /// odrobinę więcej albo mniej próbek, niż oddaje, żeby skorygować dryf zegarów.
+    read_frac: f64,
+    /// Ostatnia zdjęta ramka: lewy sąsiad do interpolacji.
+    prev_frame: (f32, f32),
     /// Wielkość zmiany głośności w dB (strzały −x, kroki +x), z suwaka w configu.
     class_gain_db: f32,
     /// Czy dynamika Scout jest włączona (przełącznik w configu).
@@ -1255,7 +1313,10 @@ impl Default for MonoRing {
             current_event: None,
             gain: 1.0,
             class_gain_enabled: false,
-            target_samples: TARGET_RING_LATENCY_SAMPLES,
+            long_latency: false,
+            clock: ring_clock::RingClock::default(),
+            read_frac: 0.0,
+            prev_frame: (0.0, 0.0),
             class_gain_db: MONO_CLASS_GAIN_DB_DEFAULT,
             scout_enabled: false,
             scout_amount: 0.5,
@@ -1276,17 +1337,65 @@ impl MonoRing {
     /// (obie czekają na decyzję klasy), krótki w przeciwnym razie. Po podniesieniu celu odczyt
     /// czeka, aż bufor się dopełni (patrz [`Self::priming`]).
     fn update_target_latency(&mut self) {
-        let wanted = if self.class_gain_enabled || self.layer_styles_enabled {
-            CLASS_GAIN_LATENCY_SAMPLES
-        } else {
-            TARGET_RING_LATENCY_SAMPLES
-        };
-        if wanted > self.target_samples && self.frames.len() < wanted {
+        let long = self.class_gain_enabled || self.layer_styles_enabled;
+        if long && !self.long_latency && self.frames.len() < CLASS_GAIN_LATENCY_SAMPLES {
             self.priming = true;
-        } else if wanted < self.target_samples {
+        } else if !long && self.long_latency {
             self.priming = false;
         }
-        self.target_samples = wanted;
+        self.long_latency = long;
+        self.clock.restart_average();
+    }
+
+    /// Docelowe średnie zapełnienie bufora (próbki wejścia): długie przy zmianie głośności klas
+    /// i „Wg warstw”, inaczej krótkie, wg urządzeń (patrz [`ring_clock::RingClock::short_target`]).
+    fn target_fill(&self) -> f32 {
+        if self.long_latency { CLASS_GAIN_LATENCY_SAMPLES as f32 } else { self.clock.short_target() }
+    }
+
+    /// Bieżąca próbka odczytu: `frames[0]` albo, przy ułamkowej pozycji, interpolacja Hermite'a
+    /// między `frames[0]` i `frames[1]`. Wymaga co najmniej jednej ramki (dwóch przy ułamku).
+    fn current_frame(&self) -> (f32, f32) {
+        let x0 = self.frames[0];
+        if self.read_frac == 0.0 {
+            return x0;
+        }
+        let t = self.read_frac as f32;
+        let xm1 = self.prev_frame;
+        let x1 = self.frames[1];
+        let x2 = self.frames.get(2).copied().unwrap_or(x1);
+        (
+            ring_clock::hermite(xm1.0, x0.0, x1.0, x2.0, t),
+            ring_clock::hermite(xm1.1, x0.1, x1.1, x2.1, t),
+        )
+    }
+
+    /// Przesuwa odczyt o `step` próbek wejścia, zdejmując minięte ramki (razem z ich celem Scout).
+    fn advance(&mut self, step: f64) {
+        self.read_frac += step;
+        while self.read_frac >= 1.0 {
+            let Some(frame) = self.frames.pop_front() else {
+                self.read_frac = 0.0;
+                break;
+            };
+            self.prev_frame = frame;
+            self.scout_targets.pop_front();
+            self.front_index += 1;
+            self.read_frac -= 1.0;
+        }
+    }
+
+    /// Zdejmuje `count` najstarszych ramek naraz (przycięcie albo przepełnienie).
+    fn drop_front(&mut self, count: usize) {
+        let count = count.min(self.frames.len());
+        if count == 0 {
+            return;
+        }
+        self.prev_frame = self.frames[count - 1];
+        self.frames.drain(..count);
+        self.scout_targets.drain(..count.min(self.scout_targets.len()));
+        self.front_index += count as u64;
+        self.read_frac = 0.0;
     }
 
     /// Warstwy grające po obu stronach w ramce `front_index`, dla stylu „Wg warstw”. Zdarzenie
@@ -1351,19 +1460,15 @@ impl MonoRing {
         scout_target_db(level_db, self.scout_amount)
     }
 
-    /// Wyjście: stosuje Scout do ramki. `own_db` to jej zmiana, a ramki w kolejce dają
-    /// wyprzedzenie: bierzemy najmocniejsze ściszenie z oknem [`SCOUT_LOOKAHEAD_FRAMES`]. Oba
-    /// kanały dostają ten sam mnożnik, więc balans L/P zostaje.
-    fn scout_apply(&mut self, l: f32, r: f32, own_db: f32) -> (f32, f32) {
+    /// Wyjście: stosuje Scout do bieżącej ramki (przód kolejki). Ramki w kolejce dają
+    /// wyprzedzenie: bierzemy najmocniejsze ściszenie z oknem [`SCOUT_LOOKAHEAD_FRAMES`],
+    /// licząc od bieżącej. Oba kanały dostają ten sam mnożnik, więc balans L/P zostaje.
+    fn scout_apply(&mut self, l: f32, r: f32) -> (f32, f32) {
         if !self.scout_enabled {
             self.scout_gain = 1.0;
             return (l, r);
         }
-        let ahead = self
-            .scout_targets
-            .iter()
-            .take(SCOUT_LOOKAHEAD_FRAMES - 1)
-            .fold(own_db, |m, &t| m.min(t));
+        let ahead = self.scout_targets.iter().take(SCOUT_LOOKAHEAD_FRAMES).copied().reduce(f32::min).unwrap_or(0.0);
         let target = 10f32.powf(ahead / 20.0);
         // Ściszanie głośnych ma być szybkie, a podbijanie cichych łagodne, żeby nie pompowało.
         let frames = if target < self.scout_gain { SCOUT_ATTACK_FRAMES } else { SCOUT_RELEASE_FRAMES };
@@ -1471,32 +1576,45 @@ impl SharedAudioAnalysis {
     /// wyjściowy `mono_router`. Najstarsze próbki są odrzucane, gdy bufor
     /// jest pełny — routing ma pokazywać "teraz", nie gonić zaległości.
     ///
-    /// Dodatkowo: gdy bufor urośnie ponad [`RING_TRIM_THRESHOLD_SAMPLES`]
-    /// (bo wejście trwale wyprzedza tempem wyjście — patrz doc-komentarz
-    /// tam), od razu przycina go z powrotem do [`TARGET_RING_LATENCY_SAMPLES`]
-    /// zamiast czekać na twardy limit [`MONO_RING_CAPACITY`] — bez tego
-    /// opóźnienie odtwarzanego dźwięku trwale rosło do ~340ms i tam zostawało.
-    pub(crate) fn push_stereo_pan(&self, samples: &[(f32, f32)]) {
+    /// Dryf zegarów wejścia i wyjścia koryguje na bieżąco odczyt (patrz
+    /// [`Self::read_stereo_pan_tagged`] i [`ring_clock::RingClock`]). Gdy bufor mimo to urośnie
+    /// o [`RING_TRIM_MARGIN_SAMPLES`] ponad cel (wyjście stanęło, wejście oddało naraz zaległe
+    /// kawałki), jest od razu przycinany do celu, zamiast rosnąć do [`MONO_RING_CAPACITY`].
+    ///
+    /// `sample_rate` to częstotliwość wejścia: z niej liczone są cele w ms i tempo odczytu
+    /// względem wyjścia.
+    pub(crate) fn push_stereo_pan_at(&self, samples: &[(f32, f32)], sample_rate: f32) {
         if let Ok(mut ring) = self.mono_ring.lock() {
+            ring.clock.note_input(samples.len(), sample_rate);
             for &s in samples {
                 if ring.frames.len() >= MONO_RING_CAPACITY {
-                    ring.frames.pop_front();
-                    ring.scout_targets.pop_front();
-                    ring.front_index += 1;
+                    ring.drop_front(1);
                 }
                 let db = ring.scout_level_db(s.0, s.1);
                 ring.frames.push_back(s);
                 ring.scout_targets.push_back(db);
             }
-            if ring.frames.len() > ring.target_samples + RING_TRIM_MARGIN_SAMPLES {
-                let excess = ring.frames.len() - ring.target_samples;
-                for _ in 0..excess {
-                    ring.frames.pop_front();
-                    ring.scout_targets.pop_front();
-                }
-                ring.front_index += excess as u64;
+            let target = ring.target_fill().round() as usize;
+            if ring.frames.len() > target + RING_TRIM_MARGIN_SAMPLES {
+                let excess = ring.frames.len() - target;
+                ring.drop_front(excess);
+                ring.clock.restart_average();
             }
         }
+    }
+
+    /// Jak [`Self::push_stereo_pan_at`] przy 48 kHz (testy).
+    #[cfg(test)]
+    pub(crate) fn push_stereo_pan(&self, samples: &[(f32, f32)]) {
+        self.push_stereo_pan_at(samples, 48_000.0);
+    }
+
+    /// Opóźnienie bufora mono do pokazania w UI.
+    pub fn mono_latency(&self) -> ring_clock::MonoLatency {
+        self.mono_ring
+            .lock()
+            .map(|ring| ring.clock.status(ring.target_fill()))
+            .unwrap_or(ring_clock::MonoLatency { buffer_ms: None, target_ms: 0.0, underruns: 0, correction_ppm: 0.0 })
     }
 
     /// Włącza albo wyłącza zmianę głośności z klasyfikacji w trybie mono. Włączona wymaga
@@ -1618,35 +1736,59 @@ impl SharedAudioAnalysis {
     ///
     /// Po podniesieniu celu opóźnienia (zmiana głośności klas albo styl „Wg warstw”) odczyt
     /// najpierw czeka, aż bufor dopełni się do celu, i do tego czasu powtarza wygaszaną ostatnią
-    /// próbkę, tak jak przy wyschnięciu bufora. To jednorazowa przerwa przy przełączeniu.
-    pub(crate) fn read_stereo_pan_tagged(&self, count: usize) -> (Vec<(f32, f32)>, Vec<SideLayers>) {
+    /// próbkę, tak jak przy wyschnięciu bufora. To jednorazowa przerwa przy przełączeniu. Tak samo
+    /// po wyschnięciu bufora: zamiast trzeszczeć przy każdym kolejnym odczycie, czeka raz, aż
+    /// bufor dojdzie do celu, a cel rośnie o mały zapas (patrz [`ring_clock::RingClock`]).
+    ///
+    /// Tempo odczytu: `output_rate` to częstotliwość wyjścia. Odczyt bierze z bufora próbki
+    /// wejścia w stosunku częstotliwości wejścia do wyjścia, poprawionym o korektę dryfu zegarów
+    /// (najwyżej ±0,5 %), z interpolacją Hermite'a. Przy równych częstotliwościach i bez korekty
+    /// próbki przechodzą bez zmian.
+    pub(crate) fn read_stereo_pan_tagged(&self, count: usize, output_rate: f32) -> (Vec<(f32, f32)>, Vec<SideLayers>) {
         const HOLD_DECAY: f32 = 0.999;
         let mut out = Vec::with_capacity(count);
         let mut tags = Vec::with_capacity(count);
         let mut last = self.last_pan.lock().map(|g| *g).unwrap_or((0.0, 0.0));
-        if let Ok(mut ring) = self.mono_ring.lock() {
-            if ring.priming && ring.frames.len() >= ring.target_samples {
+        if let Ok(mut guard) = self.mono_ring.lock() {
+            let ring = &mut *guard;
+            let target = ring.target_fill();
+            if ring.priming && ring.frames.len() as f32 >= target {
                 ring.priming = false;
+                ring.clock.restart_average();
             }
+            let nominal = f64::from(ring.clock.sample_rate()) / f64::from(output_rate.max(1.0));
+            let need = count as f64 * nominal;
+            let correction = if ring.priming {
+                0.0
+            } else {
+                let fill = ring.frames.len() as f32 - ring.read_frac as f32;
+                ring.clock.on_read(fill, need as f32, target)
+            };
+            let step = nominal * (1.0 + correction);
+            let mut dried_up = false;
             for _ in 0..count {
-                let popped = if ring.priming { None } else { ring.frames.pop_front() };
-                let sample = match popped {
-                    Some(s) => {
-                        last = s;
-                        let gain = ring.next_gain();
-                        tags.push(ring.next_layers());
-                        ring.front_index += 1;
-                        let own_db = ring.scout_targets.pop_front().unwrap_or(0.0);
-                        ring.scout_apply(s.0 * gain, s.1 * gain, own_db)
-                    }
-                    None => {
-                        last = (last.0 * HOLD_DECAY, last.1 * HOLD_DECAY);
-                        tags.push(ring.last_layers);
-                        let mult = ring.gain * ring.scout_gain;
-                        (last.0 * mult, last.1 * mult)
-                    }
+                let needed = if ring.read_frac > 0.0 { 2 } else { 1 };
+                let sample = if ring.priming || ring.frames.len() < needed {
+                    dried_up |= !ring.priming;
+                    last = (last.0 * HOLD_DECAY, last.1 * HOLD_DECAY);
+                    tags.push(ring.last_layers);
+                    let mult = ring.gain * ring.scout_gain;
+                    (last.0 * mult, last.1 * mult)
+                } else {
+                    let s = ring.current_frame();
+                    last = s;
+                    let gain = ring.next_gain();
+                    tags.push(ring.next_layers());
+                    let shaped = ring.scout_apply(s.0 * gain, s.1 * gain);
+                    ring.advance(step);
+                    shaped
                 };
                 out.push(sample);
+            }
+            if dried_up {
+                ring.clock.on_underrun();
+                ring.read_frac = 0.0;
+                ring.priming = true;
             }
         } else {
             out.resize(count, (0.0, 0.0));
@@ -1661,7 +1803,7 @@ impl SharedAudioAnalysis {
     /// Same próbki z [`Self::read_stereo_pan_tagged`], bez znaczników warstw (do testów).
     #[cfg(test)]
     pub(crate) fn read_stereo_pan(&self, count: usize) -> Vec<(f32, f32)> {
-        self.read_stereo_pan_tagged(count).0
+        self.read_stereo_pan_tagged(count, 48_000.0).0
     }
 
     /// Czy logger próbek (`sample_logger::SampleLogger`) jest aktualnie
@@ -2125,7 +2267,7 @@ pub(crate) fn update_analysis(
     // wyjścia.
     // Nagrywanie: kopia dwóch pierwszych kanałów. Bez trwającej sesji kończy od razu.
     analysis.recorder.push(samples, channels, captured);
-    analysis.push_stereo_pan(&downmix_to_stereo_pan(samples, channels));
+    analysis.push_stereo_pan_at(&downmix_to_stereo_pan(samples, channels), sample_rate);
 }
 
 /// Rozdziela zinterlacowane próbki na dwa "ważone" miksy mono: `(left,
@@ -2291,6 +2433,34 @@ mod tests {
             let back: MonoCueStyle = serde_json::from_str(&json).unwrap();
             assert_eq!(back, style, "{json}");
         }
+    }
+
+    #[test]
+    fn opposite_side_settings_load_with_defaults_from_an_older_config() {
+        // Plik sprzed ustawień strony przeciwnej: poprawki włączone z wartościami domyślnymi.
+        use crate::sound::directional as d;
+        let mut value = serde_json::to_value(RadarConfig { mono_breath_depth: 0.4, ..RadarConfig::default() }).unwrap();
+        for key in [
+            "mono_cue_subtractive",
+            "mono_comb_notch_db",
+            "mono_opposite_level_db",
+            "mono_opposite_duck_db",
+            "mono_opposite_shadow",
+            "mono_cue_tail",
+            "mono_cue_tail_level_db",
+        ] {
+            assert!(value.as_object_mut().unwrap().remove(key).is_some(), "{key}");
+        }
+        let cfg: RadarConfig = serde_json::from_value(value).unwrap();
+        assert!(cfg.mono_cue_subtractive);
+        assert_eq!(cfg.mono_comb_notch_db, d::DEFAULT_COMB_NOTCH_DB);
+        assert_eq!(cfg.mono_opposite_level_db, d::DEFAULT_OPPOSITE_LEVEL_DB);
+        assert_eq!(cfg.mono_opposite_duck_db, d::DEFAULT_DUCK_DB);
+        assert_eq!(cfg.mono_opposite_shadow, 0.0);
+        assert_eq!(cfg.mono_cue_tail, d::DEFAULT_CUE_TAIL);
+        assert_eq!(cfg.mono_cue_tail_level_db, d::DEFAULT_TAIL_LEVEL_DB);
+        assert_eq!(cfg.mono_breath_depth, 0.4, "zapisana głębokość oddechu zostaje");
+        assert_eq!(cfg, RadarConfig { mono_breath_depth: 0.4, ..RadarConfig::default() });
     }
 
     #[test]
@@ -2606,7 +2776,7 @@ mod tests {
         // Strzał: 0,5 ciszej po zdarzeniu (ok. −6 dB), a przed nim bez zmian.
         let quiet = SharedAudioAnalysis::new();
         quiet.set_mono_class_gain(true, MONO_CLASS_GAIN_DB_DEFAULT);
-        quiet.push_stereo_pan(&vec![(0.5, 0.5); CLASS_GAIN_LATENCY_SAMPLES + 4_000]);
+        quiet.push_stereo_pan(&vec![(0.5, 0.5); CLASS_GAIN_LATENCY_SAMPLES + 2_000]);
         quiet.push_class_gains(&[class_hit(layers::Layer::Shots, 0.01)], 48_000.0); // ramka 480
         let out = quiet.read_stereo_pan(3_000);
         assert_eq!(out[100], (0.5, 0.5), "przed zdarzeniem bez zmian");
@@ -2615,7 +2785,7 @@ mod tests {
         // Krok: głośniej po zdarzeniu (ok. +6 dB).
         let loud = SharedAudioAnalysis::new();
         loud.set_mono_class_gain(true, MONO_CLASS_GAIN_DB_DEFAULT);
-        loud.push_stereo_pan(&vec![(0.3, 0.3); CLASS_GAIN_LATENCY_SAMPLES + 4_000]);
+        loud.push_stereo_pan(&vec![(0.3, 0.3); CLASS_GAIN_LATENCY_SAMPLES + 2_000]);
         loud.push_class_gains(&[class_hit(layers::Layer::Steps, 0.01)], 48_000.0);
         let out = loud.read_stereo_pan(3_000);
         assert!(out[2_000].0 > 0.55, "krok ok. +6 dB: {}", out[2_000].0);
@@ -2669,7 +2839,7 @@ mod tests {
         // Suwak 12 dB: strzał ok. 0,5 × 10^(−12/20) ≈ 0,125.
         let analysis = SharedAudioAnalysis::new();
         analysis.set_mono_class_gain(true, 12.0);
-        analysis.push_stereo_pan(&vec![(0.5, 0.5); CLASS_GAIN_LATENCY_SAMPLES + 4_000]);
+        analysis.push_stereo_pan(&vec![(0.5, 0.5); CLASS_GAIN_LATENCY_SAMPLES + 2_000]);
         analysis.push_class_gains(&[class_hit(layers::Layer::Shots, 0.01)], 48_000.0);
         let out = analysis.read_stereo_pan(3_000);
         assert!((out[2_000].0 - 0.126).abs() < 0.02, "strzał przy 12 dB: {}", out[2_000].0);
@@ -2718,7 +2888,7 @@ mod tests {
         let mut tags = Vec::new();
         for _ in 0..40 {
             analysis.push_stereo_pan(&[(0.1, 0.1); 1_000]);
-            tags.extend(analysis.read_stereo_pan_tagged(1_000).1);
+            tags.extend(analysis.read_stereo_pan_tagged(1_000, 48_000.0).1);
         }
         let lookahead = LAYER_STYLE_LOOKAHEAD_FRAMES as usize;
         let hold = LAYER_STYLE_HOLD_FRAMES as usize;
@@ -2735,7 +2905,7 @@ mod tests {
         let analysis = SharedAudioAnalysis::new();
         analysis.push_stereo_pan(&vec![(0.1, 0.1); 20_000]);
         analysis.push_layer_events(&[side_hit(layers::Layer::Steps, 0.01, 0.9)], 48_000.0);
-        let (_, tags) = analysis.read_stereo_pan_tagged(10_000);
+        let (_, tags) = analysis.read_stereo_pan_tagged(10_000, 48_000.0);
         assert!(tags.iter().all(|t| *t == SideLayers::default()));
     }
 
@@ -2744,11 +2914,11 @@ mod tests {
         // Bez dopełnienia opóźnienie zostałoby krótkie, a decyzja klasy (ok. 0,15 s po
         // początku dźwięku) przychodziłaby za późno.
         let analysis = SharedAudioAnalysis::new();
-        analysis.push_stereo_pan(&vec![(0.2, 0.2); TARGET_RING_LATENCY_SAMPLES]);
+        analysis.push_stereo_pan(&vec![(0.2, 0.2); 2_400]);
         analysis.set_mono_layer_styles(true);
         let waiting = analysis.read_stereo_pan(1_000);
         assert!(waiting.iter().all(|s| s.0 < 0.2), "czeka na dopełnienie, zamiast grać od razu");
-        assert_eq!(analysis.mono_ring.lock().unwrap().frames.len(), TARGET_RING_LATENCY_SAMPLES, "nic nie zdjęte");
+        assert_eq!(analysis.mono_ring.lock().unwrap().frames.len(), 2_400, "nic nie zdjęte");
         analysis.push_stereo_pan(&vec![(0.5, 0.5); CLASS_GAIN_LATENCY_SAMPLES]);
         let playing = analysis.read_stereo_pan(10);
         assert!(playing.iter().all(|&s| s == (0.2, 0.2)), "po dopełnieniu gra od najstarszej próbki");
@@ -2764,7 +2934,7 @@ mod tests {
             analysis.push_stereo_pan(&[(0.1, 0.1); 500]);
         }
         let len = analysis.mono_ring.lock().unwrap().frames.len();
-        assert!(len <= CLASS_GAIN_LATENCY_SAMPLES + RING_TRIM_MARGIN_SAMPLES, "opóźnienie do ok. 0,35 s, jest {len}");
+        assert!(len <= CLASS_GAIN_LATENCY_SAMPLES + RING_TRIM_MARGIN_SAMPLES, "opóźnienie do ok. 0,31 s, jest {len}");
     }
 
     #[test]
@@ -2773,8 +2943,8 @@ mod tests {
         // wyprzedza tempem wyjście (nikt nie woła read_stereo_pan wcale, jak
         // tutaj — skrajny przypadek tego samego zjawiska), bufor bez
         // aktywnego przycinania rósłby aż do MONO_RING_CAPACITY (~340ms) i
-        // tam utykał. Powinien zamiast tego zatrzymać się blisko
-        // TARGET_RING_LATENCY_SAMPLES (~50ms), NIE przy pełnej pojemności.
+        // tam utykał. Powinien zamiast tego zatrzymać się blisko celu
+        // (najwyżej 50 ms) plus zapas przycinania, NIE przy pełnej pojemności.
         let analysis = SharedAudioAnalysis::new();
         let chunk = vec![(0.1, 0.2); 500];
         for _ in 0..50 {
@@ -2783,13 +2953,103 @@ mod tests {
 
         let ring_len = analysis.mono_ring.lock().unwrap().frames.len();
         assert!(
-            ring_len <= TARGET_RING_LATENCY_SAMPLES * RING_TRIM_FACTOR,
+            ring_len <= 2_400 + RING_TRIM_MARGIN_SAMPLES,
             "bufor nie powinien urosnąć powyżej progu przycinania, ma {ring_len}"
         );
         assert!(
             ring_len < MONO_RING_CAPACITY,
             "bufor utknął przy pełnej pojemności (~340ms) zamiast się przyciąć, ma {ring_len}"
         );
+    }
+
+    /// Wynik symulacji dwóch zegarów: zapełnienie bufora przy każdym odczycie (po rozruchu),
+    /// liczba przerw i wyjście.
+    struct ClockRun {
+        fills: Vec<usize>,
+        underruns: u64,
+        out: Vec<(f32, f32)>,
+    }
+
+    /// `seconds` sekund strumienia: wejście co 10 ms (480 próbek przy `in_rate` z dryfem
+    /// `drift_ppm`), wyjście co 10 ms przy `out_rate`, w kolejności czasu jak w prawdziwych
+    /// callbackach. Sygnał to sinus 1 kHz.
+    fn run_two_clocks(seconds: f64, in_rate: f64, drift_ppm: f64, out_rate: f64) -> ClockRun {
+        let analysis = SharedAudioAnalysis::new();
+        let in_chunk = (in_rate / 100.0).round() as usize;
+        let out_chunk = (out_rate / 100.0).round() as usize;
+        // Prawdziwa częstotliwość wejścia z dryfem, a nominalna podawana jest do bufora.
+        let in_period = in_chunk as f64 / (in_rate * (1.0 + drift_ppm * 1e-6));
+        let out_period = out_chunk as f64 / out_rate;
+        let (mut next_in, mut next_out) = (0.0f64, 0.003f64);
+        let mut written = 0usize;
+        let mut run = ClockRun { fills: Vec::new(), underruns: 0, out: Vec::new() };
+        while next_out < seconds {
+            if next_in <= next_out {
+                let chunk: Vec<(f32, f32)> = (written..written + in_chunk)
+                    .map(|i| {
+                        let s = 0.3 * (std::f64::consts::TAU * 1_000.0 * i as f64 / in_rate).sin() as f32;
+                        (s, 0.5 * s)
+                    })
+                    .collect();
+                written += in_chunk;
+                analysis.push_stereo_pan_at(&chunk, in_rate as f32);
+                next_in += in_period;
+            } else {
+                if next_out > 1.0 {
+                    run.fills.push(analysis.mono_ring.lock().unwrap().frames.len());
+                }
+                run.out.extend(analysis.read_stereo_pan_tagged(out_chunk, out_rate as f32).0);
+                next_out += out_period;
+            }
+        }
+        run.underruns = analysis.mono_latency().underruns;
+        run
+    }
+
+    #[test]
+    fn clock_drift_is_corrected_without_trims_and_the_buffer_stays_short() {
+        // Wejście 300 ppm szybsze albo wolniejsze od wyjścia (dużo jak na zwykłe urządzenia):
+        // przez 60 s bufor nie rośnie do progu przycinania ani nie wysycha, a po rozruchu
+        // stoi przy celu ok. 18 ms (10 ms kawałek wejścia, pół odczytu i 3 ms zapasu).
+        // Przy wolniejszym wejściu jego kawałki dwa razy przechodzą z „przed odczytem” na
+        // „po odczycie”, czyli zapełnienie spada skokiem o 10 ms: to właśnie musi wytrzymać cel.
+        for drift_ppm in [300.0, -300.0] {
+            let run = run_two_clocks(60.0, 48_000.0, drift_ppm, 48_000.0);
+            assert_eq!(run.underruns, 0, "{drift_ppm} ppm: przerwy");
+            let late = &run.fills[run.fills.len() / 2..];
+            let max = *late.iter().max().unwrap();
+            let min = *late.iter().min().unwrap();
+            let mean = late.iter().sum::<usize>() as f64 / late.len() as f64;
+            assert!(max < 2_000, "{drift_ppm} ppm: najwyżej ok. 40 ms w buforze, jest {max}");
+            assert!(min >= 480, "{drift_ppm} ppm: zawsze co najmniej jeden odczyt zapasu, jest {min}");
+            // Zapełnienie przed odczytem: cel średni (864) plus pół odczytu (240).
+            assert!((mean - 1_104.0).abs() < 250.0, "{drift_ppm} ppm: średnio {mean:.0} próbek");
+        }
+    }
+
+    #[test]
+    fn different_input_and_output_rates_play_at_the_right_speed() {
+        // VB-Cable przy 44,1 kHz, słuchawki przy 48 kHz: bez przeliczenia tempa bufor
+        // wysychałby co chwilę, a dźwięk grał o 9 % za wysoko.
+        let run = run_two_clocks(20.0, 44_100.0, 0.0, 48_000.0);
+        assert!(run.underruns <= 1, "przerwy {}", run.underruns);
+        // Sinus 1 kHz z wejścia ma na wyjściu dalej 1 kHz: przejścia przez zero co 24 próbki.
+        let tail = &run.out[run.out.len() - 48_000..];
+        let crossings = tail.windows(2).filter(|w| (w[0].0 >= 0.0) != (w[1].0 >= 0.0)).count();
+        assert!((crossings as i64 - 2_000).abs() <= 4, "1 kHz to 2000 przejść na sekundę, jest {crossings}");
+    }
+
+    #[test]
+    fn drift_correction_keeps_a_sine_clean() {
+        // Korekta tempa z interpolacją nie może słyszalnie zniekształcać: sinus 1 kHz po 30 s
+        // z dryfem dalej leży blisko idealnego sinusa o tej samej amplitudzie (L = 0,3).
+        let run = run_two_clocks(30.0, 48_000.0, 200.0, 48_000.0);
+        let tail = &run.out[run.out.len() - 4_800..];
+        let peak = tail.iter().map(|s| s.0.abs()).fold(0.0f32, f32::max);
+        assert!((peak - 0.3).abs() < 0.003, "amplituda {peak}");
+        // Odstęp od sinusa: suma próbek z przesunięciem o pół okresu (24 próbki) to zero.
+        let residual = tail.windows(25).map(|w| (w[0].0 + w[24].0).abs()).fold(0.0f32, f32::max);
+        assert!(residual < 0.003, "zniekształcenie {residual}");
     }
 }
 
