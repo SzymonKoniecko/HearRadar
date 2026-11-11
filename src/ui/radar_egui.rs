@@ -2051,7 +2051,7 @@ fn stereo_dominance((left, right): (f32, f32)) -> [bool; 2] {
 
 /// Łuki L/R na obwodzie tarczy: lewy rozchodzi się od godziny 9, prawy od 3,
 /// długość i jasność rosną z energią kanału; cienka kreska to szczyt z historii.
-/// `outlined` mówi, która strona ma czerwony obrys.
+/// `visible` mówi, które strony narysować, a `outlined`, która ma czerwony obrys (indeks 0 lewa, 1 prawa).
 #[allow(clippy::too_many_arguments)]
 fn draw_stereo_indicators<C: RadarCanvas>(
     canvas: &C,
@@ -2073,14 +2073,14 @@ fn draw_stereo_indicators<C: RadarCanvas>(
 
     let point_at = |deg: f32, radius: f32| center + screen_direction(deg) * radius;
 
+    // Lewy łuk przy 270°, prawy przy 90°. Widoczność i obrys idą po stronie (0 lewa, 1 prawa).
     let channels = [
-        (270.0_f32, left_history, left_rgb, "L", outlined[0]),
-        (90.0_f32, right_history, right_rgb, "R", outlined[1]),
+        (270.0_f32, left_history, left_rgb, "L", visible[0], outlined[0]),
+        (90.0_f32, right_history, right_rgb, "R", visible[1], outlined[1]),
     ];
 
-    for (mid_deg, history, rgb, label, dominant) in channels {
-        let side = if mid_deg < 180.0 { 0 } else { 1 };
-        if !visible[side] {
+    for (mid_deg, history, rgb, label, shown, dominant) in channels {
+        if !shown {
             continue;
         }
         let energy = history.back().copied().unwrap_or(0.0).clamp(0.0, 1.0);
@@ -2827,6 +2827,27 @@ mod tests {
         let canvas = SideColorCanvas::default();
         draw_radar(&canvas, Pos2::ZERO, &cfg, &mut state, 2, 0.2);
         assert!(canvas.dots.borrow().is_empty());
+    }
+
+    #[test]
+    fn outer_ring_hides_the_weaker_side_not_the_louder_one() {
+        // `rest_hidden_side` to strona schowana (0 lewa, 1 prawa), jak w `rest_visible`. Lewy łuk
+        // leży po lewej (x < 0), prawy po prawej, więc schowana strona nie może mieć żadnej kreski.
+        let cfg = RadarConfig::default();
+        for (hidden, shown_left) in [(1usize, true), (0, false)] {
+            let mut state = RadarState::new();
+            state.rest_hidden_side = Some(hidden);
+            let canvas = SideColorCanvas::default();
+            draw_rest_ring(&canvas, Pos2::ZERO, cfg.radius, &cfg, &state, None);
+            let segments = canvas.segments.into_inner();
+            let left = segments.iter().filter(|(p, _)| p[0].x + p[1].x < 0.0).count();
+            let right = segments.len() - left;
+            if shown_left {
+                assert!(left > 0 && right == 0, "prawa schowana: lewa {left}, prawa {right}");
+            } else {
+                assert!(right > 0 && left == 0, "lewa schowana: lewa {left}, prawa {right}");
+            }
+        }
     }
 
     #[test]
