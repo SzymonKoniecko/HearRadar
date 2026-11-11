@@ -43,6 +43,12 @@ const HIGH_CUTOFF_HZ: f32 = 2000.0;
 const MIN_BRIGHTNESS_SAMPLES: usize = 64;
 /// Ile sekund próbek trzymamy w buforze. Okno decyzji to ok. 0,35 s.
 const HISTORY_S: f32 = 1.0;
+/// Decyzja wstępna (dla stylu wskazówki „Wg warstw” w trybie mono): szczyt i jasność tylko
+/// z pierwszych 20 ms po onsecie, te same progi. Na nagraniach z gry (`recordings/`, 1020
+/// zdarzeń z boku) zgadza się z pełną decyzją w ok. 90 %. Najczęstsza różnica: strzał, który
+/// dochodzi do pełnej głośności później niż po 20 ms. Pełna decyzja z [`LayerTracker::take_ready`]
+/// przychodzi po ok. 0,15 s i ją poprawia.
+pub const QUICK_DECISION_S: f32 = 0.02;
 /// Klasa D z krótszym odstępem od poprzedniego zdarzenia to granat, czyli strzał/wybuch
 /// (jak `GRENADE_MAX_GAP_S` w `features.py`).
 pub const GRENADE_MAX_GAP_S: f32 = 0.5;
@@ -244,6 +250,8 @@ impl Frame {
 struct PendingOnset {
     at_frame: u64,
     gap_s: Option<f32>,
+    /// Czy zdarzenie dostało już decyzję wstępną ([`LayerTracker::take_quick`]).
+    quick_done: bool,
 }
 
 /// Bufor ostatniej sekundy próbek stereo, wykrywanie zdarzeń z ramek 10 ms i kolejka
@@ -269,6 +277,8 @@ pub struct LayerTracker {
     last_event_frame: Option<u64>,
     /// Klasa ostatnio podjętej decyzji, do reguły granatu.
     last_class: Option<Class>,
+    /// Jak `last_class`, dla decyzji wstępnych ([`Self::take_quick`]).
+    last_quick_class: Option<Class>,
     /// Początek ramki, w której poziom przeszedł przez próg (jak w `detect_events.py`) i nie
     /// został jeszcze wzięty przez zewnętrzny detektor.
     last_crossing: Option<u64>,
@@ -290,6 +300,7 @@ impl Default for LayerTracker {
             pending: VecDeque::new(),
             last_event_frame: None,
             last_class: None,
+            last_quick_class: None,
             last_crossing: None,
             external_onsets: false,
         }
@@ -365,6 +376,7 @@ impl LayerTracker {
         self.pending.push_back(PendingOnset {
             at_frame: start,
             gap_s,
+            quick_done: false,
         });
     }
 
@@ -417,6 +429,59 @@ impl LayerTracker {
             }
         }
         hits
+    }
+
+    /// Decyzje wstępne (patrz [`QUICK_DECISION_S`]) dla zdarzeń, którym minęło już okno szybkiej
+    /// decyzji, każda tylko raz i w kolejności zdarzeń. Pełna decyzja tego samego zdarzenia
+    /// przychodzi później z [`Self::take_ready`], z tym samym `onset_s`, i może ją poprawić.
+    pub fn take_quick(&mut self) -> Vec<LayerHit> {
+        let window = (QUICK_DECISION_S * self.rate).round() as u64;
+        let mut hits = Vec::new();
+        for i in 0..self.pending.len() {
+            let onset = self.pending[i];
+            if onset.quick_done {
+                continue;
+            }
+            if self.total_frames < onset.at_frame + window {
+                break;
+            }
+            self.pending[i].quick_done = true;
+            if let Some(hit) = self.decide_quick(onset, self.last_quick_class) {
+                self.last_quick_class = hit.class;
+                hits.push(hit);
+            }
+        }
+        hits
+    }
+
+    /// Jak [`Self::decide`], ale szczyt i jasność tylko z pierwszych [`QUICK_DECISION_S`].
+    fn decide_quick(&self, onset: PendingOnset, previous: Option<Class>) -> Option<LayerHit> {
+        let hop = frame_samples(self.rate);
+        let frames = ((QUICK_DECISION_S / FRAME_S).round() as u64).max(1);
+        let mut peak: Option<(u64, f32)> = None;
+        for k in 0..frames {
+            let start = onset.at_frame + k * hop;
+            let level = self.frame_level_dbfs(start, hop as usize)?;
+            if peak.is_none_or(|(_, best)| level > best) {
+                peak = Some((start, level));
+            }
+        }
+        let (peak_start, peak_dbfs) = peak?;
+        let len = (QUICK_DECISION_S * self.rate).round() as usize;
+        let brightness = self.mono_window(onset.at_frame, len).and_then(|mono| brightness_db(&mono, self.rate));
+        let class = class_auto(peak_dbfs, brightness);
+        let (peak_left_dbfs, peak_right_dbfs) = self.channel_dbfs_at(peak_start);
+        Some(LayerHit {
+            layer: layer_for(class, onset.gap_s, previous),
+            class,
+            pan: self.pan_at(peak_start),
+            peak_dbfs,
+            peak_left_dbfs,
+            peak_right_dbfs,
+            brightness_db: brightness,
+            gap_s: onset.gap_s,
+            onset_s: onset.at_frame as f64 / self.rate as f64,
+        })
     }
 
     /// Szuka szczytu w oknie 0,3 s po zdarzeniu (ramki 10 ms, pierwszy najgłośniejszy),
@@ -817,6 +882,52 @@ mod tests {
             mono[start..start + click.len()].copy_from_slice(&click);
         }
         assert_eq!(classify_mono(&mono).len(), 1);
+    }
+
+    /// Jak [`classify_stereo`], ale zbiera też decyzje wstępne (z czasem decyzji w próbkach).
+    fn classify_quick(left: &[f32], right: &[f32]) -> (Vec<(u64, LayerHit)>, Vec<LayerHit>) {
+        let mut tracker = LayerTracker::default();
+        let (mut quick, mut full) = (Vec::new(), Vec::new());
+        let stereo: Vec<f32> = left.iter().zip(right).flat_map(|(&l, &r)| [l, r]).collect();
+        for part in stereo.chunks(480 * 2) {
+            tracker.push_frames(part, 2, RATE);
+            quick.extend(tracker.take_quick().into_iter().map(|hit| (tracker.total_frames, hit)));
+            full.extend(tracker.take_ready());
+        }
+        (quick, full)
+    }
+
+    #[test]
+    fn quick_decision_comes_20_ms_after_the_onset_and_matches_clear_cases() {
+        for (body, layer) in [
+            (sine(1_000.0, 0.2, 4_800), Layer::Shots), // głośny: strzał
+            (noise(0.027, 4_800), Layer::Steps),       // cichy, jasny: krok
+            (sine(100.0, 0.0224, 4_800), Layer::Rest), // cichy, ciemny: reszta
+        ] {
+            let left = burst_at_onset(&body);
+            let right: Vec<f32> = left.iter().map(|s| s * 0.8).collect();
+            let (quick, full) = classify_quick(&left, &right);
+            assert_eq!(quick.len(), 1, "{layer:?}: jedna decyzja wstępna");
+            let (decided_at, hit) = quick[0];
+            assert_eq!(hit.layer, layer);
+            assert_eq!(hit.onset_s, full[0].onset_s, "ten sam onset co pełna decyzja");
+            assert!((hit.pan - full[0].pan).abs() < 0.05, "ta sama strona");
+            let after_ms = (decided_at as f64 / RATE as f64 - hit.onset_s) * 1_000.0;
+            assert!((19.9..=30.1).contains(&after_ms), "decyzja {after_ms:.1} ms po onsecie");
+        }
+    }
+
+    #[test]
+    fn quick_decision_can_be_lower_than_the_full_one_for_a_late_peak() {
+        // Cichy jasny początek (krok w pierwszych 20 ms), po 40 ms głośny: pełna decyzja to strzał.
+        let mut body = noise(0.027, 4_800);
+        for (i, s) in body.iter_mut().enumerate().skip(1_920) {
+            *s = 0.2 * (TAU * 1_000.0 * i as f32 / RATE).sin();
+        }
+        let mono = burst_at_onset(&body);
+        let (quick, full) = classify_quick(&mono, &mono);
+        assert_eq!(quick[0].1.layer, Layer::Steps);
+        assert_eq!(full[0].layer, Layer::Shots);
     }
 
     #[test]

@@ -777,9 +777,10 @@ impl HearRadarApp {
         let per_layer = style == MonoCueStyle::PerLayer;
         if per_layer {
             ui.weak(
-                "Wg warstw: styl zależy od tego, co radar rozpoznał po przeciwnej stronie. Rozpoznanie \
-                 trwa ok. 0,15 s, więc wyjście dostaje 0,25 s opóźnienia (jak przy „Strzały ciszej, \
-                 kroki głośniej”). Gdy nic nie rozpoznano, obowiązuje styl reszty.",
+                "Wg warstw: styl zależy od tego, co radar rozpoznał po przeciwnej stronie. Warstwa jest \
+                 rozpoznawana wstępnie po 20 ms od początku dźwięku (na nagraniach z gry zgodnie z pełnym \
+                 rozpoznaniem w ok. 90 %), a po ok. 0,15 s poprawiana, więc wyjście czeka tylko ok. 40 ms. \
+                 Gdy nic nie rozpoznano, obowiązuje styl reszty.",
             );
             for layer in crate::sound::layers::Layer::ALL {
                 let label = match layer {
@@ -1051,7 +1052,8 @@ impl HearRadarApp {
             "Bufor sam trzyma się celu: korekta zegara to drobne przyspieszenie albo zwolnienie \
              odczytu (najwyżej ±0,5 %, niesłyszalne), które wyrównuje różnicę tempa wejścia i \
              słuchawek. Przerwa to chwila, w której zabrakło dźwięku; po niej cel rośnie o 2 ms, \
-             a po 30 s bez przerw wolno wraca. „Wg warstw” i zmiana głośności klas trzymają 250 ms.",
+             a po 30 s bez przerw wolno wraca. „Wg warstw” czeka dodatkowo na wstępne rozpoznanie \
+             warstwy (cel ok. 38 ms), a zmiana głośności klas na pełne (250 ms).",
         );
     }
 

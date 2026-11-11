@@ -814,7 +814,7 @@ pub enum MonoCueStyle {
     DirectionalComb,
     /// Wg warstw: osobny styl kierunkowy dla strzałów, kroków i reszty (patrz
     /// [`MonoLayerStyles`]), zależnie od tego, co radar rozpoznał po przeciwnej stronie. Czeka na
-    /// decyzję klasy, więc wyjście dostaje 0,25 s opóźnienia.
+    /// wstępną decyzję klasy (20 ms, potem poprawiana), więc wyjście dostaje ok. 40 ms opóźnienia.
     PerLayer,
 }
 
@@ -1188,10 +1188,11 @@ impl AudioAnalysis {
 /// limit pamięci, NIE docelowe opóźnienie. Opóźnienie utrzymuje [`ring_clock::RingClock`].
 const MONO_RING_CAPACITY: usize = 65_536;
 
-/// Opóźnienie wyjścia z włączoną zmianą głośności klas albo stylem wskazówki „Wg warstw”
-/// (0,25 s przy 48 kHz). Tyle trwa klasyfikacja zdarzenia (ok. 0,15 s, patrz
-/// `layers::LayerTracker::take_ready`) plus zapas, żeby zmiana zdążyła przed początkiem dźwięku.
-/// Bez nich cel jest krótki i liczony na bieżąco (patrz [`ring_clock::RingClock::short_target`]).
+/// Opóźnienie wyjścia z włączoną zmianą głośności klas (0,25 s przy 48 kHz). Tyle trwa pełna
+/// klasyfikacja zdarzenia (ok. 0,15 s, patrz `layers::LayerTracker::take_ready`) plus zapas, żeby
+/// zmiana zdążyła przed początkiem dźwięku. Styl „Wg warstw” czeka tylko na decyzję wstępną
+/// (patrz [`MonoRing::target_fill`]), a bez obu cel jest krótki (patrz
+/// [`ring_clock::RingClock::short_target`]).
 const CLASS_GAIN_LATENCY_SAMPLES: usize = 12_000;
 
 /// Zapas ponad cel, po którego przekroczeniu bufor jest od razu przycinany do celu (60 ms przy
@@ -1267,9 +1268,9 @@ struct MonoRing {
     gain: f32,
     /// Czy zmiana głośności z klasyfikacji jest włączona (przełącznik w configu).
     class_gain_enabled: bool,
-    /// Czy obowiązuje długie opóźnienie ([`CLASS_GAIN_LATENCY_SAMPLES`]); patrz
+    /// Cel opóźnienia przy ostatniej zmianie trybu (zmiana głośności klas, „Wg warstw”); patrz
     /// [`Self::update_target_latency`].
-    long_latency: bool,
+    mode_target: f32,
     /// Krótki cel opóźnienia, korekta dryfu zegarów i licznik przerw.
     clock: ring_clock::RingClock,
     /// Ułamkowa pozycja odczytu między `frames[0]` i `frames[1]` (0..1). Odczyt bierze z bufora
@@ -1296,8 +1297,10 @@ struct MonoRing {
     priming: bool,
     /// Czy styl „Wg warstw” jest włączony (zbieramy zdarzenia warstw i znaczniki ramek).
     layer_styles_enabled: bool,
-    /// Zdarzenia warstw: (numer ramki początku, warstwa, strona: 0 = lewa, 1 = prawa), od najstarszego.
-    layer_events: VecDeque<(u64, layers::Layer, usize)>,
+    /// Zdarzenia warstw: (numer ramki początku, warstwa, strona: 0 = lewa, 1 = prawa, `None` =
+    /// środek), posortowane po początku. Ten sam początek może przyjść dwa razy: najpierw decyzja
+    /// wstępna, potem pełna, która ją poprawia (patrz [`Self::next_layers`]).
+    layer_events: VecDeque<(u64, layers::Layer, Option<usize>)>,
     /// Bieżące zdarzenie po każdej stronie: (numer ramki początku, warstwa).
     layer_active: [Option<(u64, layers::Layer)>; 2],
     /// Znaczniki ostatnio odczytanej ramki, powtarzane, gdy bufor na chwilę wyschnie.
@@ -1313,7 +1316,7 @@ impl Default for MonoRing {
             current_event: None,
             gain: 1.0,
             class_gain_enabled: false,
-            long_latency: false,
+            mode_target: 0.0,
             clock: ring_clock::RingClock::default(),
             read_frac: 0.0,
             prev_frame: (0.0, 0.0),
@@ -1337,20 +1340,30 @@ impl MonoRing {
     /// (obie czekają na decyzję klasy), krótki w przeciwnym razie. Po podniesieniu celu odczyt
     /// czeka, aż bufor się dopełni (patrz [`Self::priming`]).
     fn update_target_latency(&mut self) {
-        let long = self.class_gain_enabled || self.layer_styles_enabled;
-        if long && !self.long_latency && self.frames.len() < CLASS_GAIN_LATENCY_SAMPLES {
+        let target = self.target_fill();
+        if target > self.mode_target && (self.frames.len() as f32) < target {
             self.priming = true;
-        } else if !long && self.long_latency {
+        } else if target < self.mode_target {
             self.priming = false;
         }
-        self.long_latency = long;
+        self.mode_target = target;
         self.clock.restart_average();
     }
 
-    /// Docelowe średnie zapełnienie bufora (próbki wejścia): długie przy zmianie głośności klas
-    /// i „Wg warstw”, inaczej krótkie, wg urządzeń (patrz [`ring_clock::RingClock::short_target`]).
+    /// Docelowe średnie zapełnienie bufora (próbki wejścia):
+    /// - zmiana głośności klas: [`CLASS_GAIN_LATENCY_SAMPLES`], bo czeka na pełną decyzję,
+    /// - „Wg warstw”: tyle, żeby decyzja wstępna (po [`layers::QUICK_DECISION_S`]) zdążyła
+    ///   [`LAYER_STYLE_LOOKAHEAD_FRAMES`] przed dźwiękiem (ok. 38 ms przy 10 ms kawałkach),
+    /// - inaczej krótki cel wg urządzeń (patrz [`ring_clock::RingClock::short_target`]).
     fn target_fill(&self) -> f32 {
-        if self.long_latency { CLASS_GAIN_LATENCY_SAMPLES as f32 } else { self.clock.short_target() }
+        if self.class_gain_enabled {
+            CLASS_GAIN_LATENCY_SAMPLES as f32
+        } else if self.layer_styles_enabled {
+            let wait = layers::QUICK_DECISION_S * self.clock.sample_rate() + LAYER_STYLE_LOOKAHEAD_FRAMES as f32;
+            self.clock.target_with_wait(wait)
+        } else {
+            self.clock.short_target()
+        }
     }
 
     /// Bieżąca próbka odczytu: `frames[0]` albo, przy ułamkowej pozycji, interpolacja Hermite'a
@@ -1412,7 +1425,19 @@ impl MonoRing {
                 break;
             }
             self.layer_events.pop_front();
-            self.layer_active[side] = Some((onset, layer));
+            // Ten sam początek to ten sam dźwięk: pełna decyzja zastępuje wstępną, także gdy
+            // wyszła inna strona albo środek (wtedy znika ze strony, na której była).
+            for (slot, active) in self.layer_active.iter_mut().enumerate() {
+                if side != Some(slot) && active.is_some_and(|(o, _)| o == onset) {
+                    *active = None;
+                }
+            }
+            // Spóźniona poprawka starszego dźwięku nie nadpisuje nowszego po tej samej stronie.
+            if let Some(side) = side
+                && self.layer_active[side].is_none_or(|(o, _)| o <= onset)
+            {
+                self.layer_active[side] = Some((onset, layer));
+            }
         }
         let current = |active: Option<(u64, layers::Layer)>| {
             active.filter(|&(onset, _)| frame < onset + LAYER_STYLE_HOLD_FRAMES).map(|(_, layer)| layer)
@@ -1636,9 +1661,9 @@ impl SharedAudioAnalysis {
         }
     }
 
-    /// Włącza albo wyłącza zbieranie zdarzeń warstw dla stylu wskazówki „Wg warstw”. Tak jak
-    /// zmiana głośności klas wymaga opóźnienia [`CLASS_GAIN_LATENCY_SAMPLES`], żeby styl warstwy
-    /// zdążył przed początkiem dźwięku.
+    /// Włącza albo wyłącza zbieranie zdarzeń warstw dla stylu wskazówki „Wg warstw”. Wymaga
+    /// dłuższego bufora (patrz [`MonoRing::target_fill`]), żeby wstępna decyzja warstwy zdążyła
+    /// przed początkiem dźwięku.
     pub(crate) fn set_mono_layer_styles(&self, enabled: bool) {
         if let Ok(mut ring) = self.mono_ring.lock() {
             if ring.layer_styles_enabled == enabled {
@@ -1657,6 +1682,10 @@ impl SharedAudioAnalysis {
     /// Zapisuje zdarzenia warstw dla stylu „Wg warstw”, z numerem ramki początku (jak
     /// [`Self::push_class_gains`]) i stroną. Zdarzenie bliżej środka niż martwa strefa
     /// rozdzielania kierunkowego (ok. 1,5 dB różnicy L/P) nie trafia na żadną stronę.
+    ///
+    /// Najpierw przychodzą decyzje wstępne (po ok. 20 ms, `layers::LayerTracker::take_quick`),
+    /// potem pełne (po ok. 0,15 s) z tym samym początkiem. Pełna poprawia wstępną: zmienia
+    /// warstwę albo stronę od chwili, w której przyszła (płynnie, patrz `mono_router`).
     pub(crate) fn push_layer_events(&self, hits: &[layers::LayerHit], sample_rate: f32) {
         if hits.is_empty() {
             return;
@@ -1669,14 +1698,16 @@ impl SharedAudioAnalysis {
             let min_pan = layers::pan_from_rms(1.0, dead_zone);
             for hit in hits {
                 let side = if hit.pan >= min_pan {
-                    1
+                    Some(1)
                 } else if hit.pan <= -min_pan {
-                    0
+                    Some(0)
                 } else {
-                    continue;
+                    None
                 };
                 let frame = (hit.onset_s * f64::from(sample_rate)).round().max(0.0) as u64;
-                ring.layer_events.push_back((frame, hit.layer, side));
+                // Po początku, za wszystkimi wcześniejszymi i równymi (poprawka idzie po wstępnej).
+                let at = ring.layer_events.iter().rposition(|&(onset, _, _)| onset <= frame).map_or(0, |i| i + 1);
+                ring.layer_events.insert(at, (frame, hit.layer, side));
             }
             while ring.layer_events.len() > MAX_LAYER_EVENTS {
                 ring.layer_events.pop_front();
@@ -2185,19 +2216,22 @@ pub(crate) fn update_analysis(
 
     // Warstwy 3+3 i wskaźniki kierunku dostają zdarzenia z szybkiego detektora, ale tylko te,
     // które przechodzą regułę poziomu z Pythona. Odrzuca to szum przy starcie i ogon dźwięku.
-    let (layer_hits, accepted) = {
+    let (quick_hits, layer_hits, accepted) = {
         let mut tracker = analysis.layers.lock().unwrap_or_else(|e| e.into_inner());
         tracker.push_frames(samples, channels, sample_rate);
         let accepted = tracker.onset_allowed() && channel_activity.iter().any(|a| a.is_onset);
         if accepted && tracker.has_external_onsets() {
             tracker.add_onset();
         }
-        (tracker.take_ready(), accepted)
+        // Najpierw decyzje wstępne, potem pełne: pełna tego samego zdarzenia ma poprawić wstępną.
+        (tracker.take_quick(), tracker.take_ready(), accepted)
     };
 
     // Zmiana głośności w trybie mono: strzały ciszej, kroki głośniej (patrz `push_class_gains`),
-    // i styl wskazówki „Wg warstw” (patrz `push_layer_events`).
+    // tylko z pełnych decyzji. Styl wskazówki „Wg warstw” (patrz `push_layer_events`) bierze
+    // decyzje wstępne po 20 ms, a pełne je poprawiają.
     analysis.push_class_gains(&layer_hits, sample_rate);
+    analysis.push_layer_events(&quick_hits, sample_rate);
     analysis.push_layer_events(&layer_hits, sample_rate);
 
     // Wskaźniki kierunku i kroki idą z tego samego, szybkiego detektora kanałów.
@@ -2871,11 +2905,21 @@ mod tests {
         layers::LayerHit { pan, ..class_hit(layer, onset_s) }
     }
 
+    /// Warstwy, jakie odczyt widzi w ramkach `from..to` (indeks = numer ramki od `from`).
+    fn layer_timeline(analysis: &SharedAudioAnalysis, from: u64, to: u64) -> Vec<SideLayers> {
+        let mut ring = analysis.mono_ring.lock().unwrap();
+        (from..to)
+            .map(|frame| {
+                ring.front_index = frame;
+                ring.next_layers()
+            })
+            .collect()
+    }
+
     #[test]
     fn layer_events_tag_the_side_they_came_from() {
         let analysis = SharedAudioAnalysis::new();
         analysis.set_mono_layer_styles(true);
-        analysis.push_stereo_pan(&vec![(0.1, 0.1); CLASS_GAIN_LATENCY_SAMPLES]);
         analysis.push_layer_events(
             &[
                 side_hit(layers::Layer::Steps, 0.1, 0.8),  // ramka 4 800, prawa
@@ -2884,12 +2928,7 @@ mod tests {
             ],
             48_000.0,
         );
-        // Wejście i wyjście po tyle samo, jak w prawdziwym strumieniu: opóźnienie stoi na 0,25 s.
-        let mut tags = Vec::new();
-        for _ in 0..40 {
-            analysis.push_stereo_pan(&[(0.1, 0.1); 1_000]);
-            tags.extend(analysis.read_stereo_pan_tagged(1_000, 48_000.0).1);
-        }
+        let tags = layer_timeline(&analysis, 0, 40_000);
         let lookahead = LAYER_STYLE_LOOKAHEAD_FRAMES as usize;
         let hold = LAYER_STYLE_HOLD_FRAMES as usize;
         assert_eq!(tags[4_800 - lookahead - 1].right, None, "przed zdarzeniem nic");
@@ -2898,6 +2937,55 @@ mod tests {
         assert_eq!(tags[4_800 + hold].right, None, "po czasie trzymania styl wraca do reszty");
         assert_eq!(tags[10_000].left, Some(layers::Layer::Shots), "strzał z lewej oznacza lewą stronę");
         assert!(tags.iter().all(|t| t.right != Some(layers::Layer::Shots)), "strzał ze środka nie trafia na stronę");
+    }
+
+    #[test]
+    fn full_decision_corrects_the_quick_one_from_when_it_arrives() {
+        use layers::Layer::{Shots, Steps};
+        let hold = LAYER_STYLE_HOLD_FRAMES as usize;
+        let analysis = SharedAudioAnalysis::new();
+        analysis.set_mono_layer_styles(true);
+        // Decyzja wstępna: krok z prawej w ramce 4 800.
+        analysis.push_layer_events(&[side_hit(Steps, 0.1, 0.8)], 48_000.0);
+        let early = layer_timeline(&analysis, 0, 6_000);
+        assert_eq!(early[5_000].right, Some(Steps));
+        // Pełna decyzja przychodzi później: to był strzał. Od tej chwili styl strzałów,
+        // trzymany od początku dźwięku, nie od poprawki.
+        analysis.push_layer_events(&[side_hit(Shots, 0.1, 0.8)], 48_000.0);
+        let late = layer_timeline(&analysis, 6_000, 20_000);
+        assert_eq!(late[0].right, Some(Shots));
+        assert_eq!(late[4_800 + hold - 1 - 6_000].right, Some(Shots));
+        assert_eq!(late[4_800 + hold - 6_000].right, None);
+    }
+
+    #[test]
+    fn full_decision_can_move_the_sound_to_the_centre_or_the_other_side() {
+        use layers::Layer::Steps;
+        let analysis = SharedAudioAnalysis::new();
+        analysis.set_mono_layer_styles(true);
+        analysis.push_layer_events(&[side_hit(Steps, 0.1, 0.8), side_hit(Steps, 0.5, 0.8)], 48_000.0);
+        assert_eq!(layer_timeline(&analysis, 0, 5_000)[4_900].right, Some(Steps));
+        // Pełna: środek, więc styl znika z prawej.
+        analysis.push_layer_events(&[side_hit(Steps, 0.1, 0.0)], 48_000.0);
+        assert_eq!(layer_timeline(&analysis, 5_000, 5_001)[0], SideLayers::default());
+        // Drugi dźwięk: wstępnie prawa, pełna lewa.
+        assert_eq!(layer_timeline(&analysis, 24_000, 24_100)[50].right, Some(Steps));
+        analysis.push_layer_events(&[side_hit(Steps, 0.5, -0.8)], 48_000.0);
+        let moved = layer_timeline(&analysis, 24_100, 24_101)[0];
+        assert_eq!((moved.left, moved.right), (Some(Steps), None));
+    }
+
+    #[test]
+    fn a_late_correction_does_not_override_a_newer_sound() {
+        use layers::Layer::{Rest, Shots, Steps};
+        let analysis = SharedAudioAnalysis::new();
+        analysis.set_mono_layer_styles(true);
+        // Krok z prawej w 0,1 s, potem strzał z prawej w 0,15 s (oba wstępnie).
+        analysis.push_layer_events(&[side_hit(Steps, 0.1, 0.8), side_hit(Shots, 0.15, 0.8)], 48_000.0);
+        assert_eq!(layer_timeline(&analysis, 0, 8_000)[7_999].right, Some(Shots));
+        // Spóźniona pełna decyzja pierwszego dźwięku nie zabiera stylu nowszemu.
+        analysis.push_layer_events(&[side_hit(Rest, 0.1, 0.8)], 48_000.0);
+        assert_eq!(layer_timeline(&analysis, 8_000, 8_001)[0].right, Some(Shots));
     }
 
     #[test]
@@ -2915,7 +3003,7 @@ mod tests {
         // początku dźwięku) przychodziłaby za późno.
         let analysis = SharedAudioAnalysis::new();
         analysis.push_stereo_pan(&vec![(0.2, 0.2); 2_400]);
-        analysis.set_mono_layer_styles(true);
+        analysis.set_mono_class_gain(true, MONO_CLASS_GAIN_DB_DEFAULT);
         let waiting = analysis.read_stereo_pan(1_000);
         assert!(waiting.iter().all(|s| s.0 < 0.2), "czeka na dopełnienie, zamiast grać od razu");
         assert_eq!(analysis.mono_ring.lock().unwrap().frames.len(), 2_400, "nic nie zdjęte");
@@ -2968,13 +3056,27 @@ mod tests {
         fills: Vec<usize>,
         underruns: u64,
         out: Vec<(f32, f32)>,
+        /// Styl „Wg warstw”: decyzje po rozruchu i te, które przyszły za późno.
+        decisions: usize,
+        late: usize,
     }
 
     /// `seconds` sekund strumienia: wejście co 10 ms (480 próbek przy `in_rate` z dryfem
     /// `drift_ppm`), wyjście co 10 ms przy `out_rate`, w kolejności czasu jak w prawdziwych
     /// callbackach. Sygnał to sinus 1 kHz.
     fn run_two_clocks(seconds: f64, in_rate: f64, drift_ppm: f64, out_rate: f64) -> ClockRun {
+        run_two_clocks_with(seconds, in_rate, drift_ppm, out_rate, false)
+    }
+
+    /// Jak [`run_two_clocks`]; przy `layer_styles` włącza styl „Wg warstw” i co 0,37 s ogłasza
+    /// dźwięk tak, jak robi to klasyfikator: decyzja wstępna z kawałkiem wejścia, który domyka
+    /// okno 20 ms. Liczy decyzje, które przyszły za późno, czyli gdy odczyt minął już punkt
+    /// włączenia stylu (5 ms przed dźwiękiem).
+    fn run_two_clocks_with(seconds: f64, in_rate: f64, drift_ppm: f64, out_rate: f64, layer_styles: bool) -> ClockRun {
         let analysis = SharedAudioAnalysis::new();
+        analysis.set_mono_layer_styles(layer_styles);
+        let quick = (layers::QUICK_DECISION_S as f64 * in_rate).round() as u64;
+        let mut next_onset = 12_345u64;
         let in_chunk = (in_rate / 100.0).round() as usize;
         let out_chunk = (out_rate / 100.0).round() as usize;
         // Prawdziwa częstotliwość wejścia z dryfem, a nominalna podawana jest do bufora.
@@ -2982,7 +3084,7 @@ mod tests {
         let out_period = out_chunk as f64 / out_rate;
         let (mut next_in, mut next_out) = (0.0f64, 0.003f64);
         let mut written = 0usize;
-        let mut run = ClockRun { fills: Vec::new(), underruns: 0, out: Vec::new() };
+        let mut run = ClockRun { fills: Vec::new(), underruns: 0, out: Vec::new(), decisions: 0, late: 0 };
         while next_out < seconds {
             if next_in <= next_out {
                 let chunk: Vec<(f32, f32)> = (written..written + in_chunk)
@@ -2994,6 +3096,16 @@ mod tests {
                 written += in_chunk;
                 analysis.push_stereo_pan_at(&chunk, in_rate as f32);
                 next_in += in_period;
+                while layer_styles && next_onset + quick <= written as u64 {
+                    let reader = analysis.mono_ring.lock().unwrap().front_index;
+                    if next_out > 1.0 {
+                        run.decisions += 1;
+                        if reader + LAYER_STYLE_LOOKAHEAD_FRAMES > next_onset {
+                            run.late += 1;
+                        }
+                    }
+                    next_onset += 17_760;
+                }
             } else {
                 if next_out > 1.0 {
                     run.fills.push(analysis.mono_ring.lock().unwrap().frames.len());
@@ -3004,6 +3116,22 @@ mod tests {
         }
         run.underruns = analysis.mono_latency().underruns;
         run
+    }
+
+    #[test]
+    fn per_layer_decisions_arrive_before_the_sound_with_a_short_buffer() {
+        // „Wg warstw” czeka tylko na decyzję wstępną: bufor ok. 38 ms (25 ms czekania, pół
+        // kawałków i 3 ms zapasu) zamiast 250 ms, a każda decyzja i tak zdąża przed dźwiękiem.
+        for drift_ppm in [300.0, -300.0] {
+            let run = run_two_clocks_with(40.0, 48_000.0, drift_ppm, 48_000.0, true);
+            assert_eq!(run.underruns, 0, "{drift_ppm} ppm: przerwy");
+            assert!(run.decisions > 90, "{drift_ppm} ppm: decyzje {}", run.decisions);
+            assert_eq!(run.late, 0, "{drift_ppm} ppm: spóźnione decyzje z {}", run.decisions);
+            let late = &run.fills[run.fills.len() / 2..];
+            let mean = late.iter().sum::<usize>() as f64 / late.len() as f64;
+            // Zapełnienie przed odczytem: cel średni (1 824) plus pół odczytu (240).
+            assert!((mean - 2_064.0).abs() < 250.0, "{drift_ppm} ppm: średnio {mean:.0} próbek");
+        }
     }
 
     #[test]

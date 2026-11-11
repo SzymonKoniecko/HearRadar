@@ -27,6 +27,8 @@ const MARGIN_DECAY_MS: f32 = 0.5;
 /// Granice krótkiego celu opóźnienia (ms).
 const SHORT_TARGET_MIN_MS: f32 = 2.0;
 pub(crate) const SHORT_TARGET_MAX_MS: f32 = 50.0;
+/// Górna granica celu z czekaniem na decyzję ([`RingClock::target_with_wait`]).
+const WAIT_TARGET_MAX_MS: f32 = 150.0;
 /// Jak długo pamiętamy największy kawałek wejścia i odczyt wyjścia (stała czasu, s).
 const PEAK_MEMORY_S: f32 = 10.0;
 /// Uśrednianie zapełnienia bufora (stała czasu, s).
@@ -124,6 +126,18 @@ impl RingClock {
             ms_to_samples(SHORT_TARGET_MIN_MS, self.sample_rate),
             ms_to_samples(SHORT_TARGET_MAX_MS, self.sample_rate),
         )
+    }
+
+    /// Cel średniego zapełnienia, gdy dźwięk musi poczekać w buforze `wait` próbek od swojego
+    /// początku na decyzję o nim (styl „Wg warstw”: okno decyzji wstępnej i wyprzedzenie stylu).
+    ///
+    /// Decyzja przychodzi z kawałkiem wejścia, który domyka jej okno, a odczyt nie może wtedy
+    /// być dalej niż `wait` za początkiem dźwięku. Bufor jest najmniej zapełniony tuż przed
+    /// kawałkiem wejścia i tuż po odczycie, czyli o połowę obu kawałków poniżej średniej, stąd
+    /// `wait` plus połowa kawałków plus zapas (przy 10 ms kawałkach i 25 ms czekania: ok. 38 ms).
+    pub(crate) fn target_with_wait(&self, wait: f32) -> f32 {
+        let wanted = wait + 0.5 * (self.in_peak + self.out_peak) + self.margin;
+        wanted.clamp(self.short_target(), ms_to_samples(WAIT_TARGET_MAX_MS, self.sample_rate))
     }
 
     /// Odczyt `need` próbek wejścia przy zapełnieniu `fill` (przed odczytem) i celu `target`.
