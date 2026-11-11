@@ -65,14 +65,16 @@ pub fn load() -> Result<RadarConfig> {
 /// Wczytuje konfigurację z podanej ścieżki. Błędy jak w [`load`].
 ///
 /// Plik zapisany starszą wersją aplikacji jest od razu przeliczany do bieżącej skali poziomu mono
-/// (patrz [`RadarConfig::migrate_mono_level`]), żeby głośność w słuchawce nie skoczyła. Na dysk
-/// trafia to przy następnym zapisie konfiguracji.
+/// (patrz [`RadarConfig::migrate_mono_level`]), żeby głośność w słuchawce nie skoczyła, oraz do
+/// osobnych kolorów stron warstw (patrz [`RadarConfig::migrate_layer_side_colors`]), żeby łuki
+/// warstw miały dotychczasowe kolory. Na dysk trafia to przy następnym zapisie konfiguracji.
 pub fn load_from(path: &Path) -> Result<RadarConfig> {
     let data = std::fs::read_to_string(path)
         .with_context(|| format!("nie udało się odczytać pliku {}", path.display()))?;
     let mut cfg: RadarConfig =
         serde_json::from_str(&data).with_context(|| format!("nieprawidłowy JSON w {}", path.display()))?;
     cfg.migrate_mono_level();
+    cfg.migrate_layer_side_colors();
     Ok(cfg)
 }
 
@@ -251,6 +253,71 @@ mod tests {
         save_to(&path, &loaded).expect("save should succeed");
         let again = load_from(&path).expect("load should succeed right after save");
         assert_eq!(again.mono_boost_db, loaded.mono_boost_db);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Pola kolorów stron warstw, których nie ma w pliku sprzed tej funkcji.
+    const SIDE_COLOR_KEYS: [&str; 6] = [
+        "layer_shots_left_color",
+        "layer_shots_right_color",
+        "layer_steps_left_color",
+        "layer_steps_right_color",
+        "layer_rest_left_color",
+        "layer_rest_right_color",
+    ];
+
+    #[test]
+    fn loading_a_config_from_before_side_colors_keeps_layer_colors_on_both_sides() {
+        use crate::sound::devices::VisualizationMode;
+        use crate::sound::layers::Layer;
+        // Stary plik: własne kolory warstw, w głównych polach i w wyglądzie trybu, bez pól stron i wersji.
+        let path = temp_config_path("layer_side_colors");
+        let mut old = RadarConfig {
+            layer_shots_color: [10, 20, 30],
+            layer_steps_color: [40, 50, 60],
+            layer_rest_color: [70, 80, 90],
+            ..RadarConfig::default()
+        };
+        let mut appearance = old.appearance();
+        appearance.layer_steps_color = [1, 2, 3];
+        old.mode_appearance.insert(VisualizationMode::LayerBars22, appearance);
+        let mut value = serde_json::to_value(&old).unwrap();
+        let object = value.as_object_mut().unwrap();
+        assert!(object.remove("layer_colors_version").is_some());
+        for key in SIDE_COLOR_KEYS {
+            assert!(object.remove(key).is_some(), "{key}");
+            assert!(object["mode_appearance"]["LayerBars22"].as_object_mut().unwrap().remove(key).is_some(), "{key}");
+        }
+        std::fs::write(&path, value.to_string()).unwrap();
+
+        let loaded = load_from(&path).expect("stary plik powinien się wczytać");
+        assert_eq!(loaded.layer_side_colors(Layer::Shots), [[10, 20, 30]; 2]);
+        assert_eq!(loaded.layer_side_colors(Layer::Steps), [[40, 50, 60]; 2]);
+        assert_eq!(loaded.layer_side_colors(Layer::Rest), [[70, 80, 90]; 2]);
+        let saved = loaded.mode_appearance[&VisualizationMode::LayerBars22];
+        assert_eq!([saved.layer_steps_left_color, saved.layer_steps_right_color], [[1, 2, 3]; 2]);
+        assert_eq!([saved.layer_shots_left_color, saved.layer_shots_right_color], [[10, 20, 30]; 2]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn side_colors_survive_save_and_load() {
+        use crate::sound::layers::Layer;
+        // Wybór z UI: wszystko po lewej niebieskie, po prawej fioletowe. Ma przetrwać restart.
+        let path = temp_config_path("side_colors_round_trip");
+        let mut cfg = RadarConfig::default();
+        cfg.set_layer_side_color_for_all(0, [0, 150, 255]);
+        cfg.set_layer_side_color_for_all(1, [180, 40, 200]);
+        cfg.remember_appearance();
+        save_to(&path, &cfg).expect("save should succeed");
+
+        let loaded = load_from(&path).expect("load should succeed right after save");
+        assert_eq!(loaded, cfg);
+        for layer in Layer::ALL {
+            assert_eq!(loaded.layer_side_colors(layer), [[0, 150, 255], [180, 40, 200]], "{layer:?}");
+        }
 
         let _ = std::fs::remove_file(&path);
     }

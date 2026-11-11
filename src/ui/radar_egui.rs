@@ -1028,7 +1028,7 @@ fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, 
     let highlighted = state.layer_bars.highlighted_layer();
     let focus = state.side_focus.map(|f| f.side);
 
-    // Każda warstwa (para L i P) ma swój kolor. Czerwony zostaje na obwódkę.
+    // Każda warstwa ma swój kolor, osobno po lewej i prawej stronie. Czerwony zostaje na obwódkę.
     let rgba = |rgb: (u8, u8, u8), alpha: f32| {
         Color32::from_rgba_unmultiplied(rgb.0, rgb.1, rgb.2, (alpha * fg).clamp(0.0, 255.0) as u8)
     };
@@ -1044,7 +1044,6 @@ fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, 
     // Kroki i strzały jako łuki w środku, kroki najbliżej. Zewnętrzny łuk to wszystko, rysowany osobno.
     for layer in [Layer::Steps, Layer::Shots] {
         let radius = inner + ring_index(layer) as f32 * spacing;
-        let rgb = layer_rgb(cfg, layer);
         let is_highlighted = layer == highlighted;
         // Każda para ma własne wzmocnienie widoczności z ustawień.
         let gain = layer_gain(cfg, layer);
@@ -1054,6 +1053,7 @@ fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, 
             if !visible[side] {
                 continue;
             }
+            let rgb = layer_rgb(cfg, layer, side);
             // Ślad całego łuku, żeby było widać zakres. Podświetlona para ma szerszy.
             let track = if is_highlighted { thickness * 2.2 } else { thickness };
             let track_alpha = if is_highlighted { 45.0 } else { 22.0 };
@@ -1078,9 +1078,9 @@ fn draw_layer_bars<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConfig, 
         r,
         cfg.fg_alpha,
         &[
-            ("kroki", layer_rgb(cfg, Layer::Steps)),
-            ("strzały", layer_rgb(cfg, Layer::Shots)),
-            ("wszystko", layer_rgb(cfg, Layer::Rest)),
+            legend_item(cfg, "kroki", Layer::Steps),
+            legend_item(cfg, "strzały", Layer::Shots),
+            legend_item(cfg, "wszystko", Layer::Rest),
         ],
     );
 }
@@ -1122,12 +1122,13 @@ fn draw_layer_bars_2x2<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConf
     for (side, mid_deg) in [(0usize, 270.0_f32), (1, 90.0)] {
         let (layer, height) = inner_groups[side];
         let outlined = focus == Some(side) && height >= DOMINANT_MIN_HEIGHT;
-        draw_level_arc(canvas, center, mid_deg, inner, thickness, layer_rgb(cfg, layer), height, outlined, fg);
+        draw_level_arc(canvas, center, mid_deg, inner, thickness, layer_rgb(cfg, layer, side), height, outlined, fg);
     }
     for (side, mid_deg) in [(0usize, 270.0_f32), (1, 90.0)] {
         let (layer, height) = outer_groups[side];
         let outlined = focus == Some(side) && height >= DOMINANT_MIN_HEIGHT;
-        draw_level_arc(canvas, center, mid_deg, rim_radius, rim_thickness, layer_rgb(cfg, layer), height, outlined, fg);
+        let rgb = layer_rgb(cfg, layer, side);
+        draw_level_arc(canvas, center, mid_deg, rim_radius, rim_thickness, rgb, height, outlined, fg);
     }
 
     draw_spatial_extras(canvas, center, r, cfg, state, now);
@@ -1137,9 +1138,9 @@ fn draw_layer_bars_2x2<C: RadarCanvas>(canvas: &C, center: Pos2, cfg: &RadarConf
         r,
         cfg.fg_alpha,
         &[
-            ("strzały", layer_rgb(cfg, Layer::Shots)),
-            ("kroki", layer_rgb(cfg, Layer::Steps)),
-            ("wszystko", layer_rgb(cfg, Layer::Rest)),
+            legend_item(cfg, "strzały", Layer::Shots),
+            legend_item(cfg, "kroki", Layer::Steps),
+            legend_item(cfg, "wszystko", Layer::Rest),
         ],
     );
 }
@@ -1438,15 +1439,18 @@ fn draw_rest_ring<C: RadarCanvas>(
     };
     let left_history = scale(&state.stereo_left_history);
     let right_history = scale(&state.stereo_right_history);
-    let (rr, rg, rb) = layer_rgb(cfg, Layer::Rest);
+    let [left_rgb, right_rgb] = [0usize, 1].map(|side| {
+        let (red, green, blue) = layer_rgb(cfg, Layer::Rest, side);
+        [red, green, blue]
+    });
     draw_stereo_indicators(
         canvas,
         center,
         r,
         &left_history,
         &right_history,
-        [rr, rg, rb],
-        [rr, rg, rb],
+        left_rgb,
+        right_rgb,
         fg,
         lt,
         state.rest_visible(),
@@ -1454,31 +1458,44 @@ fn draw_rest_ring<C: RadarCanvas>(
     );
 }
 
-/// Legenda pod radarem: nazwa i kolor każdego łuku, od lewej do prawej (po trzy pozycje).
-fn draw_layer_legend<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, fg: f32, items: &[(&str, (u8, u8, u8))]) {
-    for (i, (label, rgb)) in items.iter().enumerate() {
-        let x = center.x + (i as f32 - 1.0) * r * 0.55;
-        canvas.text(
-            Pos2::new(x, center.y + r * 1.3),
-            Align2::CENTER_CENTER,
-            label,
-            FontId::proportional(10.0),
-            tint(*rgb, 200.0, fg),
-        );
+/// Kolor nazwy w legendzie, gdy łuk ma inny kolor po każdej stronie (wtedy kolory stron pokazują kropki).
+const LEGEND_NEUTRAL_RGB: (u8, u8, u8) = (220, 220, 220);
+
+/// Legenda pod radarem: nazwa i kolor każdego łuku, od lewej do prawej (po trzy pozycje). Łuk z tym
+/// samym kolorem po obu stronach ma nazwę w tym kolorze. Przy różnych kolorach nazwa jest jasnoszara,
+/// a obok niej stoją kropki: z lewej w kolorze lewej strony, z prawej w kolorze prawej.
+fn draw_layer_legend<C: RadarCanvas>(canvas: &C, center: Pos2, r: f32, fg: f32, items: &[LegendItem]) {
+    const FONT_PX: f32 = 10.0;
+    // Przybliżona połowa szerokości znaku czcionki 10 px, bo płótno nie mierzy tekstu.
+    const HALF_CHAR_PX: f32 = 2.8;
+    const DOT_RADIUS: f32 = 2.5;
+    for (i, (label, [left, right])) in items.iter().enumerate() {
+        let pos = Pos2::new(center.x + (i as f32 - 1.0) * r * 0.55, center.y + r * 1.3);
+        let text_rgb = if left == right { *left } else { LEGEND_NEUTRAL_RGB };
+        canvas.text(pos, Align2::CENTER_CENTER, label, FontId::proportional(FONT_PX), tint(text_rgb, 200.0, fg));
+        if left != right {
+            let offset = label.chars().count() as f32 * HALF_CHAR_PX + 3.0 + DOT_RADIUS;
+            canvas.circle_filled(pos - Vec2::new(offset, 0.0), DOT_RADIUS, tint(*left, 230.0, fg));
+            canvas.circle_filled(pos + Vec2::new(offset, 0.0), DOT_RADIUS, tint(*right, 230.0, fg));
+        }
     }
 }
 
-/// Kolor warstwy z ustawień. W wysokim kontraście wszystkie są białe.
-fn layer_rgb(cfg: &RadarConfig, layer: Layer) -> (u8, u8, u8) {
+/// Kolor warstwy po stronie `side` (0 lewa, 1 prawa) z ustawień. W wysokim kontraście wszystkie są białe.
+fn layer_rgb(cfg: &RadarConfig, layer: Layer, side: usize) -> (u8, u8, u8) {
     if cfg.high_contrast {
         return (255, 255, 255);
     }
-    let c = match layer {
-        Layer::Shots => cfg.layer_shots_color,
-        Layer::Steps => cfg.layer_steps_color,
-        Layer::Rest => cfg.layer_rest_color,
-    };
-    (c[0], c[1], c[2])
+    let [r, g, b] = cfg.layer_side_colors(layer)[side];
+    (r, g, b)
+}
+
+/// Pozycja legendy: nazwa łuku i jego kolor po lewej i prawej stronie.
+type LegendItem = (&'static str, [(u8, u8, u8); 2]);
+
+/// Pozycja legendy dla warstwy, z kolorami obu stron.
+fn legend_item(cfg: &RadarConfig, label: &'static str, layer: Layer) -> LegendItem {
+    (label, [layer_rgb(cfg, layer, 0), layer_rgb(cfg, layer, 1)])
 }
 
 /// Wzmocnienie widoczności warstwy z ustawień.
@@ -1717,10 +1734,10 @@ pub fn view_snapshot(state: &RadarState, cfg: &RadarConfig, now: f64) -> ViewSna
 /// czerwona obwódka i kolory.
 pub fn layer_text(state: &RadarState, cfg: &RadarConfig, now: f64) -> String {
     let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
-    let color = |layer: Layer| match layer {
-        Layer::Shots => cfg.layer_shots_color,
-        Layer::Steps => cfg.layer_steps_color,
-        Layer::Rest => cfg.layer_rest_color,
+    // Jeden kolor, gdy obie strony są takie same, inaczej kolor lewej i prawej strony.
+    let color = |layer: Layer| match cfg.layer_side_colors(layer) {
+        [left, right] if left == right => hex(left),
+        [left, right] => format!("L {} P {}", hex(left), hex(right)),
     };
     let gain = |layer: Layer| match layer {
         Layer::Shots => cfg.layer_shots_gain,
@@ -1746,7 +1763,7 @@ pub fn layer_text(state: &RadarState, cfg: &RadarConfig, now: f64) -> String {
             shown(0),
             h[1],
             shown(1),
-            hex(color(layer)),
+            color(layer),
             mark
         ));
         if layer == highlighted {
@@ -1768,7 +1785,7 @@ pub fn layer_text(state: &RadarState, cfg: &RadarConfig, now: f64) -> String {
         shown(0),
         r,
         shown(1),
-        hex(color(Layer::Rest))
+        color(Layer::Rest)
     ));
     // Przód/tył rysuje się tylko przy włączonym widoku przestrzennym (patrz `draw_layer_bars`).
     if cfg.spatial_audio_view {
@@ -2732,6 +2749,84 @@ mod tests {
         canvas.colors.borrow_mut().clear();
         draw_level_arc(&canvas, Pos2::ZERO, 270.0, 100.0, 4.0, (0, 255, 0), 0.5, false, 1.0);
         assert!(!canvas.colors.borrow().iter().any(is_red), "bez przewagi brak obrysu");
+    }
+
+    /// Zapisuje kreski i kropki z płótna, żeby sprawdzić kolory po każdej stronie radaru.
+    #[derive(Default)]
+    struct SideColorCanvas {
+        segments: std::cell::RefCell<Vec<([Pos2; 2], Color32)>>,
+        dots: std::cell::RefCell<Vec<(Pos2, Color32)>>,
+    }
+
+    impl RadarCanvas for SideColorCanvas {
+        fn circle_filled(&self, center: Pos2, _: f32, color: Color32) {
+            self.dots.borrow_mut().push((center, color));
+        }
+        fn circle_stroke(&self, _: Pos2, _: f32, _: Stroke) {}
+        fn line_segment(&self, points: [Pos2; 2], stroke: Stroke) {
+            self.segments.borrow_mut().push((points, stroke.color));
+        }
+        fn rect_filled(&self, _: Rect, _: f32, _: Color32) {}
+        fn triangle_filled(&self, _: [Pos2; 3], _: Color32) {}
+        fn text(&self, _: Pos2, _: Align2, _: &str, _: FontId, _: Color32) {}
+    }
+
+    #[test]
+    fn layer_arcs_use_the_color_of_their_side() {
+        use crate::sound::devices::VisualizationMode;
+        // Wszystkie warstwy po lewej czysto niebieskie, po prawej czysto zielone. Czerwień obrysu
+        // i poświaty ma składową R, więc kreski bez R to łuki warstw w kolorze strony.
+        const BLUE: [u8; 3] = [0, 0, 255];
+        const GREEN: [u8; 3] = [0, 255, 0];
+        for mode in [VisualizationMode::LayerBars, VisualizationMode::LayerBars22] {
+            let mut cfg = RadarConfig { visualization_mode: mode, ..RadarConfig::default() };
+            cfg.set_layer_side_color_for_all(0, BLUE);
+            cfg.set_layer_side_color_for_all(1, GREEN);
+            let mut state = RadarState::new();
+            for i in 0..5 {
+                state.update(i as f64 * 0.05, 2, &[0.3, 0.3], &[], &[], cfg.decay_secs, cfg.radar_sensitivity, &[]);
+            }
+            let canvas = SideColorCanvas::default();
+            draw_radar(&canvas, Pos2::ZERO, &cfg, &mut state, 2, 0.2);
+
+            let segments = canvas.segments.into_inner();
+            let layer_arcs = |left: bool| -> Vec<Color32> {
+                segments
+                    .iter()
+                    .filter(|(points, color)| {
+                        let mid_x = (points[0].x + points[1].x) * 0.5;
+                        color.r() == 0 && color.a() > 0 && if left { mid_x < -1.0 } else { mid_x > 1.0 }
+                    })
+                    .map(|(_, color)| *color)
+                    .collect()
+            };
+            let left = layer_arcs(true);
+            let right = layer_arcs(false);
+            assert!(!left.is_empty() && !right.is_empty(), "{mode:?}: łuki po obu stronach");
+            assert!(left.iter().all(|c| c.g() == 0 && c.b() > 0), "{mode:?}: lewa niebieska: {left:?}");
+            assert!(right.iter().all(|c| c.b() == 0 && c.g() > 0), "{mode:?}: prawa zielona: {right:?}");
+
+            // Legenda: przy różnych kolorach stron kropka z lewej ma kolor lewej, z prawej kolor prawej.
+            let dots = canvas.dots.into_inner();
+            assert_eq!(dots.len(), 6, "{mode:?}: po dwie kropki przy trzech pozycjach legendy");
+            for pair in dots.chunks(2) {
+                let [(left_pos, left_color), (right_pos, right_color)] = [pair[0], pair[1]];
+                assert!(left_pos.x < right_pos.x);
+                assert!(left_color.b() > 0 && left_color.g() == 0, "{mode:?}: {left_color:?}");
+                assert!(right_color.g() > 0 && right_color.b() == 0, "{mode:?}: {right_color:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn legend_has_no_side_dots_when_both_sides_share_a_color() {
+        use crate::sound::devices::VisualizationMode;
+        // Domyślny config (i stary, po przeliczeniu) ma oba boki w kolorze warstwy: legenda jak dawniej.
+        let cfg = RadarConfig { visualization_mode: VisualizationMode::LayerBars, ..RadarConfig::default() };
+        let mut state = RadarState::new();
+        let canvas = SideColorCanvas::default();
+        draw_radar(&canvas, Pos2::ZERO, &cfg, &mut state, 2, 0.2);
+        assert!(canvas.dots.borrow().is_empty());
     }
 
     #[test]

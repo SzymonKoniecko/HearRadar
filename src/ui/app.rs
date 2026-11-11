@@ -1548,24 +1548,7 @@ impl HearRadarApp {
                             .text("Zewnętrzny łuk (wszystko): wzmocnienie widoczności"),
                     )
                     .changed();
-                changed |= ui
-                    .horizontal(|ui| {
-                        ui.label("Kolor strzałów");
-                        ui.color_edit_button_srgb(&mut self.radar_config.layer_shots_color).changed()
-                    })
-                    .inner;
-                changed |= ui
-                    .horizontal(|ui| {
-                        ui.label("Kolor kroków");
-                        ui.color_edit_button_srgb(&mut self.radar_config.layer_steps_color).changed()
-                    })
-                    .inner;
-                changed |= ui
-                    .horizontal(|ui| {
-                        ui.label("Kolor zewnętrznego łuku (wszystko)");
-                        ui.color_edit_button_srgb(&mut self.radar_config.layer_rest_color).changed()
-                    })
-                    .inner;
+                changed |= layer_side_color_grid(ui, &mut self.radar_config);
             });
         changed
     }
@@ -1968,10 +1951,6 @@ impl HearRadarApp {
         let fit_radius = ((ui.available_width() - padding) * 0.5).max(PREVIEW_MIN_RADIUS);
         let scaled;
         let cfg = if self.radar_config.radius > fit_radius {
-            ui.weak(format!(
-                "Pomniejszony: na ekranie promień {:.0} px, tu {fit_radius:.0} px.",
-                self.radar_config.radius
-            ));
             let mut smaller = self.radar_config.clone();
             smaller.radius = fit_radius;
             scaled = smaller;
@@ -2349,6 +2328,45 @@ fn ui_frequency_strip(ui: &mut egui::Ui, rules: &[spectrum::ColorRule]) {
             tick_color,
         );
     }
+}
+
+/// Kolory łuków warstw 3+3 i 2+2 osobno dla lewej (L) i prawej (P) strony. Ostatni wiersz, „Cała
+/// strona”, ustawia jeden kolor wszystkim warstwom po tej stronie.
+fn layer_side_color_grid(ui: &mut egui::Ui, cfg: &mut RadarConfig) -> bool {
+    use crate::sound::layers::Layer;
+    let mut changed = false;
+    ui.label("Kolory łuków (L = lewa strona, P = prawa strona):");
+    egui::Grid::new("layer_side_colors_grid").num_columns(3).show(ui, |ui| {
+        ui.label("");
+        ui.label("L");
+        ui.label("P");
+        ui.end_row();
+        for (layer, name) in [
+            (Layer::Shots, "Strzały"),
+            (Layer::Steps, "Kroki"),
+            (Layer::Rest, "Zewnętrzny łuk (wszystko)"),
+        ] {
+            ui.label(name);
+            for color in cfg.layer_side_colors_mut(layer) {
+                changed |= ui.color_edit_button_srgb(color).changed();
+            }
+            ui.end_row();
+        }
+        ui.label("Cała strona");
+        for (side, hint) in [
+            (0, "Ustawia ten kolor wszystkim warstwom po lewej stronie."),
+            (1, "Ustawia ten kolor wszystkim warstwom po prawej stronie."),
+        ] {
+            // Przycisk pokazuje kolor strzałów tej strony, a wybrany kolor dostają wszystkie jej warstwy.
+            let mut color = cfg.layer_side_colors(Layer::Shots)[side];
+            if ui.color_edit_button_srgb(&mut color).on_hover_text(hint).changed() {
+                cfg.set_layer_side_color_for_all(side, color);
+                changed = true;
+            }
+        }
+        ui.end_row();
+    });
+    changed
 }
 
 fn stereo_color_combo(ui: &mut egui::Ui, label: &str, color: &mut [u8; 3]) -> bool {

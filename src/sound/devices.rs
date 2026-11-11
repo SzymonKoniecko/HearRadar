@@ -396,13 +396,34 @@ pub struct RadarConfig {
     pub layer_shots_gain: f32,
     #[serde(default = "default_layer_gain")]
     pub layer_rest_gain: f32,
-    /// Kolory każdej pary 3+3 (RGB).
+    /// Wspólny kolor każdej pary 3+3 (RGB), z czasów przed osobnymi kolorami stron. Radar rysuje
+    /// teraz kolorami stron (`layer_*_left_color`/`layer_*_right_color`). Te pola zostają, bo plik
+    /// sprzed kolorów stron daje z nich oba boki (patrz [`RadarConfig::migrate_layer_side_colors`]).
     #[serde(default = "default_layer_shots_color")]
     pub layer_shots_color: [u8; 3],
     #[serde(default = "default_layer_steps_color")]
     pub layer_steps_color: [u8; 3],
     #[serde(default = "default_layer_rest_color")]
     pub layer_rest_color: [u8; 3],
+    /// Kolory łuków warstw osobno po lewej i prawej stronie (tryby 3+3 i 2+2). Brak w pliku:
+    /// kolor warstwy z pola wyżej, bo wczytanie przelicza stary plik (patrz
+    /// [`RadarConfig::migrate_layer_side_colors`]). Dostęp po warstwie: [`RadarConfig::layer_side_colors`].
+    #[serde(default = "default_layer_shots_color")]
+    pub layer_shots_left_color: [u8; 3],
+    #[serde(default = "default_layer_shots_color")]
+    pub layer_shots_right_color: [u8; 3],
+    #[serde(default = "default_layer_steps_color")]
+    pub layer_steps_left_color: [u8; 3],
+    #[serde(default = "default_layer_steps_color")]
+    pub layer_steps_right_color: [u8; 3],
+    #[serde(default = "default_layer_rest_color")]
+    pub layer_rest_left_color: [u8; 3],
+    #[serde(default = "default_layer_rest_color")]
+    pub layer_rest_right_color: [u8; 3],
+    /// Wersja kolorów warstw, potrzebna do przeliczenia starego pliku. Plik bez tego pola to wersja 0:
+    /// jeden kolor warstwy dla obu stron, bez pól `layer_*_left_color`/`layer_*_right_color`.
+    #[serde(default)]
+    pub layer_colors_version: u32,
     /// Moc czerwonej poświaty na zewnątrz radaru 2+2, po stronie z przewagą (0.0 wyłącza, 1.0 domyślna,
     /// 2.0 najmocniejsza). Mnoży krycie poświaty, a nie zmienia decyzji o stronie.
     #[serde(default = "default_layer_side_glow")]
@@ -440,7 +461,25 @@ pub struct ModeAppearance {
     pub layer_shots_color: [u8; 3],
     pub layer_steps_color: [u8; 3],
     pub layer_rest_color: [u8; 3],
+    pub layer_shots_left_color: [u8; 3],
+    pub layer_shots_right_color: [u8; 3],
+    pub layer_steps_left_color: [u8; 3],
+    pub layer_steps_right_color: [u8; 3],
+    pub layer_rest_left_color: [u8; 3],
+    pub layer_rest_right_color: [u8; 3],
     pub layer_side_glow: f32,
+}
+
+impl ModeAppearance {
+    /// Oba boki każdej warstwy w jej wspólnym kolorze (`layer_*_color`), czyli wygląd sprzed kolorów stron.
+    fn side_colors_from_layer_colors(&mut self) {
+        self.layer_shots_left_color = self.layer_shots_color;
+        self.layer_shots_right_color = self.layer_shots_color;
+        self.layer_steps_left_color = self.layer_steps_color;
+        self.layer_steps_right_color = self.layer_steps_color;
+        self.layer_rest_left_color = self.layer_rest_color;
+        self.layer_rest_right_color = self.layer_rest_color;
+    }
 }
 
 impl Default for ModeAppearance {
@@ -473,6 +512,12 @@ impl RadarConfig {
             layer_shots_color: self.layer_shots_color,
             layer_steps_color: self.layer_steps_color,
             layer_rest_color: self.layer_rest_color,
+            layer_shots_left_color: self.layer_shots_left_color,
+            layer_shots_right_color: self.layer_shots_right_color,
+            layer_steps_left_color: self.layer_steps_left_color,
+            layer_steps_right_color: self.layer_steps_right_color,
+            layer_rest_left_color: self.layer_rest_left_color,
+            layer_rest_right_color: self.layer_rest_right_color,
             layer_side_glow: self.layer_side_glow,
         }
     }
@@ -499,7 +544,56 @@ impl RadarConfig {
         self.layer_shots_color = a.layer_shots_color;
         self.layer_steps_color = a.layer_steps_color;
         self.layer_rest_color = a.layer_rest_color;
+        self.layer_shots_left_color = a.layer_shots_left_color;
+        self.layer_shots_right_color = a.layer_shots_right_color;
+        self.layer_steps_left_color = a.layer_steps_left_color;
+        self.layer_steps_right_color = a.layer_steps_right_color;
+        self.layer_rest_left_color = a.layer_rest_left_color;
+        self.layer_rest_right_color = a.layer_rest_right_color;
         self.layer_side_glow = a.layer_side_glow;
+    }
+
+    /// Kolory łuku warstwy `layer` po lewej i prawej stronie (indeks 0 lewa, 1 prawa, jak strony w
+    /// `ui::radar_egui`).
+    pub fn layer_side_colors(&self, layer: layers::Layer) -> [[u8; 3]; 2] {
+        match layer {
+            layers::Layer::Shots => [self.layer_shots_left_color, self.layer_shots_right_color],
+            layers::Layer::Steps => [self.layer_steps_left_color, self.layer_steps_right_color],
+            layers::Layer::Rest => [self.layer_rest_left_color, self.layer_rest_right_color],
+        }
+    }
+
+    /// Jak [`Self::layer_side_colors`], do zmiany kolorów (ustawienia w UI).
+    pub fn layer_side_colors_mut(&mut self, layer: layers::Layer) -> [&mut [u8; 3]; 2] {
+        match layer {
+            layers::Layer::Shots => [&mut self.layer_shots_left_color, &mut self.layer_shots_right_color],
+            layers::Layer::Steps => [&mut self.layer_steps_left_color, &mut self.layer_steps_right_color],
+            layers::Layer::Rest => [&mut self.layer_rest_left_color, &mut self.layer_rest_right_color],
+        }
+    }
+
+    /// Ustawia jeden kolor wszystkim warstwom po stronie `side` (0 lewa, 1 prawa).
+    pub fn set_layer_side_color_for_all(&mut self, side: usize, color: [u8; 3]) {
+        for layer in layers::Layer::ALL {
+            *self.layer_side_colors_mut(layer)[side] = color;
+        }
+    }
+
+    /// Przelicza plik zapisany przed osobnymi kolorami stron (wersja 0, patrz [`LAYER_COLORS_VERSION`]):
+    /// obie strony każdej warstwy dostają jej dotychczasowy wspólny kolor, w bieżących polach i w
+    /// wyglądzie każdego trybu z `mode_appearance`. Dzięki temu stary config wygląda tak samo. Plik już
+    /// przeliczony albo nowy zostaje bez zmian. Wołane przy wczytaniu pliku (`config_store::load_from`).
+    pub fn migrate_layer_side_colors(&mut self) {
+        if self.layer_colors_version >= LAYER_COLORS_VERSION {
+            return;
+        }
+        let mut current = self.appearance();
+        current.side_colors_from_layer_colors();
+        self.apply_appearance(&current);
+        for appearance in self.mode_appearance.values_mut() {
+            appearance.side_colors_from_layer_colors();
+        }
+        self.layer_colors_version = LAYER_COLORS_VERSION;
     }
 
     /// Zapamiętuje wygląd wybranego trybu w mapie. Wołane przed każdym zapisem na dysk.
@@ -536,6 +630,10 @@ impl RadarConfig {
         }
     }
 }
+
+/// Bieżąca wersja kolorów warstw: osobny kolor lewej i prawej strony każdej warstwy. Wersja 0 miała
+/// jeden kolor warstwy dla obu stron.
+pub(crate) const LAYER_COLORS_VERSION: u32 = 1;
 
 /// Bieżąca wersja skali poziomu w torze mono: bufor w skali stereo (patrz [`MONO_PAN_SCALE`]).
 /// Wersja 0 dzieliła bufor przez liczbę kanałów strumienia.
@@ -730,6 +828,13 @@ impl Default for RadarConfig {
             layer_shots_color: default_layer_shots_color(),
             layer_steps_color: default_layer_steps_color(),
             layer_rest_color: default_layer_rest_color(),
+            layer_shots_left_color: default_layer_shots_color(),
+            layer_shots_right_color: default_layer_shots_color(),
+            layer_steps_left_color: default_layer_steps_color(),
+            layer_steps_right_color: default_layer_steps_color(),
+            layer_rest_left_color: default_layer_rest_color(),
+            layer_rest_right_color: default_layer_rest_color(),
+            layer_colors_version: LAYER_COLORS_VERSION,
             layer_side_glow: default_layer_side_glow(),
             mode_appearance: BTreeMap::new(),
         }
@@ -2573,6 +2678,68 @@ mod tests {
         appearance.layer_arc_inner = 0.6;
         cfg.apply_appearance(&appearance);
         assert_eq!(cfg.appearance(), appearance);
+    }
+
+    #[test]
+    fn default_side_colors_match_the_layer_color() {
+        use layers::Layer;
+        let cfg = RadarConfig::default();
+        assert_eq!(cfg.layer_side_colors(Layer::Shots), [cfg.layer_shots_color; 2]);
+        assert_eq!(cfg.layer_side_colors(Layer::Steps), [cfg.layer_steps_color; 2]);
+        assert_eq!(cfg.layer_side_colors(Layer::Rest), [cfg.layer_rest_color; 2]);
+        assert_eq!(cfg.layer_colors_version, LAYER_COLORS_VERSION);
+        assert_eq!(ModeAppearance::default(), cfg.appearance());
+    }
+
+    #[test]
+    fn whole_side_color_changes_only_that_side() {
+        use layers::Layer;
+        let mut cfg = RadarConfig::default();
+        cfg.set_layer_side_color_for_all(0, [0, 0, 255]);
+        cfg.set_layer_side_color_for_all(1, [180, 40, 200]);
+        for layer in Layer::ALL {
+            assert_eq!(cfg.layer_side_colors(layer), [[0, 0, 255], [180, 40, 200]], "{layer:?}");
+        }
+        *cfg.layer_side_colors_mut(Layer::Steps)[1] = [1, 2, 3];
+        assert_eq!(cfg.layer_side_colors(Layer::Steps), [[0, 0, 255], [1, 2, 3]]);
+        assert_eq!(cfg.layer_side_colors(Layer::Shots)[1], [180, 40, 200], "inne warstwy bez zmian");
+    }
+
+    #[test]
+    fn side_colors_are_remembered_per_mode() {
+        use layers::Layer;
+        let mut cfg = RadarConfig { visualization_mode: VisualizationMode::LayerBars, ..RadarConfig::default() };
+        cfg.set_layer_side_color_for_all(0, [0, 0, 255]);
+        cfg.switch_mode(VisualizationMode::LayerBars22);
+        cfg.set_layer_side_color_for_all(1, [180, 40, 200]);
+        cfg.switch_mode(VisualizationMode::LayerBars);
+        assert_eq!(cfg.layer_side_colors(Layer::Rest), [[0, 0, 255], cfg.layer_rest_color]);
+        cfg.switch_mode(VisualizationMode::LayerBars22);
+        assert_eq!(cfg.layer_side_colors(Layer::Rest), [[0, 0, 255], [180, 40, 200]]);
+    }
+
+    #[test]
+    fn migrating_side_colors_copies_each_layer_color_once() {
+        use layers::Layer;
+        let mut cfg = RadarConfig {
+            layer_shots_color: [1, 2, 3],
+            layer_colors_version: 0,
+            ..RadarConfig::default()
+        };
+        let mut appearance = cfg.appearance();
+        appearance.layer_rest_color = [7, 8, 9];
+        cfg.mode_appearance.insert(VisualizationMode::OnlyBars, appearance);
+
+        cfg.migrate_layer_side_colors();
+        assert_eq!(cfg.layer_side_colors(Layer::Shots), [[1, 2, 3]; 2]);
+        let bars = cfg.mode_appearance[&VisualizationMode::OnlyBars];
+        assert_eq!([bars.layer_rest_left_color, bars.layer_rest_right_color], [[7, 8, 9]; 2]);
+        assert_eq!(cfg.layer_colors_version, LAYER_COLORS_VERSION);
+
+        // Przeliczony plik nie traci już kolorów stron ustawionych później.
+        cfg.set_layer_side_color_for_all(0, [0, 0, 255]);
+        cfg.migrate_layer_side_colors();
+        assert_eq!(cfg.layer_side_colors(Layer::Shots)[0], [0, 0, 255]);
     }
 
     #[test]

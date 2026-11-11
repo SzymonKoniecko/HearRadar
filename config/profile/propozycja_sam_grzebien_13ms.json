@@ -137,6 +137,37 @@
     170,
     255
   ],
+  "layer_shots_left_color": [
+    255,
+    140,
+    40
+  ],
+  "layer_shots_right_color": [
+    255,
+    140,
+    40
+  ],
+  "layer_steps_left_color": [
+    150,
+    255,
+    90
+  ],
+  "layer_steps_right_color": [
+    150,
+    255,
+    90
+  ],
+  "layer_rest_left_color": [
+    80,
+    170,
+    255
+  ],
+  "layer_rest_right_color": [
+    80,
+    170,
+    255
+  ],
+  "layer_colors_version": 1,
   "layer_side_glow": 1.25,
   "mode_appearance": {
     "OnlyRadar": {
@@ -176,6 +207,36 @@
         90
       ],
       "layer_rest_color": [
+        80,
+        170,
+        255
+      ],
+      "layer_shots_left_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_shots_right_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_steps_left_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_steps_right_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_rest_left_color": [
+        80,
+        170,
+        255
+      ],
+      "layer_rest_right_color": [
         80,
         170,
         255
@@ -223,6 +284,36 @@
         170,
         255
       ],
+      "layer_shots_left_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_shots_right_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_steps_left_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_steps_right_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_rest_left_color": [
+        80,
+        170,
+        255
+      ],
+      "layer_rest_right_color": [
+        80,
+        170,
+        255
+      ],
       "layer_side_glow": 1.0
     },
     "Both": {
@@ -262,6 +353,36 @@
         90
       ],
       "layer_rest_color": [
+        80,
+        170,
+        255
+      ],
+      "layer_shots_left_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_shots_right_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_steps_left_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_steps_right_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_rest_left_color": [
+        80,
+        170,
+        255
+      ],
+      "layer_rest_right_color": [
         80,
         170,
         255
@@ -309,6 +430,36 @@
         170,
         255
       ],
+      "layer_shots_left_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_shots_right_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_steps_left_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_steps_right_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_rest_left_color": [
+        80,
+        170,
+        255
+      ],
+      "layer_rest_right_color": [
+        80,
+        170,
+        255
+      ],
       "layer_side_glow": 1.0
     },
     "LayerBars22": {
@@ -348,6 +499,36 @@
         90
       ],
       "layer_rest_color": [
+        80,
+        170,
+        255
+      ],
+      "layer_shots_left_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_shots_right_color": [
+        255,
+        140,
+        40
+      ],
+      "layer_steps_left_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_steps_right_color": [
+        150,
+        255,
+        90
+      ],
+      "layer_rest_left_color": [
+        80,
+        170,
+        255
+      ],
+      "layer_rest_right_color": [
         80,
         170,
         255
