@@ -92,7 +92,7 @@
   ],
   "spatial_audio_view": false,
   "line_thickness": 0.3,
-  "mono_cue_style": "PerDirection",
+  "mono_cue_style": "PerLayer",
   "mono_breath_depth": 0.45,
   "mono_breath_timbre": 0.6,
   "mono_buzz_depth": 0.63,
@@ -106,17 +106,6 @@
     "shots_intensity": 1.0,
     "steps_intensity": 1.0,
     "rest_intensity": 1.0
-  },
-  "mono_direction_styles": {
-    "opposite": "DirectionalComb",
-    "front": "Off",
-    "back": "DirectionalBreath",
-    "opposite_volume_db": 0.0,
-    "front_volume_db": 0.0,
-    "back_volume_db": 0.0,
-    "opposite_intensity": 1.0,
-    "front_intensity": 1.0,
-    "back_intensity": 1.0
   },
   "mono_cue_subtractive": false,
   "mono_comb_notch_db": -16.0,

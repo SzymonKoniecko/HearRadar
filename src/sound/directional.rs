@@ -392,17 +392,6 @@ fn timbre_curve_peak(sample_rate: f32) -> Vec<f32> {
     shape.into_iter().map(|h| h / peak).collect()
 }
 
-/// Wyrównania cieńszej barwy dla wersji liczonej filtrami w czasie (przód i tył w stylu „Wg
-/// kierunku”, patrz `mono_router::zone_timbre`): `(z wyrównaniem głośności, „w dół”)`. Te same
-/// mnożniki, którymi [`timbre_curve`] i [`timbre_curve_peak`] skalują kształt [`timbre_shape`].
-pub(crate) fn timbre_makeups(sample_rate: f32) -> (f32, f32) {
-    let shape = timbre_shape(sample_rate.max(1.0));
-    let loud = timbre_curve(sample_rate.max(1.0));
-    let (at, peak) = shape.iter().cloned().enumerate().fold((0, 0.0f32), |best, (k, h)| if h > best.1 { (k, h) } else { best });
-    let peak = peak.max(1e-6);
-    (loud[at] / peak, 1.0 / peak)
-}
-
 impl DirectionalSplit {
     pub(crate) fn new(sample_rate: f32) -> Self {
         let sample_rate = sample_rate.max(1.0);

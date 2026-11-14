@@ -31,12 +31,6 @@
 //! osobno w każdym paśmie częstotliwości na część przeciwną i resztę, a efekt
 //! dostaje tylko część przeciwna (patrz [`mix_for_ear`]).
 //!
-//! Styl „Wg kierunku” (`MonoCueStyle::PerDirection`) dokłada drugą oś. Bufor niesie też przód
-//! i tył każdej ramki (`devices::ZoneFrame`, z kanałów 5.1/7.1). Przód i tył dostają swoje style
-//! jeszcze przed rozdzielaniem ([`apply_zones`]), tak samo w lewym i prawym kanale, więc
-//! rozdzielanie dalej widzi tę samą różnicę stron, a strona przeciwna dostaje swój styl na
-//! wierzch. Dźwięk z tyłu po przeciwnej stronie ma więc oba.
-//!
 //! Wcześniej `mono_router` otwierał WŁASNY, drugi strumień wejściowy na
 //! nazwie urządzenia z tej samej listy co radar. Na Windows ta lista
 //! (`devices::fetch_output_devices`) zawiera nazwy urządzeń WYJŚCIOWYCH (do
@@ -51,10 +45,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
-use crate::sound::devices::{
-    CueDirection, MonoCueStyle, MonoDirectionStyles, MonoEar, MonoLayerStyles, SharedAudioAnalysis, SideLayers,
-    ZoneFrame,
-};
+use crate::sound::devices::{MonoCueStyle, MonoEar, MonoLayerStyles, SharedAudioAnalysis, SideLayers};
 use crate::sound::directional::{self, DirectionalSplit, Opposite, SplitParams, SplitSample};
 use crate::sound::layers::Layer;
 
@@ -192,18 +183,6 @@ impl Default for EffectState {
     }
 }
 
-impl EffectState {
-    /// Zeruje stan bez nowej alokacji (wołane w callbacku audio).
-    fn clear(&mut self) {
-        self.phase = 0.0;
-        self.breath_phase = 0.0;
-        self.lp = 0.0;
-        self.lp2 = 0.0;
-        self.pos = 0;
-        self.delay.fill(0.0);
-    }
-}
-
 /// Jak szybko styl „Wg warstw” przechodzi między stylami warstw (ms). Wszystkie trzy wagi mają
 /// tę samą stałą czasu, więc ich suma zostaje 1 i przejście nie zmienia głośności.
 const LAYER_FADE_MS: f32 = 8.0;
@@ -223,11 +202,6 @@ struct CueState {
     layer_effects: [EffectState; 3],
     /// Bieżące wagi efektów warstw (suma 1), wygładzane przez [`LAYER_FADE_MS`].
     layer_weights: [f32; 3],
-    /// Styl „Wg kierunku”: efekty przodu i tyłu, osobno dla lewego i prawego kanału strefy.
-    /// Oba kanały idą krok w krok, więc oscylatory mają tę samą fazę.
-    zone_effects: [[EffectState; 2]; 2],
-    /// Wyrównania barwy stref: `(z wyrównaniem głośności, „w dół”)`, patrz [`zone_timbre`].
-    zone_timbre_makeups: (f32, f32),
     /// Znaczniki warstw opóźnione o okno FFT, żeby zgadzały się z wyjściem rozdzielania.
     tag_delay: Vec<SideLayers>,
     tag_pos: usize,
@@ -260,8 +234,6 @@ impl CueState {
             directional_active: false,
             layer_effects: [EffectState::default(), EffectState::default(), EffectState::default()],
             layer_weights: REST_ONLY,
-            zone_effects: Default::default(),
-            zone_timbre_makeups: directional::timbre_makeups(sample_rate),
             tag_delay: vec![SideLayers::default(); directional::LATENCY],
             tag_pos: 0,
             layer_fade: smoothing_per_sample(LAYER_FADE_MS, sample_rate),
@@ -279,9 +251,6 @@ impl CueState {
         self.tag_delay.fill(SideLayers::default());
         self.tag_pos = 0;
         self.layer_weights = REST_ONLY;
-        for effect in self.zone_effects.iter_mut().flatten() {
-            effect.clear();
-        }
         self.fresh = 0.0;
         self.tone_opp = ToneState::default();
         self.limiter.reset();
@@ -454,58 +423,6 @@ fn directional_effect(
     }
 }
 
-/// Cieńsza barwa Oddechu liczona filtrami w czasie, dla przodu i tyłu w stylu „Wg kierunku”
-/// (dla strony przeciwnej liczy ją rozdzielanie w paskach FFT). Te same filtry pierwszego rzędu:
-/// górnoprzepustowy [`TREMOLO_HPF_HZ`] i dolnoprzepustowy [`directional::TIMBRE_LPF_HZ`],
-/// z wyrównaniem `makeups` (patrz `directional::timbre_makeups`) i siłą z suwaka barwy.
-#[inline]
-fn zone_timbre(
-    sample: f32,
-    settings: &OutputSettings,
-    makeups: (f32, f32),
-    sample_rate: f32,
-    state: &mut EffectState,
-) -> f32 {
-    let sample_rate = sample_rate.max(1.0);
-    let bass = one_pole_lowpass_step(sample, sample_rate, TREMOLO_HPF_HZ, &mut state.lp2);
-    let band = one_pole_lowpass_step(sample - bass, sample_rate, directional::TIMBRE_LPF_HZ, &mut state.lp);
-    let makeup = if settings.subtractive { makeups.1 } else { makeups.0 };
-    sample + settings.breath_timbre * (band * makeup - sample)
-}
-
-/// Styl „Wg kierunku”: nakłada style przodu i tyłu na ich części pary `(left, right)` i zwraca
-/// parę z oznaczonymi strefami. Reszta pary (kanały boczne, LFE) przechodzi bez zmian.
-///
-/// Lewy i prawy kanał strefy dostają ten sam efekt w tej samej fazie, więc różnica poziomów
-/// stron w każdym paśmie zostaje i rozdzielanie kierunkowe działa na wyniku tak jak na oryginale.
-/// Strefy nie mają wycofywania wskazówki po początku dźwięku (to dotyczy tylko strony przeciwnej).
-#[inline]
-fn apply_zones(
-    left: f32,
-    right: f32,
-    zone: ZoneFrame,
-    settings: &OutputSettings,
-    sample_rate: f32,
-    cue_state: &mut CueState,
-) -> (f32, f32) {
-    let makeups = cue_state.zone_timbre_makeups;
-    let (mut left, mut right) = (left, right);
-    for (slot, direction) in [CueDirection::Front, CueDirection::Back].into_iter().enumerate() {
-        let style = settings.direction_styles[direction.index()];
-        let gain = settings.direction_gains[direction.index()];
-        let intensity = settings.direction_intensity[direction.index()];
-        for (side, out) in [&mut left, &mut right].into_iter().enumerate() {
-            let dry = zone[2 * slot + side];
-            let state = &mut cue_state.zone_effects[slot][side];
-            let part_timbre = if style.uses_breath() { zone_timbre(dry, settings, makeups, sample_rate, state) } else { dry };
-            let split = SplitSample { part: dry, part_timbre, rest: 0.0, fresh: 0.0 };
-            let effect = directional_effect(style, split, settings, sample_rate, state);
-            *out += gain * (dry + intensity * (effect - dry)) - dry;
-        }
-    }
-    (left, right)
-}
-
 /// Częstotliwość podziału pasm dla korekcji tonu ([`apply_tone`]) — poniżej
 /// jest składowa "bas", powyżej "wysokie". 500 Hz leży w środku pasma, w którym
 /// słuchacz najłatwiej słyszy barwę, a nie tylko głośność.
@@ -554,11 +471,6 @@ struct OutputSettings {
     /// (0–1: udział efektu względem czystego dźwięku), w tej samej kolejności.
     layer_gains: [f32; 3],
     layer_intensity: [f32; 3],
-    /// Styl „Wg kierunku”: styl, głośność (mnożnik liniowy) i intensywność wskazówki (0–1) dla
-    /// strony przeciwnej, przodu i tyłu (kolejność [`CueDirection::ALL`]).
-    direction_styles: [MonoCueStyle; 3],
-    direction_gains: [f32; 3],
-    direction_intensity: [f32; 3],
     /// Strona przeciwna w stylach kierunkowych (patrz [`OppositeSettings`]): wskazówki tylko
     /// „w dół”, współczynnik γ grzebienia, poziom (mnożnik), ustępowanie (dB), cień głowy (0–0,7),
     /// siła wskazówki po początku dźwięku (0–1) i poziom ogona (mnożnik).
@@ -636,9 +548,6 @@ impl OutputSettings {
             layer_styles: MonoLayerStyles::default().in_layer_order(),
             layer_gains: [1.0; 3],
             layer_intensity: [1.0; 3],
-            direction_styles: MonoDirectionStyles::default().in_order(),
-            direction_gains: [1.0; 3],
-            direction_intensity: [1.0; 3],
             subtractive: true,
             comb_gamma: 0.0,
             opposite_gain: 1.0,
@@ -692,14 +601,6 @@ impl OutputSettings {
         self
     }
 
-    /// Ustawia style, głośności i intensywności kierunków dla stylu „Wg kierunku”.
-    fn with_directions(mut self, directions: &MonoDirectionStyles) -> Self {
-        self.direction_styles = directions.in_order();
-        self.direction_gains = directions.volume_db_in_order().map(db_to_linear);
-        self.direction_intensity = directions.intensity_in_order();
-        self
-    }
-
     /// Ustawienia bez korekcji tonu — do testów i ścieżek, którym tonu nie trzeba.
     #[cfg(test)]
     fn plain(ear: MonoEar, gain: f32, cue_style: MonoCueStyle) -> Self {
@@ -745,9 +646,9 @@ fn build_output_stream(
                 &stream_config,
                 move |out: &mut [f32], _| {
                     let frames = out.len() / out_channels.max(1);
-                    let (pan, tags, zones) = analysis.read_mono_frames(frames, sample_rate);
+                    let (pan, tags) = analysis.read_stereo_pan_tagged(frames, sample_rate);
                     let settings = read_output_settings(&analysis);
-                    fill_output_zoned(out, &pan, &tags, &zones, out_channels, &settings, sample_rate, &mut cue_state);
+                    fill_output_f32(out, &pan, &tags, out_channels, &settings, sample_rate, &mut cue_state);
                 },
                 err_fn,
                 None,
@@ -759,11 +660,11 @@ fn build_output_stream(
                 &stream_config,
                 move |out: &mut [i16], _| {
                     let frames = out.len() / out_channels.max(1);
-                    let (pan, tags, zones) = analysis.read_mono_frames(frames, sample_rate);
+                    let (pan, tags) = analysis.read_stereo_pan_tagged(frames, sample_rate);
                     let settings = read_output_settings(&analysis);
                     // Konwersja f32 → i16
                     let mut tmp = vec![0.0f32; out.len()];
-                    fill_output_zoned(&mut tmp, &pan, &tags, &zones, out_channels, &settings, sample_rate, &mut cue_state);
+                    fill_output_f32(&mut tmp, &pan, &tags, out_channels, &settings, sample_rate, &mut cue_state);
                     for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
                         *dst = (src * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                     }
@@ -778,10 +679,10 @@ fn build_output_stream(
                 &stream_config,
                 move |out: &mut [u16], _| {
                     let frames = out.len() / out_channels.max(1);
-                    let (pan, tags, zones) = analysis.read_mono_frames(frames, sample_rate);
+                    let (pan, tags) = analysis.read_stereo_pan_tagged(frames, sample_rate);
                     let settings = read_output_settings(&analysis);
                     let mut tmp = vec![0.0f32; out.len()];
-                    fill_output_zoned(&mut tmp, &pan, &tags, &zones, out_channels, &settings, sample_rate, &mut cue_state);
+                    fill_output_f32(&mut tmp, &pan, &tags, out_channels, &settings, sample_rate, &mut cue_state);
                     for (dst, &src) in out.iter_mut().zip(tmp.iter()) {
                         // f32 (-1..1) → u16 (0..65535), środek = 32768
                         *dst = ((src * 0.5 + 0.5) * u16::MAX as f32)
@@ -950,7 +851,6 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
         breath_timbre: f32,
         buzz_depth: f32,
         layers: MonoLayerStyles,
-        directions: MonoDirectionStyles,
         opposite: OppositeSettings,
     }
     let s = analysis
@@ -970,7 +870,6 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
                 breath_timbre: c.mono_breath_timbre,
                 buzz_depth: c.mono_buzz_depth,
                 layers: c.mono_layer_styles,
-                directions: c.mono_direction_styles,
                 opposite: OppositeSettings {
                     subtractive: c.mono_cue_subtractive,
                     comb_notch_db: c.mono_comb_notch_db,
@@ -995,7 +894,6 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
             breath_timbre: directional::DEFAULT_TIMBRE,
             buzz_depth: directional::DEFAULT_BUZZ_DEPTH,
             layers: MonoLayerStyles::default(),
-            directions: MonoDirectionStyles::default(),
             opposite: OppositeSettings::default(),
         });
     // Przełączniki i siły idą do bufora; zastosują się od następnego callbacku.
@@ -1005,7 +903,6 @@ fn read_output_settings(analysis: &SharedAudioAnalysis) -> OutputSettings {
     OutputSettings::new(s.ear, db_to_linear(s.boost_db), s.cue_style, s.tone_db)
         .with_breath(s.breath_depth, s.breath_timbre, s.buzz_depth)
         .with_layers(&s.layers)
-        .with_directions(&s.directions)
         .with_opposite(s.opposite)
 }
 
@@ -1050,17 +947,9 @@ fn mix_for_ear(
     // Znaczniki zapisujemy zawsze, żeby po przełączeniu na „Wg warstw” były od razu zgrane.
     let tags = cue_state.delayed_tags(tags);
     if style != MonoCueStyle::PerLayer {
-        // „Wg kierunku”: przód i tył są już oznaczone w parze (patrz [`apply_zones`]), tu dochodzi
-        // styl strony przeciwnej z jej głośnością i intensywnością.
-        let (style, gain, strength) = if style == MonoCueStyle::PerDirection {
-            let slot = CueDirection::Opposite.index();
-            (settings.direction_styles[slot], settings.direction_gains[slot], settings.direction_intensity[slot])
-        } else {
-            (style, 1.0, 1.0)
-        };
         let effect = directional_effect(style, split, settings, sample_rate, &mut cue_state.effect);
         let (intensity, level) = fade_after_onset(style, fresh, settings);
-        let marked = gain * level * (split.part + strength * intensity * (effect - split.part));
+        let marked = level * (split.part + intensity * (effect - split.part));
         return (split.rest, settings.opposite_gain * marked);
     }
     let layer = match opposite {
@@ -1131,29 +1020,10 @@ fn ear_sample(
 /// osobno przez ton i wzmocnienie, a potem przez [`PriorityLimiter`], który
 /// przy głośnej sumie ścisza najpierw stronę przeciwną (+1 ms opóźnienia).
 #[inline]
-#[cfg_attr(not(test), allow(dead_code))]
 fn fill_output_f32(
     out: &mut [f32],
     pan: &[(f32, f32)],
     tags: &[SideLayers],
-    out_channels: usize,
-    settings: &OutputSettings,
-    sample_rate: f32,
-    cue_state: &mut CueState,
-) {
-    fill_output_zoned(out, pan, tags, &[], out_channels, settings, sample_rate, cue_state);
-}
-
-/// Jak [`fill_output_f32`], razem z przodem i tyłem każdej ramki (`zones`, patrz
-/// `devices::ZoneFrame`) dla stylu „Wg kierunku”. Brakujące strefy to zera: dźwięk bez przodu
-/// i tyłu, czyli tylko styl strony przeciwnej.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn fill_output_zoned(
-    out: &mut [f32],
-    pan: &[(f32, f32)],
-    tags: &[SideLayers],
-    zones: &[ZoneFrame],
     out_channels: usize,
     settings: &OutputSettings,
     sample_rate: f32,
@@ -1169,17 +1039,10 @@ fn fill_output_zoned(
         cue_state.reset_directional();
     }
     cue_state.directional_active = directional;
-    let per_direction = directional && settings.cue_style == MonoCueStyle::PerDirection;
 
     for (frame_idx, frame) in out.chunks_exact_mut(ch).enumerate() {
         let (left, right) = pan.get(frame_idx).copied().unwrap_or((0.0, 0.0));
         let layers = tags.get(frame_idx).copied().unwrap_or_default();
-        let (left, right) = if per_direction {
-            let zone = zones.get(frame_idx).copied().unwrap_or_default();
-            apply_zones(left, right, zone, settings, sample_rate, cue_state)
-        } else {
-            (left, right)
-        };
 
         for s in frame.iter_mut() {
             *s = 0.0;
@@ -1923,113 +1786,5 @@ mod tests {
             left_channel.iter().any(|&s| s < 1.0),
             "przy miękkim dogięciu przesterowany sygnał NIE powinien lądować dokładnie na płaskim 1.0 co klatkę: {left_channel:?}"
         );
-    }
-
-    // ── Styl „Wg kierunku” ──────────────────────────────────────────────────
-
-    /// Lewy kanał wyjścia (ucho lewe) dla pary i stref, w kawałkach jak z callbacku.
-    fn run_zoned(settings: OutputSettings, pan_frames: &[(f32, f32)], zones: &[ZoneFrame]) -> Vec<f32> {
-        let mut out = vec![0.0f32; pan_frames.len() * 2];
-        let mut cue_state = CueState::default();
-        for (i, (out_chunk, pan_chunk)) in out.chunks_mut(441 * 2).zip(pan_frames.chunks(441)).enumerate() {
-            let start = (i * 441).min(zones.len());
-            let end = (start + pan_chunk.len()).min(zones.len());
-            fill_output_zoned(out_chunk, pan_chunk, &[], &zones[start..end], 2, &settings, 48_000.0, &mut cue_state);
-        }
-        output_channel(&out, 0)
-    }
-
-    fn per_direction(directions: MonoDirectionStyles) -> OutputSettings {
-        neutral(MonoCueStyle::PerDirection).with_directions(&directions)
-    }
-
-    /// Ton 1 kHz z różnicą stron `ild_db` (dodatnia = z prawej), 2 s.
-    fn tone_pair(ild_db: f32) -> Vec<(f32, f32)> {
-        use crate::sound::directional::test_signals::pan;
-        let src: Vec<f32> = (0..96_000).map(|i| 0.5 * sine(1_000.0, i)).collect();
-        let (l, r) = pan(&src, ild_db);
-        l.into_iter().zip(r).collect()
-    }
-
-    /// Cała para jako przód albo tył.
-    fn all_in_zone(pan_frames: &[(f32, f32)], back: bool) -> Vec<ZoneFrame> {
-        pan_frames.iter().map(|&(l, r)| if back { [0.0, 0.0, l, r] } else { [l, r, 0.0, 0.0] }).collect()
-    }
-
-    #[test]
-    fn per_direction_without_zones_is_just_the_opposite_style() {
-        // Strumień stereo nie ma przodu ani tyłu: zostaje sam styl strony przeciwnej.
-        use crate::sound::directional::test_signals::{noise, pan};
-        let (l, r) = pan(&noise(24_000, 31), 9.0);
-        let pan_frames: Vec<(f32, f32)> = l.into_iter().zip(r).collect();
-        let directions = MonoDirectionStyles { opposite: MonoCueStyle::DirectionalBuzz, ..MonoDirectionStyles::default() };
-        let by_direction = run_zoned(per_direction(directions), &pan_frames, &[]);
-        let single = run_zoned(neutral(MonoCueStyle::DirectionalBuzz), &pan_frames, &[]);
-        assert_eq!(by_direction, single);
-    }
-
-    #[test]
-    fn back_zone_gets_its_style_and_the_rest_stays_clean() {
-        use crate::sound::directional::test_signals::modulation_index;
-        // Dźwięk ze środka: strona przeciwna go nie rusza, więc słychać tylko styl strefy.
-        let pan_frames = tone_pair(0.0);
-        let directions = MonoDirectionStyles {
-            front: MonoCueStyle::Off,
-            back: MonoCueStyle::DirectionalBreath,
-            ..MonoDirectionStyles::default()
-        };
-        let settings = per_direction(directions);
-        let from_back = run_zoned(settings, &pan_frames, &all_in_zone(&pan_frames, true));
-        let from_front = run_zoned(settings, &pan_frames, &all_in_zone(&pan_frames, false));
-        let from_side = run_zoned(settings, &pan_frames, &[]);
-        let breath = |x: &[f32]| modulation_index(&x[24_000..], TREMOLO_HZ);
-        assert!(breath(&from_back) > 0.15, "tył ma oddychać: {}", breath(&from_back));
-        assert!(breath(&from_front) < 0.02, "przód bez stylu zostaje czysty: {}", breath(&from_front));
-        assert!(breath(&from_side) < 0.02, "dźwięk spoza stref zostaje czysty: {}", breath(&from_side));
-        // Przód bez stylu to dokładnie suma kanałów, opóźniona jak w każdym stylu kierunkowym.
-        let latency = directional_latency();
-        for t in 12_000..pan_frames.len() {
-            let expected = pan_frames[t - latency].0 + pan_frames[t - latency].1;
-            assert!((from_front[t] - expected).abs() < 1e-3, "próbka {t}: {} zamiast {expected}", from_front[t]);
-        }
-    }
-
-    #[test]
-    fn back_sound_on_the_opposite_side_gets_both_styles() {
-        use crate::sound::directional::test_signals::modulation_index;
-        let pan_frames = tone_pair(9.0);
-        let directions = |back| MonoDirectionStyles {
-            opposite: MonoCueStyle::DirectionalBuzz,
-            front: MonoCueStyle::Off,
-            back,
-            ..MonoDirectionStyles::default()
-        };
-        let zones = all_in_zone(&pan_frames, true);
-        let both = run_zoned(per_direction(directions(MonoCueStyle::DirectionalBreath)), &pan_frames, &zones);
-        let side_only = run_zoned(per_direction(directions(MonoCueStyle::Off)), &pan_frames, &zones);
-        let at = |x: &[f32], hz: f32| modulation_index(&x[24_000..], hz);
-        assert!(at(&both, RING_MOD_BUZZ_HZ) > 0.5, "brzęczenie strony przeciwnej: {}", at(&both, RING_MOD_BUZZ_HZ));
-        assert!(at(&both, TREMOLO_HZ) > 0.15, "oddech tyłu: {}", at(&both, TREMOLO_HZ));
-        assert!(at(&side_only, RING_MOD_BUZZ_HZ) > 0.5, "bez stylu tyłu brzęczenie zostaje");
-        assert!(at(&side_only, TREMOLO_HZ) < 0.05, "bez stylu tyłu nie ma oddechu: {}", at(&side_only, TREMOLO_HZ));
-    }
-
-    #[test]
-    fn zone_volume_and_intensity_scale_only_that_zone() {
-        let pan_frames = tone_pair(0.0);
-        let level = |directions: MonoDirectionStyles, back: bool| {
-            rms(&run_zoned(per_direction(directions), &pan_frames, &all_in_zone(&pan_frames, back))[24_000..])
-        };
-        let base = MonoDirectionStyles { front: MonoCueStyle::Off, back: MonoCueStyle::Off, ..MonoDirectionStyles::default() };
-        let quieter = MonoDirectionStyles { back_volume_db: -6.0, ..base };
-        let change_db = |a: f32, b: f32| 20.0 * (a / b).log10();
-        let back = change_db(level(quieter, true), level(base, true));
-        let front = change_db(level(quieter, false), level(base, false));
-        assert!((back + 6.0).abs() < 0.1, "tył o 6 dB ciszej: {back:+.2} dB");
-        assert!(front.abs() < 0.01, "przód bez zmian: {front:+.2} dB");
-        // Intensywność 0 % wyłącza efekt stylu.
-        let muted = MonoDirectionStyles { back: MonoCueStyle::DirectionalBuzz, back_intensity: 0.0, ..base };
-        let diff = change_db(level(muted, true), level(base, true));
-        assert!(diff.abs() < 0.01, "intensywność 0 % to czysty dźwięk: {diff:+.2} dB");
     }
 }
