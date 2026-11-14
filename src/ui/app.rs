@@ -37,6 +37,13 @@ const OVERLAY_PADDING: f32 = 60.0;
 /// 1440p. Większy radar też działa (np. wpisany w config), tylko jest przycinany na brzegach ekranu.
 const RADAR_RADIUS_MIN: f32 = 40.0;
 const RADAR_RADIUS_MAX: f32 = 720.0;
+/// Podgląd radaru po prawej stronie okna ustawień: część szerokości okna i jej granice (px),
+/// odstęp od ustawień i miejsce na pasek przewijania zakładki.
+const PREVIEW_WIDTH_SHARE: f32 = 0.36;
+const PREVIEW_WIDTH_MIN: f32 = 220.0;
+const PREVIEW_WIDTH_MAX: f32 = 420.0;
+const PREVIEW_GAP: f32 = 12.0;
+const SCROLL_BAR_ROOM: f32 = 14.0;
 /// Podgląd w oknie ustawień nie jest szerszy niż kolumna: większy radar rysujemy pomniejszony.
 const PREVIEW_MIN_RADIUS: f32 = 60.0;
 /// Domyślna liczba kanałów używana do podglądu/scenariuszy testowych, zanim
@@ -50,6 +57,41 @@ const TEST_TONE_SAMPLE_RATE: f32 = 48_000.0;
 /// Ile próbek na klatkę generujemy dla scenariusza `Tone` (~10 ms przy 48 kHz
 /// — podobnie jak typowy bufor cpal).
 const TEST_TONE_BUFFER_LEN: usize = 480;
+
+// ── Zakładki okna ustawień ────────────────────────────────────────────────────
+
+/// Zakładka okna ustawień. Podgląd radaru po prawej jest widoczny w każdej.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+enum MainTab {
+    /// Skąd bierze się dźwięk: urządzenie wejściowe albo nagranie.
+    #[default]
+    Source,
+    /// Odsłuch w jednej słuchawce (mono router) i wskazówki kierunku.
+    Headphones,
+    /// Wygląd radaru i overlay.
+    Radar,
+    /// Scenariusze testowe i test kierunków.
+    Tests,
+    /// Zapis konfiguracji, profile i logi.
+    Profiles,
+}
+
+impl MainTab {
+    const ALL: [Self; 5] = [Self::Source, Self::Headphones, Self::Radar, Self::Tests, Self::Profiles];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Source => "🎤 Źródło",
+            Self::Headphones => "🎧 Słuchawki",
+            Self::Radar => "🎯 Radar",
+            Self::Tests => "🔧 Testy",
+            Self::Profiles => "💾 Profile i logi",
+        }
+    }
+}
+
+/// Kolory stanu w nagłówku i panelach: działa, ostrzeżenie, błąd.
+const STATUS_ON: egui::Color32 = egui::Color32::from_rgb(0, 200, 120);
 
 // ── Stan aplikacji ────────────────────────────────────────────────────────────
 
@@ -144,6 +186,8 @@ pub struct HearRadarApp {
 
     /// Panel testu kierunków (słuchawki + zapis wyników do CSV).
     direction_tester: DirectionTester,
+    /// Otwarta zakładka okna ustawień.
+    main_tab: MainTab,
 }
 
 impl HearRadarApp {
@@ -217,6 +261,7 @@ impl HearRadarApp {
             radar_log_status: None,
             radar_log_close_at: None,
             direction_tester: DirectionTester::new(),
+            main_tab: MainTab::default(),
         }
     }
 
@@ -421,7 +466,7 @@ impl HearRadarApp {
             }
         }
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_label("Urządzenie wejściowe")
                 .selected_text(if self.selected_device.is_empty() {
                     "Wybierz urządzenie...".to_string()
@@ -536,9 +581,6 @@ impl HearRadarApp {
         self.ui_file_playback(ui);
 
         ui.separator();
-        self.ui_mono_router(ui);
-
-        ui.separator();
         ui_device_details(ui, devices.iter().find(|d| d.name == self.selected_device));
     }
 
@@ -549,7 +591,7 @@ impl HearRadarApp {
         ui.strong("Odsłuch nagrania (test radaru)");
         let playing = self.file_player.as_ref().is_some_and(|p| !p.is_finished());
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let selected_text = self
                 .playable
                 .get(self.playable_selected)
@@ -677,42 +719,105 @@ impl HearRadarApp {
     }
 
     // ── Panel: mono router ────────────────────────────────────────────────
+    /// Zakładka „Słuchawki”: stan i start routingu na górze, niżej trzy zwijane sekcje.
     fn ui_mono_router(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.strong("Mono Router");
+            ui.heading("Słuchawki (mono router)");
             if self.mono_router.is_some() {
-                ui.colored_label(egui::Color32::from_rgb(0, 200, 120), "● AKTYWNY");
+                ui.colored_label(STATUS_ON, "● AKTYWNY");
             } else {
                 ui.weak("○ nieaktywny");
             }
-            if ui.small_button("↻").clicked() {
+            if ui.small_button("↻").on_hover_text("Odśwież listę urządzeń").clicked() {
                 self.out_devices =
                     devices::fetch_physical_output_devices().map_err(|e| e.to_string());
                 self.devices = devices::fetch_output_devices().map_err(|e| e.to_string());
             }
         });
-        ui.label(
-            "Odsłuchaj zmiksowany sygnał mono w jednej słuchawce — dokłada się do już \
-             przechwytywanego wejścia powyżej (nie otwiera osobnego wejścia), radar dalej \
-             pokazuje pełne kanały.",
+        ui.weak(
+            "Odsłuch zmiksowanego sygnału mono w jednej słuchawce. Dokłada się do wejścia z zakładki \
+             „Źródło” (nie otwiera osobnego wejścia), a radar dalej pokazuje pełne kanały.",
         );
 
-        let out_devices: Vec<SoundDevice> = self.out_devices.clone().unwrap_or_default();
-
-        if self.mono_sel_out.is_empty() {
-            if let Some(d) = out_devices.first() {
-                self.mono_sel_out = d.name.clone();
-            }
+        if self.mono_sel_out.is_empty()
+            && let Some(d) = self.out_devices.as_ref().ok().and_then(|ds| ds.first())
+        {
+            self.mono_sel_out = d.name.clone();
         }
 
         let capturing = self.active_stream.is_some();
         if !capturing {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 160, 60),
-                "Najpierw kliknij „Przechwytuj” powyżej — routing czyta z tego samego wejścia.",
+                "Najpierw kliknij „Przechwytuj” w zakładce „Źródło” — routing czyta z tego samego wejścia.",
             );
         }
+        self.ui_mono_start(ui, capturing);
+        if let Some(msg) = &self.mono_status {
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg);
+        }
+        if self.mono_router.is_some() {
+            self.ui_mono_latency(ui);
+        }
 
+        ui.add_space(4.0);
+        egui::CollapsingHeader::new("Wyjście i ucho")
+            .default_open(true)
+            .show(ui, |ui| self.ui_mono_output(ui));
+        egui::CollapsingHeader::new("Wskazówka kierunku")
+            .default_open(true)
+            .show(ui, |ui| self.ui_mono_cue(ui));
+        egui::CollapsingHeader::new("Głośność i dynamika")
+            .default_open(true)
+            .show(ui, |ui| self.ui_mono_levels(ui));
+    }
+
+    /// Przycisk startu i zatrzymania routingu.
+    fn ui_mono_start(&mut self, ui: &mut egui::Ui, capturing: bool) {
+        let is_routing = self.mono_router.is_some();
+        let can_start = capturing && !self.mono_sel_out.is_empty();
+        ui.add_enabled_ui(can_start || is_routing, |ui| {
+            let label = if is_routing {
+                "⏹ Zatrzymaj routing"
+            } else {
+                "▶ Uruchom routing"
+            };
+            if ui.button(label).clicked() {
+                if is_routing {
+                    self.mono_router = None;
+                    self.mono_ear = MonoEar::Off;
+                    if let Ok(mut lock) = self.analysis.lock() {
+                        lock.mono_ear = MonoEar::Off;
+                    }
+                    self.mono_status = None;
+                } else {
+                    if self.mono_ear == MonoEar::Off {
+                        self.mono_ear = MonoEar::Left;
+                    }
+                    if let Ok(mut lock) = self.analysis.lock() {
+                        lock.mono_ear = self.mono_ear;
+                    }
+                    match mono_router::start_mono_output(&self.mono_sel_out, self.analysis.clone())
+                    {
+                        Ok(r) => {
+                            self.mono_router = Some(r);
+                            self.mono_status = None;
+                        }
+                        Err(e) => {
+                            let msg = format!("Nie udało się uruchomić routingu: {e}");
+                            crate::dlog!("[mono_router] start error: {e}");
+                            self.mono_status = Some(msg);
+                        }
+                    }
+                }
+            }
+        });
+
+    }
+
+    /// Sekcja „Wyjście i ucho”: urządzenie wyjściowe i grane ucho.
+    fn ui_mono_output(&mut self, ui: &mut egui::Ui) {
+        let out_devices: Vec<SoundDevice> = self.out_devices.clone().unwrap_or_default();
         // `from_id_salt`, nie `from_label`: etykieta jest też kluczem egui, a panel testu
         // kierunków ma tę samą etykietę — wspólny klucz psuje otwieranie obu list.
         ui.horizontal(|ui| {
@@ -730,8 +835,9 @@ impl HearRadarApp {
             ui.label("Ucho:");
             for ear in MonoEar::ALL {
                 let ear = *ear;
+                let label = ear.label().trim_start_matches(|c: char| !c.is_alphanumeric());
                 if ui
-                    .selectable_label(self.mono_ear == ear, ear.label())
+                    .selectable_label(self.mono_ear == ear, label)
                     .clicked()
                 {
                     self.mono_ear = ear;
@@ -741,10 +847,11 @@ impl HearRadarApp {
                 }
             }
         });
-        if self.mono_router.is_some() {
-            self.ui_mono_latency(ui);
-        }
+    }
 
+    /// Sekcja „Wskazówka kierunku”: styl oznaczania strony przeciwnej (albo warstw i kierunków)
+    /// i jego suwaki.
+    fn ui_mono_cue(&mut self, ui: &mut egui::Ui) {
         // Efekt na stronie przeciwnej do granego ucha (patrz
         // `mono_router::apply_cue`) — bez tego w trybie jednousznym
         // (Lewe/Prawe) cała informacja "z której strony był dźwięk" ginie,
@@ -764,13 +871,15 @@ impl HearRadarApp {
                 }
             });
         }
-        ui.weak(
-            "Dotyczy tylko ucha Lewe/Prawe. Na kanale: efekt dostaje cały kanał przeciwny, więc \
-             trochę też dźwięki ze środka i z Twojej strony. Kierunkowo: efekt dostaje tylko dźwięk, \
-             który przychodzi z przeciwnej strony (osobno w każdym paśmie); środek (np. własna broń) \
-             i Twoja strona zostają czyste i mają pierwszeństwo (patrz „Strona przeciwna” niżej). \
-             Dodaje ok. 6 ms opóźnienia.",
-        );
+        egui::CollapsingHeader::new("Czym różnią się grupy stylów?").id_salt("mono_cue_groups_help").show(ui, |ui| {
+            ui.weak(
+                "Dotyczy tylko ucha Lewe/Prawe. Na kanale: efekt dostaje cały kanał przeciwny, więc \
+                 trochę też dźwięki ze środka i z Twojej strony. Kierunkowo: efekt dostaje tylko dźwięk, \
+                 który przychodzi z przeciwnej strony (osobno w każdym paśmie); środek (np. własna broń) \
+                 i Twoja strona zostają czyste i mają pierwszeństwo (patrz „Strona przeciwna” niżej). \
+                 Dodaje ok. 6 ms opóźnienia.",
+            );
+        });
 
         // „Wg warstw”: osobny styl dla strzałów, kroków i reszty (patrz `MonoLayerStyles`).
         let style = self.radar_config.mono_cue_style;
@@ -970,6 +1079,10 @@ impl HearRadarApp {
             self.ui_mono_opposite_side(ui, style, per_layer);
         }
 
+    }
+
+    /// Sekcja „Głośność i dynamika”: wzmocnienie, ton, zmiana głośności klas i Scout.
+    fn ui_mono_levels(&mut self, ui: &mut egui::Ui) {
         // Wzmocnienie sygnału mono na wyjściu — odpowiednik `INTENSITY_SCALE`
         // z `sound::direction` (tam sztywny mnożnik dla WYŚWIETLANIA na
         // radarze), tylko tu regulowalny przez użytkownika i wpływający na
@@ -1047,48 +1160,6 @@ impl HearRadarApp {
             self.apply_radar_config();
         }
 
-        let is_routing = self.mono_router.is_some();
-        let can_start = capturing && !self.mono_sel_out.is_empty();
-        ui.add_enabled_ui(can_start || is_routing, |ui| {
-            let label = if is_routing {
-                "⏹ Zatrzymaj routing"
-            } else {
-                "▶ Uruchom routing"
-            };
-            if ui.button(label).clicked() {
-                if is_routing {
-                    self.mono_router = None;
-                    self.mono_ear = MonoEar::Off;
-                    if let Ok(mut lock) = self.analysis.lock() {
-                        lock.mono_ear = MonoEar::Off;
-                    }
-                    self.mono_status = None;
-                } else {
-                    if self.mono_ear == MonoEar::Off {
-                        self.mono_ear = MonoEar::Left;
-                    }
-                    if let Ok(mut lock) = self.analysis.lock() {
-                        lock.mono_ear = self.mono_ear;
-                    }
-                    match mono_router::start_mono_output(&self.mono_sel_out, self.analysis.clone())
-                    {
-                        Ok(r) => {
-                            self.mono_router = Some(r);
-                            self.mono_status = None;
-                        }
-                        Err(e) => {
-                            let msg = format!("Nie udało się uruchomić routingu: {e}");
-                            crate::dlog!("[mono_router] start error: {e}");
-                            self.mono_status = Some(msg);
-                        }
-                    }
-                }
-            }
-        });
-
-        if let Some(msg) = &self.mono_status {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), msg);
-        }
     }
 
     /// Zmierzone opóźnienie toru mono w aplikacji: bufor między wejściem a słuchawkami (patrz
@@ -1304,21 +1375,23 @@ impl HearRadarApp {
         let mut changed = false;
         ui.label("Tryb wyświetlania:");
         let setup = self.radar_config.speaker_setup;
-        for mode in devices::VisualizationMode::ALL.iter().filter(|mode| setup.allows(**mode)) {
-            if ui
-                .selectable_label(self.radar_config.visualization_mode == *mode, mode.label())
-                .clicked()
-            {
-                self.radar_config.switch_mode(*mode);
-                self.overlay_reposition_pending = true;
-                changed = true;
+        // Tryby w jednym rzędzie, pod spodem opis tylko wybranego. Symbole z etykiet pomijamy,
+        // bo czcionka okna ich nie ma i rysowałaby puste kwadraty.
+        ui.horizontal_wrapped(|ui| {
+            for mode in devices::VisualizationMode::ALL.iter().filter(|mode| setup.allows(**mode)) {
+                let label = mode.label().trim_start_matches(|c: char| !c.is_alphanumeric());
+                if ui
+                    .selectable_label(self.radar_config.visualization_mode == *mode, label)
+                    .on_hover_text(mode.description())
+                    .clicked()
+                {
+                    self.radar_config.switch_mode(*mode);
+                    self.overlay_reposition_pending = true;
+                    changed = true;
+                }
             }
-            egui::CollapsingHeader::new("Opis")
-                .id_salt(("visualization_description", mode.label()))
-                .show(ui, |ui| {
-                    ui.label(mode.description());
-                });
-        }
+        });
+        ui.label(self.radar_config.visualization_mode.description());
         ui.weak("Rozmiar, przezroczystości, czułość, kolory i wzmocnienia zapisują się osobno dla każdego trybu. Pozycja na ekranie jest wspólna.");
 
         if changed {
@@ -1783,18 +1856,6 @@ impl HearRadarApp {
 
     }
 
-    /// Zapis i wczytanie konfiguracji oraz logowanie próbek do pliku. Ta sekcja jest zawsze widoczna,
-    /// niezależnie od wybranego układu głośników.
-    fn ui_save_and_logging(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.separator();
-        self.ui_sample_logging_toggle(ui);
-
-        ui.add_space(6.0);
-        ui.separator();
-        self.ui_config_persistence(ui);
-    }
-
     /// Checkbox włączający/wyłączający logger próbek (`sound::sample_logger`)
     /// do ręcznej analizy, który z każdej ramki audio zapisuje realny kolor
     /// (albo brak markera) każdego słyszalnego kanału do pliku CSV w
@@ -1832,6 +1893,84 @@ impl HearRadarApp {
                 ui.end_row();
             }
         });
+    }
+
+    /// Góra okna: tytuł i stan (przechwytywanie, routing mono, overlay), pasek zapisu, układ
+    /// głośników i pasek zakładek. Widoczna w każdej zakładce.
+    fn ui_header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Hear Radar");
+            ui.add_space(8.0);
+            let playing = self.file_player.as_ref().is_some_and(|p| !p.is_finished());
+            let chip = |ui: &mut egui::Ui, on: bool, text: &str| {
+                if on {
+                    ui.colored_label(STATUS_ON, format!("● {text}"));
+                } else {
+                    ui.weak(format!("○ {text}"));
+                }
+            };
+            chip(ui, self.active_stream.is_some(), "przechwytywanie");
+            if playing {
+                chip(ui, true, "odsłuch nagrania");
+            }
+            chip(ui, self.mono_router.is_some(), "routing mono");
+            let overlay_label = if self.overlay_open { "🎯 Ukryj overlay" } else { "🎯 Pokaż overlay" };
+            if ui.button(overlay_label).on_hover_text("Skrót: Alt+R, gdy to okno ma fokus.").clicked() {
+                self.overlay_open = !self.overlay_open;
+                if self.overlay_open {
+                    self.overlay_reposition_pending = true;
+                }
+            }
+        });
+        self.ui_save_bar(ui);
+        self.ui_speaker_setup(ui);
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for tab in MainTab::ALL {
+                ui.selectable_value(&mut self.main_tab, tab, tab.label());
+            }
+        });
+    }
+
+    /// Treść otwartej zakładki.
+    fn ui_tab(&mut self, ui: &mut egui::Ui, tab: MainTab) {
+        let surround = self.radar_config.speaker_setup == devices::SpeakerSetup::Surround;
+        match tab {
+            MainTab::Source => self.ui_device_selector(ui),
+            MainTab::Headphones => self.ui_mono_router(ui),
+            MainTab::Radar => {
+                self.ui_config_panel(ui);
+                // Kolory częstotliwości są tylko dla 5.1 / 7.1.
+                if surround {
+                    ui.separator();
+                    self.ui_color_rules_panel(ui);
+                }
+            }
+            MainTab::Tests => {
+                // Scenariusze testowe radaru są tylko dla 5.1 / 7.1.
+                if surround {
+                    self.ui_test_panel(ui);
+                    ui.separator();
+                } else {
+                    ui.weak("Scenariusze testowe radaru są dostępne przy układzie 5.1 / 7.1.");
+                    ui.add_space(4.0);
+                }
+                self.direction_tester.ui(
+                    ui,
+                    &self.analysis,
+                    &self.radar_config,
+                    self.out_devices.as_deref().unwrap_or(&[]),
+                    self.mono_router.is_some() && self.mono_ear != MonoEar::Off,
+                );
+            }
+            MainTab::Profiles => {
+                self.ui_config_persistence(ui);
+                ui.add_space(6.0);
+                ui.separator();
+                ui.heading("Logi");
+                self.ui_sample_logging_toggle(ui);
+            }
+        }
     }
 
     /// Czy bieżąca konfiguracja różni się od zapisanej w `config/radar_config.json`.
@@ -1915,7 +2054,7 @@ impl HearRadarApp {
     /// w `config/` w repo i nazwane profile w `config/profile/` — patrz
     /// [`config_store`]. Nic nie zapisuje się samo: tylko po kliknięciu.
     fn ui_config_persistence(&mut self, ui: &mut egui::Ui) {
-        ui.label("Konfiguracja");
+        ui.heading("Konfiguracja i profile");
         ui.horizontal(|ui| {
             if ui
                 .button("💾 Zapisz")
@@ -2230,40 +2369,29 @@ impl eframe::App for HearRadarApp {
         }
 
         egui::CentralPanel::default().show(root_ui, |ui| {
-            ui.heading("Hear Radar !!!");
-            self.ui_save_bar(ui);
-            ui.add_space(4.0);
-            self.ui_speaker_setup(ui);
-            ui.add_space(4.0);
+            self.ui_header(ui);
+            ui.separator();
 
-            let surround = self.radar_config.speaker_setup == devices::SpeakerSetup::Surround;
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.columns(2, |cols| {
-                    self.ui_device_selector(&mut cols[0]);
-                    cols[0].separator();
-                    // Test radaru i kolory częstotliwości są tylko dla 5.1 / 7.1.
-                    if surround {
-                        self.ui_test_panel(&mut cols[0]);
-                        cols[0].separator();
-                    }
-                    self.direction_tester.ui(
-                        &mut cols[0],
-                        &self.analysis,
-                        &self.radar_config,
-                        self.out_devices.as_deref().unwrap_or(&[]),
-                        self.mono_router.is_some() && self.mono_ear != MonoEar::Off,
-                    );
-                    cols[0].separator();
-                    self.ui_config_panel(&mut cols[0]);
-                    if surround {
-                        cols[0].separator();
-                        self.ui_color_rules_panel(&mut cols[0]);
-                    }
-                    self.ui_save_and_logging(&mut cols[0]);
-
-                    self.ui_radar_preview(&mut cols[1]);
-                });
+            // Lewa część to otwarta zakładka (przewijana), prawa to podgląd radaru, który zostaje
+            // na miejscu. Podgląd dostaje stałą część szerokości, żeby ustawienia miały więcej miejsca.
+            let full = ui.available_rect_before_wrap();
+            let preview_width = (full.width() * PREVIEW_WIDTH_SHARE).clamp(PREVIEW_WIDTH_MIN, PREVIEW_WIDTH_MAX);
+            let split_x = full.max.x - preview_width;
+            let settings_rect = egui::Rect::from_min_max(full.min, egui::pos2(split_x - PREVIEW_GAP, full.max.y));
+            let preview_rect = egui::Rect::from_min_max(egui::pos2(split_x, full.min.y), full.max);
+            let tab = self.main_tab;
+            ui.scope_builder(egui::UiBuilder::new().max_rect(settings_rect), |ui| {
+                // Zbyt szeroki wiersz ustawień jest przycinany, zamiast wchodzić na podgląd.
+                ui.set_clip_rect(settings_rect.intersect(ui.clip_rect()));
+                egui::ScrollArea::vertical()
+                    .id_salt(("main_tab_scroll", tab))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(settings_rect.width() - SCROLL_BAR_ROOM);
+                        self.ui_tab(ui, tab);
+                    });
             });
+            ui.scope_builder(egui::UiBuilder::new().max_rect(preview_rect), |ui| self.ui_radar_preview(ui));
         });
 
         #[cfg(windows)]
