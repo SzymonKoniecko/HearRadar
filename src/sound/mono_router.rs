@@ -1924,4 +1924,112 @@ mod tests {
             "przy miękkim dogięciu przesterowany sygnał NIE powinien lądować dokładnie na płaskim 1.0 co klatkę: {left_channel:?}"
         );
     }
+
+    // ── Styl „Wg kierunku” ──────────────────────────────────────────────────
+
+    /// Lewy kanał wyjścia (ucho lewe) dla pary i stref, w kawałkach jak z callbacku.
+    fn run_zoned(settings: OutputSettings, pan_frames: &[(f32, f32)], zones: &[ZoneFrame]) -> Vec<f32> {
+        let mut out = vec![0.0f32; pan_frames.len() * 2];
+        let mut cue_state = CueState::default();
+        for (i, (out_chunk, pan_chunk)) in out.chunks_mut(441 * 2).zip(pan_frames.chunks(441)).enumerate() {
+            let start = (i * 441).min(zones.len());
+            let end = (start + pan_chunk.len()).min(zones.len());
+            fill_output_zoned(out_chunk, pan_chunk, &[], &zones[start..end], 2, &settings, 48_000.0, &mut cue_state);
+        }
+        output_channel(&out, 0)
+    }
+
+    fn per_direction(directions: MonoDirectionStyles) -> OutputSettings {
+        neutral(MonoCueStyle::PerDirection).with_directions(&directions)
+    }
+
+    /// Ton 1 kHz z różnicą stron `ild_db` (dodatnia = z prawej), 2 s.
+    fn tone_pair(ild_db: f32) -> Vec<(f32, f32)> {
+        use crate::sound::directional::test_signals::pan;
+        let src: Vec<f32> = (0..96_000).map(|i| 0.5 * sine(1_000.0, i)).collect();
+        let (l, r) = pan(&src, ild_db);
+        l.into_iter().zip(r).collect()
+    }
+
+    /// Cała para jako przód albo tył.
+    fn all_in_zone(pan_frames: &[(f32, f32)], back: bool) -> Vec<ZoneFrame> {
+        pan_frames.iter().map(|&(l, r)| if back { [0.0, 0.0, l, r] } else { [l, r, 0.0, 0.0] }).collect()
+    }
+
+    #[test]
+    fn per_direction_without_zones_is_just_the_opposite_style() {
+        // Strumień stereo nie ma przodu ani tyłu: zostaje sam styl strony przeciwnej.
+        use crate::sound::directional::test_signals::{noise, pan};
+        let (l, r) = pan(&noise(24_000, 31), 9.0);
+        let pan_frames: Vec<(f32, f32)> = l.into_iter().zip(r).collect();
+        let directions = MonoDirectionStyles { opposite: MonoCueStyle::DirectionalBuzz, ..MonoDirectionStyles::default() };
+        let by_direction = run_zoned(per_direction(directions), &pan_frames, &[]);
+        let single = run_zoned(neutral(MonoCueStyle::DirectionalBuzz), &pan_frames, &[]);
+        assert_eq!(by_direction, single);
+    }
+
+    #[test]
+    fn back_zone_gets_its_style_and_the_rest_stays_clean() {
+        use crate::sound::directional::test_signals::modulation_index;
+        // Dźwięk ze środka: strona przeciwna go nie rusza, więc słychać tylko styl strefy.
+        let pan_frames = tone_pair(0.0);
+        let directions = MonoDirectionStyles {
+            front: MonoCueStyle::Off,
+            back: MonoCueStyle::DirectionalBreath,
+            ..MonoDirectionStyles::default()
+        };
+        let settings = per_direction(directions);
+        let from_back = run_zoned(settings, &pan_frames, &all_in_zone(&pan_frames, true));
+        let from_front = run_zoned(settings, &pan_frames, &all_in_zone(&pan_frames, false));
+        let from_side = run_zoned(settings, &pan_frames, &[]);
+        let breath = |x: &[f32]| modulation_index(&x[24_000..], TREMOLO_HZ);
+        assert!(breath(&from_back) > 0.15, "tył ma oddychać: {}", breath(&from_back));
+        assert!(breath(&from_front) < 0.02, "przód bez stylu zostaje czysty: {}", breath(&from_front));
+        assert!(breath(&from_side) < 0.02, "dźwięk spoza stref zostaje czysty: {}", breath(&from_side));
+        // Przód bez stylu to dokładnie suma kanałów, opóźniona jak w każdym stylu kierunkowym.
+        let latency = directional_latency();
+        for t in 12_000..pan_frames.len() {
+            let expected = pan_frames[t - latency].0 + pan_frames[t - latency].1;
+            assert!((from_front[t] - expected).abs() < 1e-3, "próbka {t}: {} zamiast {expected}", from_front[t]);
+        }
+    }
+
+    #[test]
+    fn back_sound_on_the_opposite_side_gets_both_styles() {
+        use crate::sound::directional::test_signals::modulation_index;
+        let pan_frames = tone_pair(9.0);
+        let directions = |back| MonoDirectionStyles {
+            opposite: MonoCueStyle::DirectionalBuzz,
+            front: MonoCueStyle::Off,
+            back,
+            ..MonoDirectionStyles::default()
+        };
+        let zones = all_in_zone(&pan_frames, true);
+        let both = run_zoned(per_direction(directions(MonoCueStyle::DirectionalBreath)), &pan_frames, &zones);
+        let side_only = run_zoned(per_direction(directions(MonoCueStyle::Off)), &pan_frames, &zones);
+        let at = |x: &[f32], hz: f32| modulation_index(&x[24_000..], hz);
+        assert!(at(&both, RING_MOD_BUZZ_HZ) > 0.5, "brzęczenie strony przeciwnej: {}", at(&both, RING_MOD_BUZZ_HZ));
+        assert!(at(&both, TREMOLO_HZ) > 0.15, "oddech tyłu: {}", at(&both, TREMOLO_HZ));
+        assert!(at(&side_only, RING_MOD_BUZZ_HZ) > 0.5, "bez stylu tyłu brzęczenie zostaje");
+        assert!(at(&side_only, TREMOLO_HZ) < 0.05, "bez stylu tyłu nie ma oddechu: {}", at(&side_only, TREMOLO_HZ));
+    }
+
+    #[test]
+    fn zone_volume_and_intensity_scale_only_that_zone() {
+        let pan_frames = tone_pair(0.0);
+        let level = |directions: MonoDirectionStyles, back: bool| {
+            rms(&run_zoned(per_direction(directions), &pan_frames, &all_in_zone(&pan_frames, back))[24_000..])
+        };
+        let base = MonoDirectionStyles { front: MonoCueStyle::Off, back: MonoCueStyle::Off, ..MonoDirectionStyles::default() };
+        let quieter = MonoDirectionStyles { back_volume_db: -6.0, ..base };
+        let change_db = |a: f32, b: f32| 20.0 * (a / b).log10();
+        let back = change_db(level(quieter, true), level(base, true));
+        let front = change_db(level(quieter, false), level(base, false));
+        assert!((back + 6.0).abs() < 0.1, "tył o 6 dB ciszej: {back:+.2} dB");
+        assert!(front.abs() < 0.01, "przód bez zmian: {front:+.2} dB");
+        // Intensywność 0 % wyłącza efekt stylu.
+        let muted = MonoDirectionStyles { back: MonoCueStyle::DirectionalBuzz, back_intensity: 0.0, ..base };
+        let diff = change_db(level(muted, true), level(base, true));
+        assert!(diff.abs() < 0.01, "intensywność 0 % to czysty dźwięk: {diff:+.2} dB");
+    }
 }

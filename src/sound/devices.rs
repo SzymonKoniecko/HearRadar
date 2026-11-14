@@ -1918,6 +1918,7 @@ impl SharedAudioAnalysis {
     ///
     /// `sample_rate` to częstotliwość wejścia: z niej liczone są cele w ms i tempo odczytu
     /// względem wyjścia.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn push_stereo_pan_at(&self, samples: &[(f32, f32)], sample_rate: f32) {
         self.push_zoned_pan_at(samples, &[], false, sample_rate);
     }
@@ -2106,6 +2107,7 @@ impl SharedAudioAnalysis {
     /// wejścia w stosunku częstotliwości wejścia do wyjścia, poprawionym o korektę dryfu zegarów
     /// (najwyżej ±0,5 %), z interpolacją Hermite'a. Przy równych częstotliwościach i bez korekty
     /// próbki przechodzą bez zmian.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn read_stereo_pan_tagged(&self, count: usize, output_rate: f32) -> (Vec<(f32, f32)>, Vec<SideLayers>) {
         let (out, tags, _) = self.read_mono_frames(count, output_rate);
         (out, tags)
@@ -3685,5 +3687,75 @@ mod direction_queue_tests {
             Some((MAX_QUEUED_DIRECTION_EVENTS + 9) as f32),
             "najnowsze zdarzenia zostają"
         );
+    }
+
+    // ── Przód i tył dla stylu „Wg kierunku” ─────────────────────────────────
+
+    #[test]
+    fn direction_styles_load_with_defaults_from_an_old_file() {
+        let mut value = serde_json::to_value(RadarConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("mono_direction_styles");
+        let cfg: RadarConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.mono_direction_styles, MonoDirectionStyles::default());
+
+        let mut value = serde_json::to_value(RadarConfig::default()).unwrap();
+        value["mono_cue_style"] = serde_json::json!("PerDirection");
+        value["mono_direction_styles"] = serde_json::json!({ "back": "Buzz", "front_volume_db": 99.0 });
+        let cfg: RadarConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.mono_cue_style, MonoCueStyle::PerDirection);
+        let styles = cfg.mono_direction_styles;
+        // Styl kanałowy daje wersję kierunkową, głośność jest przycinana.
+        assert_eq!(styles.in_order()[CueDirection::Back.index()], MonoCueStyle::DirectionalBuzz);
+        assert_eq!(styles.in_order()[CueDirection::Opposite.index()], MonoDirectionStyles::default().opposite);
+        assert_eq!(styles.volume_db_in_order()[CueDirection::Front.index()], MONO_LAYER_VOLUME_DB_MAX);
+    }
+
+    #[test]
+    fn downmix_zones_takes_front_and_back_out_of_the_pair() {
+        // 7.1: FL, FR, C, LFE, RL, RR, SL, SR.
+        let frame = [1.0, 0.0, 0.4, 0.9, 0.0, 0.5, 0.3, 0.0];
+        let (zones, active) = downmix_zones(&frame, 8);
+        assert!(active, "gra coś w kanałach tylnych i bocznych");
+        let expected = [(1.0 + 0.2) * MONO_PAN_SCALE, 0.2 * MONO_PAN_SCALE, 0.0, 0.5 * MONO_PAN_SCALE];
+        for (got, want) in zones[0].iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6, "{:?} zamiast {expected:?}", zones[0]);
+        }
+        // Strefy to części pary: reszta (SL i LFE) nie należy do żadnej.
+        let (l, r) = downmix_to_stereo_pan(&frame, 8)[0];
+        assert!((l - zones[0][0] - zones[0][2] - (0.3 + 0.45) * MONO_PAN_SCALE).abs() < 1e-6);
+        assert!((r - zones[0][1] - zones[0][3] - 0.45 * MONO_PAN_SCALE).abs() < 1e-6);
+
+        // Gra w stereo przez kabel 7.1: tylne i boczne puste.
+        assert!(!downmix_zones(&[0.7, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 8).1);
+        // Stereo i mono nie mają przodu ani tyłu.
+        assert_eq!(downmix_zones(&[0.7, 0.2], 2), (Vec::new(), false));
+        assert_eq!(downmix_zones(&[0.7], 1), (Vec::new(), false));
+    }
+
+    /// Wpycha i czyta po 480 ramek przez 2 s, zwraca ostatnią odczytaną parę i strefy.
+    fn last_zoned_frame(surround_active: bool) -> ((f32, f32), ZoneFrame) {
+        let analysis = SharedAudioAnalysis::new();
+        let pan = vec![(0.5f32, 0.3f32); 480];
+        let zones = vec![[0.2f32, 0.1, 0.05, 0.0]; 480];
+        let mut last = ((0.0, 0.0), [0.0; 4]);
+        for _ in 0..200 {
+            analysis.push_zoned_pan_at(&pan, &zones, surround_active, 48_000.0);
+            let (out, _, out_zones) = analysis.read_mono_frames(480, 48_000.0);
+            last = (out[479], out_zones[479]);
+        }
+        last
+    }
+
+    #[test]
+    fn zones_pass_through_the_ring_only_when_the_stream_is_really_surround() {
+        let (pan, zone) = last_zoned_frame(true);
+        assert!((pan.0 - 0.5).abs() < 1e-4 && (pan.1 - 0.3).abs() < 1e-4, "{pan:?}");
+        for (got, want) in zone.iter().zip([0.2, 0.1, 0.05, 0.0]) {
+            assert!((got - want).abs() < 1e-3, "strefy mają przejść bez zmian: {zone:?}");
+        }
+        // Tylne i boczne kanały puste (gra w stereo): cały dźwięk zostaje bez przodu i tyłu.
+        let (pan, zone) = last_zoned_frame(false);
+        assert!((pan.0 - 0.5).abs() < 1e-4, "{pan:?}");
+        assert_eq!(zone, [0.0; 4]);
     }
 }

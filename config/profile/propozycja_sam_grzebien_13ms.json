@@ -107,6 +107,17 @@
     "steps_intensity": 1.0,
     "rest_intensity": 1.0
   },
+  "mono_direction_styles": {
+    "opposite": "DirectionalComb",
+    "front": "Off",
+    "back": "DirectionalBreath",
+    "opposite_volume_db": 0.0,
+    "front_volume_db": 0.0,
+    "back_volume_db": 0.0,
+    "opposite_intensity": 1.0,
+    "front_intensity": 1.0,
+    "back_intensity": 1.0
+  },
   "mono_cue_subtractive": true,
   "mono_comb_notch_db": -16.0,
   "mono_opposite_level_db": -2.0,

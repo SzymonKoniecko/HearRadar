@@ -838,9 +838,74 @@ impl HearRadarApp {
             }
         }
 
+        // „Wg kierunku”: osobny styl dla strony przeciwnej, przodu i tyłu (patrz `MonoDirectionStyles`).
+        let per_direction = style == MonoCueStyle::PerDirection;
+        if per_direction {
+            ui.weak(
+                "Wg kierunku: Twoja strona zostaje czysta, a strona przeciwna, przód i tył dostają \
+                 własne style. Style się nakładają, np. dźwięk z tyłu po przeciwnej stronie ma oba. \
+                 Przód i tył biorą się z kanałów 5.1/7.1 (przód: FL, FR, C; tył: tylne), więc gra musi \
+                 grać w 5.1 albo 7.1. Przy grze w stereo działa tylko styl strony przeciwnej. Góry \
+                 i dołu kanały nie niosą.",
+            );
+            for direction in devices::CueDirection::ALL {
+                let current = self.radar_config.mono_direction_styles.get(direction).as_layer_choice();
+                let mut chosen = current;
+                ui.horizontal(|ui| {
+                    ui.label(direction.label());
+                    egui::ComboBox::from_id_salt(("mono_direction_style", direction.index()))
+                        .selected_text(current.label())
+                        .show_ui(ui, |ui| {
+                            for &choice in MonoCueStyle::LAYER_CHOICES {
+                                ui.selectable_value(&mut chosen, choice, choice.label());
+                            }
+                        });
+                });
+                if chosen != current {
+                    *self.radar_config.mono_direction_styles.get_mut(direction) = chosen;
+                    self.apply_radar_config();
+                }
+                // Głośność i intensywność tego kierunku.
+                let mut changed = false;
+                ui.indent(("mono_direction_levels", direction.index()), |ui| {
+                    let directions = &mut self.radar_config.mono_direction_styles;
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                directions.volume_db_mut(direction),
+                                devices::MONO_LAYER_VOLUME_DB_MIN..=devices::MONO_LAYER_VOLUME_DB_MAX,
+                            )
+                            .text("Głośność")
+                            .suffix(" dB"),
+                        )
+                        .on_hover_text("Głośność dźwięku z tego kierunku. 0 dB = bez zmian.")
+                        .changed();
+                    changed |= ui
+                        .add_enabled(
+                            chosen != MonoCueStyle::Off,
+                            egui::Slider::new(directions.intensity_mut(direction), 0.0..=1.0)
+                                .text("Intensywność")
+                                .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+                        )
+                        .on_hover_text(
+                            "Jak mocno działa wskazówka tego kierunku: 0 % = czysty dźwięk bez efektu, \
+                             100 % = pełny efekt wybranego stylu.",
+                        )
+                        .changed();
+                });
+                if changed {
+                    self.apply_radar_config();
+                }
+            }
+        }
+
         // Style kierunkowe z oddechem: głębokość i barwa (patrz `sound::directional`).
         let layer_styles = self.radar_config.mono_layer_styles;
-        if style.uses_breath() || (per_layer && layer_styles.any_uses_breath()) {
+        let direction_styles = self.radar_config.mono_direction_styles;
+        if style.uses_breath()
+            || (per_layer && layer_styles.any_uses_breath())
+            || (per_direction && direction_styles.any_uses_breath())
+        {
             if ui
                 .add(
                     egui::Slider::new(&mut self.radar_config.mono_breath_depth, 0.2..=0.9)
@@ -874,7 +939,9 @@ impl HearRadarApp {
                 self.apply_radar_config();
             }
         }
-        if (style == MonoCueStyle::BreathBuzz || (per_layer && layer_styles.any_uses_breath_buzz()))
+        if (style == MonoCueStyle::BreathBuzz
+            || (per_layer && layer_styles.any_uses_breath_buzz())
+            || (per_direction && direction_styles.any_uses_breath_buzz()))
             && ui
                 .add(
                     egui::Slider::new(&mut self.radar_config.mono_buzz_depth, 0.1..=1.0)
@@ -1061,7 +1128,13 @@ impl HearRadarApp {
     /// ustępowanie, cień głowy, wycofywanie wskazówki i głębokość dołków grzebienia.
     fn ui_mono_opposite_side(&mut self, ui: &mut egui::Ui, style: MonoCueStyle, per_layer: bool) {
         use crate::sound::directional as d;
-        let in_use = if per_layer { self.radar_config.mono_layer_styles.in_layer_order() } else { [style; 3] };
+        let in_use = if per_layer {
+            self.radar_config.mono_layer_styles.in_layer_order()
+        } else if style == MonoCueStyle::PerDirection {
+            self.radar_config.mono_direction_styles.in_order()
+        } else {
+            [style; 3]
+        };
         let c = &mut self.radar_config;
         let mut changed = false;
         ui.add_space(4.0);
