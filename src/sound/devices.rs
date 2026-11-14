@@ -334,6 +334,10 @@ pub struct RadarConfig {
     /// Styl wskazówki dla strzałów, kroków i reszty w stylu „Wg warstw” (`MonoCueStyle::PerLayer`).
     #[serde(default)]
     pub mono_layer_styles: MonoLayerStyles,
+    /// Styl wskazówki dla strony przeciwnej, przodu i tyłu w stylu „Wg kierunku”
+    /// (`MonoCueStyle::PerDirection`).
+    #[serde(default)]
+    pub mono_direction_styles: MonoDirectionStyles,
     /// Strona przeciwna w stylach kierunkowych (patrz `mono_router::OppositeSettings`).
     /// Wskazówki tylko „w dół”: efekt nigdzie nie podnosi dźwięku z przeciwnej strony ponad
     /// oryginał (oddech od 0 dB w dół, grzebień z samymi dołkami). Wyłączone = wyrównana głośność.
@@ -810,6 +814,7 @@ impl Default for RadarConfig {
             mono_breath_timbre: default_mono_breath_timbre(),
             mono_buzz_depth: default_mono_buzz_depth(),
             mono_layer_styles: MonoLayerStyles::default(),
+            mono_direction_styles: MonoDirectionStyles::default(),
             mono_cue_subtractive: true,
             mono_comb_notch_db: default_mono_comb_notch_db(),
             mono_opposite_level_db: default_mono_opposite_level_db(),
@@ -921,6 +926,11 @@ pub enum MonoCueStyle {
     /// [`MonoLayerStyles`]), zależnie od tego, co radar rozpoznał po przeciwnej stronie. Czeka na
     /// wstępną decyzję klasy (20 ms, potem poprawiana), więc wyjście dostaje ok. 40 ms opóźnienia.
     PerLayer,
+    /// Wg kierunku: osobny styl dla dźwięku z przeciwnej strony, z przodu i z tyłu (patrz
+    /// [`MonoDirectionStyles`]). Przód i tył biorą się z kanałów 5.1/7.1, więc w strumieniu
+    /// stereo działa tylko styl strony przeciwnej. Style się nakładają: dźwięk z tyłu po
+    /// przeciwnej stronie dostaje oba.
+    PerDirection,
 }
 
 impl MonoCueStyle {
@@ -955,6 +965,7 @@ impl MonoCueStyle {
         Self::DirectionalBright,
         Self::DirectionalComb,
         Self::PerLayer,
+        Self::PerDirection,
     ];
 
     pub const ALL: &'static [Self] = &[
@@ -971,6 +982,7 @@ impl MonoCueStyle {
         Self::DirectionalBright,
         Self::DirectionalComb,
         Self::PerLayer,
+        Self::PerDirection,
     ];
 
     pub fn label(self) -> &'static str {
@@ -988,11 +1000,13 @@ impl MonoCueStyle {
             Self::DirectionalBright => "Jasny kierunkowy",
             Self::DirectionalComb => "Grzebień kierunkowy",
             Self::PerLayer => "Wg warstw",
+            Self::PerDirection => "Wg kierunku",
         }
     }
 
     /// Styl sprowadzony do wyboru dozwolonego dla jednej warstwy ([`Self::LAYER_CHOICES`]):
-    /// styl kanałowy daje swoją wersję kierunkową, a „Wg warstw” daje brak wskazówki.
+    /// styl kanałowy daje swoją wersję kierunkową, a „Wg warstw” i „Wg kierunku” dają brak
+    /// wskazówki.
     pub fn as_layer_choice(self) -> Self {
         match self {
             Self::Buzz => Self::DirectionalBuzz,
@@ -1000,7 +1014,7 @@ impl MonoCueStyle {
             Self::Tremolo => Self::DirectionalBreath,
             Self::Bright => Self::DirectionalBright,
             Self::Comb => Self::DirectionalComb,
-            Self::PerLayer => Self::Off,
+            Self::PerLayer | Self::PerDirection => Self::Off,
             other => other,
         }
     }
@@ -1064,6 +1078,7 @@ impl MonoCueStyle {
             Self::DirectionalBright => "DirectionalBright",
             Self::DirectionalComb => "DirectionalComb",
             Self::PerLayer => "PerLayer",
+            Self::PerDirection => "PerDirection",
         }
     }
 }
@@ -1171,6 +1186,139 @@ impl MonoLayerStyles {
     /// Czy któraś warstwa używa „Oddech + brzęczenie” (suwak siły brzęczenia w UI).
     pub fn any_uses_breath_buzz(&self) -> bool {
         self.in_layer_order().contains(&MonoCueStyle::BreathBuzz)
+    }
+}
+
+/// Kierunek, któremu styl „Wg kierunku” (`MonoCueStyle::PerDirection`) nadaje własną wskazówkę.
+/// Strona własna (grane ucho) nie ma wpisu: zostaje czysta, o ile dźwięk nie jest też z przodu
+/// albo z tyłu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CueDirection {
+    /// Strona przeciwna do granego ucha (rozdzielanie kierunkowe, działa też w stereo).
+    Opposite,
+    /// Przód: kanały FL, FR i C strumienia 5.1/7.1.
+    Front,
+    /// Tył: kanały tylne (RL, RR) strumienia 5.1/7.1.
+    Back,
+}
+
+impl CueDirection {
+    pub const ALL: [Self; 3] = [Self::Opposite, Self::Front, Self::Back];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Opposite => 0,
+            Self::Front => 1,
+            Self::Back => 2,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Opposite => "Strona przeciwna:",
+            Self::Front => "Przód:",
+            Self::Back => "Tył:",
+        }
+    }
+}
+
+/// Styl wskazówki dla każdego kierunku w stylu „Wg kierunku” (`MonoCueStyle::PerDirection`).
+/// Domyślnie trzy różne faktury, które da się słyszeć naraz: grzebień (pusta barwa) dla strony
+/// przeciwnej, jasny dla przodu i oddech (wahanie w czasie) dla tyłu.
+///
+/// Każdy kierunek ma też głośność (dB, jak warstwy: [`MONO_LAYER_VOLUME_DB_MIN`]..
+/// [`MONO_LAYER_VOLUME_DB_MAX`]) i intensywność wskazówki (0–1). Plik zapisany przed tym polem
+/// wczytuje się z wartościami domyślnymi.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MonoDirectionStyles {
+    pub opposite: MonoCueStyle,
+    pub front: MonoCueStyle,
+    pub back: MonoCueStyle,
+    pub opposite_volume_db: f32,
+    pub front_volume_db: f32,
+    pub back_volume_db: f32,
+    pub opposite_intensity: f32,
+    pub front_intensity: f32,
+    pub back_intensity: f32,
+}
+
+impl Default for MonoDirectionStyles {
+    fn default() -> Self {
+        Self {
+            opposite: MonoCueStyle::DirectionalComb,
+            front: MonoCueStyle::DirectionalBright,
+            back: MonoCueStyle::DirectionalBreath,
+            opposite_volume_db: 0.0,
+            front_volume_db: 0.0,
+            back_volume_db: 0.0,
+            opposite_intensity: 1.0,
+            front_intensity: 1.0,
+            back_intensity: 1.0,
+        }
+    }
+}
+
+impl MonoDirectionStyles {
+    pub fn get(&self, direction: CueDirection) -> MonoCueStyle {
+        match direction {
+            CueDirection::Opposite => self.opposite,
+            CueDirection::Front => self.front,
+            CueDirection::Back => self.back,
+        }
+    }
+
+    pub fn get_mut(&mut self, direction: CueDirection) -> &mut MonoCueStyle {
+        match direction {
+            CueDirection::Opposite => &mut self.opposite,
+            CueDirection::Front => &mut self.front,
+            CueDirection::Back => &mut self.back,
+        }
+    }
+
+    /// Głośność kierunku (dB), do suwaka w UI.
+    pub fn volume_db_mut(&mut self, direction: CueDirection) -> &mut f32 {
+        match direction {
+            CueDirection::Opposite => &mut self.opposite_volume_db,
+            CueDirection::Front => &mut self.front_volume_db,
+            CueDirection::Back => &mut self.back_volume_db,
+        }
+    }
+
+    /// Intensywność wskazówki kierunku (0–1), do suwaka w UI.
+    pub fn intensity_mut(&mut self, direction: CueDirection) -> &mut f32 {
+        match direction {
+            CueDirection::Opposite => &mut self.opposite_intensity,
+            CueDirection::Front => &mut self.front_intensity,
+            CueDirection::Back => &mut self.back_intensity,
+        }
+    }
+
+    /// Style w kolejności [`CueDirection::ALL`], każdy sprowadzony do dozwolonego wyboru
+    /// (patrz [`MonoCueStyle::as_layer_choice`]).
+    pub fn in_order(&self) -> [MonoCueStyle; 3] {
+        CueDirection::ALL.map(|direction| self.get(direction).as_layer_choice())
+    }
+
+    /// Głośności w kolejności [`CueDirection::ALL`], przycięte do dozwolonego zakresu (dB).
+    pub fn volume_db_in_order(&self) -> [f32; 3] {
+        [self.opposite_volume_db, self.front_volume_db, self.back_volume_db]
+            .map(|db| db.clamp(MONO_LAYER_VOLUME_DB_MIN, MONO_LAYER_VOLUME_DB_MAX))
+    }
+
+    /// Intensywności w kolejności [`CueDirection::ALL`], przycięte do 0–1.
+    pub fn intensity_in_order(&self) -> [f32; 3] {
+        [self.opposite_intensity, self.front_intensity, self.back_intensity].map(|v| v.clamp(0.0, 1.0))
+    }
+
+    /// Czy któryś kierunek używa stylu z oddechem (suwaki głębokości i barwy w UI).
+    pub fn any_uses_breath(&self) -> bool {
+        self.in_order().iter().any(|s| s.uses_breath())
+    }
+
+    /// Czy któryś kierunek używa „Oddech + brzęczenie” (suwak siły brzęczenia w UI).
+    pub fn any_uses_breath_buzz(&self) -> bool {
+        self.in_order().contains(&MonoCueStyle::BreathBuzz)
     }
 }
 
@@ -1324,6 +1472,22 @@ pub(crate) struct SideLayers {
     pub(crate) right: Option<layers::Layer>,
 }
 
+/// Przód i tył jednej ramki bufora mono, dla stylu wskazówki „Wg kierunku”
+/// (`MonoCueStyle::PerDirection`): `[przód lewy, przód prawy, tył lewy, tył prawy]`, w tej samej
+/// skali co para `(lewa, prawa)` (patrz [`downmix_zones`]). To części tej pary, nie dodatkowy
+/// sygnał: reszta pary (kanały boczne i LFE) nie należy ani do przodu, ani do tyłu.
+pub(crate) type ZoneFrame = [f32; 4];
+
+/// Poziom (szczyt próbki) w kanałach tylnych albo bocznych, od którego uznajemy, że strumień
+/// niesie prawdziwy dźwięk przestrzenny (ok. −80 dBFS).
+const SURROUND_ACTIVE_LEVEL: f32 = 1e-4;
+/// Jak długo po ostatnim dźwięku w kanałach tylnych i bocznych dalej dzielimy na przód i tył:
+/// 120 s przy 48 kHz. Gra w stereo przez VB-Cable 7.1 ma te kanały zawsze puste, więc bez tego
+/// cały dźwięk (tylko FL/FR) dostawałby wskazówkę przodu.
+const SURROUND_HOLD_FRAMES: u64 = 5_760_000;
+/// Płynne włączanie i wyłączanie podziału na przód i tył (50 ms przy 48 kHz), żeby nie trzaskało.
+const SURROUND_FADE_FRAMES: f32 = 2_400.0;
+
 /// Domyślna zmiana głośności na słuchawkach w trybie mono (dB): strzały i wybuchy o tyle ciszej,
 /// kroki o tyle głośniej. Suwak w panelu ustawia wartość z zakresu 0–12 dB.
 const MONO_CLASS_GAIN_DB_DEFAULT: f32 = 6.0;
@@ -1363,6 +1527,16 @@ const SCOUT_LOOKAHEAD_FRAMES: usize = 240;
 #[derive(Debug)]
 struct MonoRing {
     frames: VecDeque<(f32, f32)>,
+    /// Przód i tył każdej ramki, równolegle do `frames` (patrz [`ZoneFrame`]).
+    zones: VecDeque<ZoneFrame>,
+    /// Strefy ostatniej zdjętej ramki (lewy sąsiad do interpolacji) i ostatnio odczytane
+    /// (powtarzane, gdy bufor na chwilę wyschnie).
+    prev_zone: ZoneFrame,
+    held_zone: ZoneFrame,
+    /// Ile ramek minęło od ostatniego dźwięku w kanałach tylnych albo bocznych.
+    surround_idle: u64,
+    /// Udział podziału na przód i tył (0–1), wygładzany przez [`SURROUND_FADE_FRAMES`].
+    surround_presence: f32,
     /// Numer ramki wejścia (od startu analizy), która stoi na przodzie `frames`.
     front_index: u64,
     /// Zdarzenia klas: (numer ramki początku, zmiana w dB), od najstarszego.
@@ -1416,6 +1590,11 @@ impl Default for MonoRing {
     fn default() -> Self {
         Self {
             frames: VecDeque::with_capacity(MONO_RING_CAPACITY),
+            zones: VecDeque::with_capacity(MONO_RING_CAPACITY),
+            prev_zone: [0.0; 4],
+            held_zone: [0.0; 4],
+            surround_idle: SURROUND_HOLD_FRAMES,
+            surround_presence: 0.0,
             front_index: 0,
             class_gains: VecDeque::new(),
             current_event: None,
@@ -1488,6 +1667,29 @@ impl MonoRing {
         )
     }
 
+    /// Strefy bieżącej próbki odczytu, z tą samą interpolacją co [`Self::current_frame`], więc
+    /// dalej są częściami pary.
+    fn current_zone(&self) -> ZoneFrame {
+        let zone = |i: usize| self.zones.get(i).copied();
+        let x0 = zone(0).unwrap_or_default();
+        if self.read_frac == 0.0 {
+            return x0;
+        }
+        let t = self.read_frac as f32;
+        let xm1 = self.prev_zone;
+        let x1 = zone(1).unwrap_or(x0);
+        let x2 = zone(2).unwrap_or(x1);
+        std::array::from_fn(|k| ring_clock::hermite(xm1[k], x0[k], x1[k], x2[k], t))
+    }
+
+    /// Udział podziału na przód i tył dla następnej ramki wejścia (patrz [`SURROUND_HOLD_FRAMES`]).
+    fn next_surround_presence(&mut self) -> f32 {
+        self.surround_idle = self.surround_idle.saturating_add(1);
+        let target = if self.surround_idle < SURROUND_HOLD_FRAMES { 1.0 } else { 0.0 };
+        self.surround_presence += (target - self.surround_presence) * (1.0 - (-1.0 / SURROUND_FADE_FRAMES).exp());
+        self.surround_presence
+    }
+
     /// Przesuwa odczyt o `step` próbek wejścia, zdejmując minięte ramki (razem z ich celem Scout).
     fn advance(&mut self, step: f64) {
         self.read_frac += step;
@@ -1497,6 +1699,7 @@ impl MonoRing {
                 break;
             };
             self.prev_frame = frame;
+            self.prev_zone = self.zones.pop_front().unwrap_or_default();
             self.scout_targets.pop_front();
             self.front_index += 1;
             self.read_frac -= 1.0;
@@ -1511,6 +1714,8 @@ impl MonoRing {
         }
         self.prev_frame = self.frames[count - 1];
         self.frames.drain(..count);
+        self.prev_zone = self.zones.get(count - 1).copied().unwrap_or_default();
+        self.zones.drain(..count.min(self.zones.len()));
         self.scout_targets.drain(..count.min(self.scout_targets.len()));
         self.front_index += count as u64;
         self.read_frac = 0.0;
@@ -1714,14 +1919,35 @@ impl SharedAudioAnalysis {
     /// `sample_rate` to częstotliwość wejścia: z niej liczone są cele w ms i tempo odczytu
     /// względem wyjścia.
     pub(crate) fn push_stereo_pan_at(&self, samples: &[(f32, f32)], sample_rate: f32) {
+        self.push_zoned_pan_at(samples, &[], false, sample_rate);
+    }
+
+    /// Jak [`Self::push_stereo_pan_at`], razem z przodem i tyłem każdej ramki dla stylu „Wg
+    /// kierunku” (patrz [`downmix_zones`]). `zones` krótsze niż `samples` (np. puste dla stereo)
+    /// znaczy: brak przodu i tyłu. `surround_active` mówi, czy w tym kawałku grało coś w kanałach
+    /// tylnych albo bocznych. Dopóki nic tam nie gra (gra w stereo przez kabel 7.1), strefy są
+    /// zerowane, czyli cały dźwięk zostaje bez przodu i tyłu.
+    pub(crate) fn push_zoned_pan_at(
+        &self,
+        samples: &[(f32, f32)],
+        zones: &[ZoneFrame],
+        surround_active: bool,
+        sample_rate: f32,
+    ) {
         if let Ok(mut ring) = self.mono_ring.lock() {
             ring.clock.note_input(samples.len(), sample_rate);
-            for &s in samples {
+            if surround_active {
+                ring.surround_idle = 0;
+            }
+            for (i, &s) in samples.iter().enumerate() {
                 if ring.frames.len() >= MONO_RING_CAPACITY {
                     ring.drop_front(1);
                 }
                 let db = ring.scout_level_db(s.0, s.1);
+                let presence = ring.next_surround_presence();
+                let zone = zones.get(i).copied().unwrap_or_default();
                 ring.frames.push_back(s);
+                ring.zones.push_back(zone.map(|v| v * presence));
                 ring.scout_targets.push_back(db);
             }
             let target = ring.target_fill().round() as usize;
@@ -1881,9 +2107,21 @@ impl SharedAudioAnalysis {
     /// (najwyżej ±0,5 %), z interpolacją Hermite'a. Przy równych częstotliwościach i bez korekty
     /// próbki przechodzą bez zmian.
     pub(crate) fn read_stereo_pan_tagged(&self, count: usize, output_rate: f32) -> (Vec<(f32, f32)>, Vec<SideLayers>) {
+        let (out, tags, _) = self.read_mono_frames(count, output_rate);
+        (out, tags)
+    }
+
+    /// Jak [`Self::read_stereo_pan_tagged`], a do tego przód i tył każdej ramki (patrz
+    /// [`ZoneFrame`]) z tą samą zmianą głośności co para, dla stylu wskazówki „Wg kierunku”.
+    pub(crate) fn read_mono_frames(
+        &self,
+        count: usize,
+        output_rate: f32,
+    ) -> (Vec<(f32, f32)>, Vec<SideLayers>, Vec<ZoneFrame>) {
         const HOLD_DECAY: f32 = 0.999;
         let mut out = Vec::with_capacity(count);
         let mut tags = Vec::with_capacity(count);
+        let mut zones = Vec::with_capacity(count);
         let mut last = self.last_pan.lock().map(|g| *g).unwrap_or((0.0, 0.0));
         if let Ok(mut guard) = self.mono_ring.lock() {
             let ring = &mut *guard;
@@ -1909,13 +2147,20 @@ impl SharedAudioAnalysis {
                     last = (last.0 * HOLD_DECAY, last.1 * HOLD_DECAY);
                     tags.push(ring.last_layers);
                     let mult = ring.gain * ring.scout_gain;
+                    ring.held_zone = ring.held_zone.map(|v| v * HOLD_DECAY);
+                    zones.push(ring.held_zone.map(|v| v * mult));
                     (last.0 * mult, last.1 * mult)
                 } else {
                     let s = ring.current_frame();
+                    let zone = ring.current_zone();
                     last = s;
+                    ring.held_zone = zone;
                     let gain = ring.next_gain();
                     tags.push(ring.next_layers());
                     let shaped = ring.scout_apply(s.0 * gain, s.1 * gain);
+                    // Ten sam mnożnik co para (zmiana głośności klas i Scout).
+                    let mult = gain * ring.scout_gain;
+                    zones.push(zone.map(|v| v * mult));
                     ring.advance(step);
                     shaped
                 };
@@ -1929,11 +2174,12 @@ impl SharedAudioAnalysis {
         } else {
             out.resize(count, (0.0, 0.0));
             tags.resize(count, SideLayers::default());
+            zones.resize(count, [0.0; 4]);
         }
         if let Ok(mut guard) = self.last_pan.lock() {
             *guard = last;
         }
-        (out, tags)
+        (out, tags, zones)
     }
 
     /// Same próbki z [`Self::read_stereo_pan_tagged`], bez znaczników warstw (do testów).
@@ -2406,7 +2652,46 @@ pub(crate) fn update_analysis(
     // wyjścia.
     // Nagrywanie: kopia dwóch pierwszych kanałów. Bez trwającej sesji kończy od razu.
     analysis.recorder.push(samples, channels, captured);
-    analysis.push_stereo_pan_at(&downmix_to_stereo_pan(samples, channels), sample_rate);
+    let (zones, surround_active) = downmix_zones(samples, channels);
+    analysis.push_zoned_pan_at(&downmix_to_stereo_pan(samples, channels), &zones, surround_active, sample_rate);
+}
+
+/// Przód i tył każdej ramki dla stylu wskazówki „Wg kierunku”: części pary z
+/// [`downmix_to_stereo_pan`] (ta sama skala i te same wagi stron), które pochodzą z kanałów
+/// przednich (FL, FR, C) i tylnych (RL, RR). Kanały boczne i LFE nie należą do żadnej strefy.
+///
+/// Druga wartość mówi, czy w kanałach tylnych albo bocznych jest sygnał powyżej
+/// [`SURROUND_ACTIVE_LEVEL`]. Układy bez kanałów tylnych (mono, stereo) dają pustą listę i `false`.
+fn downmix_zones(interleaved: &[f32], channels: usize) -> (Vec<ZoneFrame>, bool) {
+    use direction::ChannelRole::*;
+    let layout = direction::channel_layout(channels);
+    if channels < 2 || layout.len() != channels || !layout.iter().any(|r| matches!(r, RearLeft | RearRight)) {
+        return (Vec::new(), false);
+    }
+    let mut surround_active = false;
+    let zones = interleaved
+        .chunks_exact(channels)
+        .map(|frame| {
+            let mut zone = [0.0f32; 4];
+            for (&s, &role) in frame.iter().zip(layout) {
+                let (wl, wr) = channel_pan_weights(role);
+                let base = match role {
+                    FrontLeft | FrontRight | Center => 0,
+                    RearLeft | RearRight => 2,
+                    SideLeft | SideRight | Lfe => continue,
+                };
+                zone[base] += s * wl * MONO_PAN_SCALE;
+                zone[base + 1] += s * wr * MONO_PAN_SCALE;
+            }
+            for (&s, &role) in frame.iter().zip(layout) {
+                if matches!(role, RearLeft | RearRight | SideLeft | SideRight) && s.abs() > SURROUND_ACTIVE_LEVEL {
+                    surround_active = true;
+                }
+            }
+            zone
+        })
+        .collect();
+    (zones, surround_active)
 }
 
 /// Rozdziela zinterlacowane próbki na dwa "ważone" miksy mono: `(left,
@@ -2656,7 +2941,7 @@ mod tests {
         }
         for &style in MonoCueStyle::DIRECTIONAL {
             assert!(style.is_directional(), "{style:?}");
-            if !style.uses_breath() && style != MonoCueStyle::PerLayer {
+            if !style.uses_breath() && !matches!(style, MonoCueStyle::PerLayer | MonoCueStyle::PerDirection) {
                 assert!(MonoCueStyle::CHANNEL.contains(&style.base_cue()), "{style:?}: efekt stylu kanałowego");
             }
         }

@@ -3,7 +3,7 @@
   "anchor_y": 0.52,
   "radius": 300.0,
   "bg_alpha": 0.45,
-  "fg_alpha": 0.73,
+  "fg_alpha": 0.36,
   "high_contrast": false,
   "decay_secs": 1.05,
   "color_rules": [
@@ -64,7 +64,7 @@
     }
   ],
   "overlay_click_through": true,
-  "mono_boost_db": 5.0,
+  "mono_boost_db": 7.0,
   "mono_level_version": 1,
   "mono_tone_db": 5.0,
   "mono_class_gain": false,
@@ -109,7 +109,7 @@
   },
   "mono_cue_subtractive": true,
   "mono_comb_notch_db": -16.0,
-  "mono_opposite_level_db": -3.0,
+  "mono_opposite_level_db": -2.0,
   "mono_opposite_duck_db": 6.0,
   "mono_opposite_shadow": 0.0,
   "mono_cue_tail": 0.6,
@@ -159,13 +159,13 @@
   ],
   "layer_rest_left_color": [
     80,
-    170,
+    245,
     255
   ],
   "layer_rest_right_color": [
-    80,
-    170,
-    255
+    193,
+    255,
+    80
   ],
   "layer_colors_version": 1,
   "layer_side_glow": 1.25,
@@ -465,7 +465,7 @@
     "LayerBars22": {
       "radius": 300.0,
       "bg_alpha": 0.45,
-      "fg_alpha": 0.73,
+      "fg_alpha": 0.36,
       "high_contrast": false,
       "decay_secs": 1.05,
       "radar_sensitivity": 20.0,
@@ -525,13 +525,13 @@
       ],
       "layer_rest_left_color": [
         80,
-        170,
+        245,
         255
       ],
       "layer_rest_right_color": [
-        80,
-        170,
-        255
+        193,
+        255,
+        80
       ],
       "layer_side_glow": 1.25
     }

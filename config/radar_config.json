@@ -1,9 +1,9 @@
 {
   "anchor_x": 0.5,
   "anchor_y": 0.52,
-  "radius": 300.0,
+  "radius": 440.0,
   "bg_alpha": 0.45,
-  "fg_alpha": 0.73,
+  "fg_alpha": 0.36,
   "high_contrast": false,
   "decay_secs": 1.05,
   "color_rules": [
@@ -69,7 +69,7 @@
   "mono_tone_db": 5.0,
   "mono_class_gain": false,
   "mono_class_gain_db": 7.5,
-  "mono_scout": false,
+  "mono_scout": true,
   "mono_scout_amount": 1.0,
   "radar_sensitivity": 20.0,
   "edge_glow_enabled": false,
@@ -78,7 +78,7 @@
   "edge_vignette_width": 0.27,
   "radar_glow_style": "Crescent",
   "glow_line_width": 1.0,
-  "glow_min_visibility": 0.63,
+  "glow_min_visibility": 0.46,
   "speaker_layout_view": true,
   "stereo_left_color": [
     0,
@@ -91,7 +91,7 @@
     50
   ],
   "spatial_audio_view": false,
-  "line_thickness": 1.15,
+  "line_thickness": 0.3,
   "mono_cue_style": "PerLayer",
   "mono_breath_depth": 0.45,
   "mono_breath_timbre": 0.6,
@@ -139,13 +139,13 @@
   ],
   "layer_shots_left_color": [
     255,
-    140,
+    255,
     40
   ],
   "layer_shots_right_color": [
-    255,
-    140,
-    40
+    239,
+    171,
+    249
   ],
   "layer_steps_left_color": [
     150,
@@ -153,22 +153,22 @@
     90
   ],
   "layer_steps_right_color": [
-    150,
-    255,
-    90
+    243,
+    170,
+    255
   ],
   "layer_rest_left_color": [
     80,
-    170,
+    252,
     255
   ],
   "layer_rest_right_color": [
-    80,
-    170,
-    255
+    143,
+    255,
+    0
   ],
   "layer_colors_version": 1,
-  "layer_side_glow": 1.25,
+  "layer_side_glow": 2.0,
   "mode_appearance": {
     "OnlyRadar": {
       "radius": 115.0,
@@ -244,13 +244,13 @@
       "layer_side_glow": 1.0
     },
     "OnlyBars": {
-      "radius": 115.0,
+      "radius": 440.0,
       "bg_alpha": 0.45,
-      "fg_alpha": 0.78,
+      "fg_alpha": 1.0,
       "high_contrast": false,
       "decay_secs": 1.05,
-      "radar_sensitivity": 20.0,
-      "line_thickness": 1.7,
+      "radar_sensitivity": 17.5,
+      "line_thickness": 0.3,
       "speaker_layout_view": true,
       "spatial_audio_view": false,
       "direction_contrast_enabled": false,
@@ -463,13 +463,13 @@
       "layer_side_glow": 1.0
     },
     "LayerBars22": {
-      "radius": 300.0,
+      "radius": 440.0,
       "bg_alpha": 0.45,
-      "fg_alpha": 0.73,
+      "fg_alpha": 0.36,
       "high_contrast": false,
       "decay_secs": 1.05,
       "radar_sensitivity": 20.0,
-      "line_thickness": 1.15,
+      "line_thickness": 0.3,
       "speaker_layout_view": true,
       "spatial_audio_view": false,
       "direction_contrast_enabled": false,
@@ -505,13 +505,13 @@
       ],
       "layer_shots_left_color": [
         255,
-        140,
+        255,
         40
       ],
       "layer_shots_right_color": [
-        255,
-        140,
-        40
+        239,
+        171,
+        249
       ],
       "layer_steps_left_color": [
         150,
@@ -519,21 +519,21 @@
         90
       ],
       "layer_steps_right_color": [
-        150,
-        255,
-        90
+        243,
+        170,
+        255
       ],
       "layer_rest_left_color": [
         80,
-        170,
+        252,
         255
       ],
       "layer_rest_right_color": [
-        80,
-        170,
-        255
+        143,
+        255,
+        0
       ],
-      "layer_side_glow": 1.25
+      "layer_side_glow": 2.0
     }
   }
 }
